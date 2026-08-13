@@ -1,6 +1,7 @@
 import { AgentTurnBuffer } from "./buffer.js";
-import { parseConfig } from "./config.js";
+import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { requireAgentId } from "./identity.js";
+import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient } from "./mcp-client.js";
 import {
   buildRecallBlock,
@@ -34,24 +35,43 @@ function errorText(error: unknown): string {
 }
 
 export function register(api: OpenClawPluginApi): void {
-  const cfg = parseConfig(api.pluginConfig);
-  const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
+  let cfg: GraphitiPluginConfig;
+  try {
+    cfg = parseConfig(api.pluginConfig);
+  } catch (error) {
+    api.logger.error(`graphiti: event=config_invalid error=${JSON.stringify(errorText(error))}`);
+    throw error;
+  }
 
-  const log = (message: string): void => {
-    if (cfg.logOperations) api.logger.info(`graphiti: ${message}`);
-  };
+  const logger = createGraphitiLogger(api.logger, cfg);
+  const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
 
   const buffer = new AgentTurnBuffer(
     cfg.captureBatchTurns,
     cfg.captureBatchIdleFlushSeconds * 1_000,
     async (agentId, turns, reason) => {
       const body = formatTurnsForEpisode(turns);
+      logger.debug("capture_flush_start", {
+        agentId,
+        group_id: agentId,
+        turns: turns.length,
+        reason,
+        chars: body.length,
+      });
+      logger.debugContent(
+        "capture_payload",
+        { agentId, group_id: agentId, turns: turns.length, reason, chars: body.length },
+        { episodeBody: body },
+      );
+
       if (body.length > cfg.captureMaxChars) {
-        api.logger.warn(
-          `graphiti: capture batch exceeds captureMaxChars ` +
-            `(agentId=${agentId}, chars=${body.length}, configured=${cfg.captureMaxChars}); ` +
-            "submitting intact to avoid silent data loss",
-        );
+        logger.warn("capture_batch_oversize", {
+          agentId,
+          group_id: agentId,
+          chars: body.length,
+          configured: cfg.captureMaxChars,
+          action: "submit_intact",
+        });
       }
 
       const started = Date.now();
@@ -63,19 +83,30 @@ export function register(api: OpenClawPluginApi): void {
       });
       if (typeof result.error === "string") throw new Error(result.error);
 
-      log(
-        `capture queue accepted agentId=${agentId} group_id=${agentId} ` +
-          `turns=${turns.length} reason=${reason} durationMs=${Date.now() - started}`,
-      );
+      logger.info("capture_queue_accepted", {
+        agentId,
+        group_id: agentId,
+        turns: turns.length,
+        reason,
+        durationMs: Date.now() - started,
+      });
     },
     {
       onBuffered: (agentId, turns) =>
-        log(`capture buffered agentId=${agentId} group_id=${agentId} bufferTurns=${turns}`),
+        logger.debug("capture_buffered", {
+          agentId,
+          group_id: agentId,
+          bufferTurns: turns,
+        }),
       onFlushError: (agentId, reason, error) =>
-        api.logger.warn(
-          `graphiti: capture flush failed agentId=${agentId} group_id=${agentId} ` +
-            `reason=${reason} error=${errorText(error)}`,
-        ),
+        logger.error("capture_flush_failed", {
+          agentId,
+          group_id: agentId,
+          reason,
+          error: errorText(error),
+          retained: true,
+          automaticRetry: false,
+        }),
     },
   );
 
@@ -88,12 +119,25 @@ export function register(api: OpenClawPluginApi): void {
         try {
           agentId = requireAgentId(ctx?.agentId);
         } catch (error) {
-          api.logger.warn(`graphiti: auto-recall skipped: ${errorText(error)}`);
+          logger.warn("recall_skipped", { reason: "invalid_agent_id", error: errorText(error) });
           return;
         }
 
         const query = prepareRecallQuery(event.prompt ?? "", cfg.recallQueryMaxChars);
-        if (!query || query.startsWith(SESSION_RESET_PROMPT_PREFIX)) return;
+        if (!query) {
+          logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "empty_query" });
+          return;
+        }
+        if (query.startsWith(SESSION_RESET_PROMPT_PREFIX)) {
+          logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "session_reset" });
+          return;
+        }
+
+        logger.debugContent(
+          "recall_query",
+          { agentId, group_id: agentId, chars: query.length },
+          { query },
+        );
 
         const started = Date.now();
         try {
@@ -102,16 +146,32 @@ export function register(api: OpenClawPluginApi): void {
             .map((fact) => (typeof fact.fact === "string" ? fact.fact : ""))
             .filter(Boolean);
           const block = buildRecallBlock(factTexts, cfg.recallMaxInjectedChars);
-          log(
-            `recall agentId=${agentId} group_id=${agentId} results=${factTexts.length} ` +
-              `injectedChars=${block?.length ?? 0} durationMs=${Date.now() - started}`,
+
+          logger.debugContent(
+            "recall_payload",
+            {
+              agentId,
+              group_id: agentId,
+              results: factTexts.length,
+              injectedChars: block?.length ?? 0,
+            },
+            { facts: factTexts, injectedBlock: block ?? "" },
           );
+          logger.info("recall_completed", {
+            agentId,
+            group_id: agentId,
+            results: factTexts.length,
+            injectedChars: block?.length ?? 0,
+            durationMs: Date.now() - started,
+          });
           return block ? { prependContext: block } : undefined;
         } catch (error) {
-          api.logger.warn(
-            `graphiti: auto-recall failed agentId=${agentId} group_id=${agentId} ` +
-              `error=${errorText(error)}`,
-          );
+          logger.warn("recall_failed", {
+            agentId,
+            group_id: agentId,
+            durationMs: Date.now() - started,
+            error: errorText(error),
+          });
           return;
         }
       },
@@ -122,28 +182,70 @@ export function register(api: OpenClawPluginApi): void {
   if (cfg.autoCapture) {
     api.on("agent_end", (rawEvent: unknown, ctx?: HookContext): void => {
       const event = rawEvent as AgentEndEvent;
-      if (!event.success || isBackgroundRun(ctx ?? {})) return;
-      if (ctx?.sessionKey === SLUG_GENERATOR_SESSION_KEY) return;
+      if (!event.success) {
+        logger.debug("capture_skipped", {
+          agentId: ctx?.agentId,
+          reason: "agent_run_failed",
+          durationMs: event.durationMs,
+        });
+        return;
+      }
+      if (isBackgroundRun(ctx ?? {})) {
+        logger.debug("capture_skipped", {
+          agentId: ctx?.agentId,
+          reason: "background_run",
+          trigger: ctx?.trigger,
+        });
+        return;
+      }
+      if (ctx?.sessionKey === SLUG_GENERATOR_SESSION_KEY) {
+        logger.debug("capture_skipped", { agentId: ctx?.agentId, reason: "slug_generator" });
+        return;
+      }
 
       let agentId: string;
       try {
         agentId = requireAgentId(ctx?.agentId);
       } catch (error) {
-        api.logger.warn(`graphiti: auto-capture skipped: ${errorText(error)}`);
+        logger.warn("capture_skipped", { reason: "invalid_agent_id", error: errorText(error) });
         return;
       }
 
       const turn = extractCompletedTurn(Array.isArray(event.messages) ? event.messages : []);
-      if (!turn) return;
+      if (!turn) {
+        logger.debug("capture_skipped", {
+          agentId,
+          group_id: agentId,
+          reason: "no_completed_turn",
+          messageCount: Array.isArray(event.messages) ? event.messages.length : 0,
+        });
+        return;
+      }
+
+      logger.debugContent(
+        "capture_turn",
+        {
+          agentId,
+          group_id: agentId,
+          userChars: turn.user.length,
+          assistantChars: turn.assistant.length,
+        },
+        { user: turn.user, assistant: turn.assistant },
+      );
       buffer.add(agentId, turn);
     });
   }
 
-  api.logger.info(
-    `graphiti: plugin loaded autoCapture=${cfg.autoCapture} autoRecall=${cfg.autoRecall} ` +
-      `captureBatchTurns=${cfg.captureBatchTurns} ` +
-      `captureBatchIdleFlushSeconds=${cfg.captureBatchIdleFlushSeconds}`,
-  );
+  logger.info("plugin_loaded", {
+    autoCapture: cfg.autoCapture,
+    autoRecall: cfg.autoRecall,
+    captureBatchTurns: cfg.captureBatchTurns,
+    captureBatchIdleFlushSeconds: cfg.captureBatchIdleFlushSeconds,
+    requestTimeoutMs: cfg.requestTimeoutMs,
+    recallLimit: cfg.recallLimit,
+    logLevel: cfg.logLevel,
+    logContent: cfg.logContent,
+  });
 }
 
 export default { id, name, description, register };

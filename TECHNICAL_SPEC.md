@@ -4,6 +4,25 @@ Status: active specification for the first live vertical slice.
 
 This file is the authority for v0.1. Older handoffs, donor plugins, experiments, and previous design notes are non-authoritative when they conflict with this document.
 
+## Implementation status — 2026-08-13
+
+The code-side v0.1 vertical slice is implemented on `main` and passes npm CI (`typecheck + build + tests`). The OpenClaw 2026.8.1 hook contract was checked against core commit `2ce420091e136da4c83e65071c6caea68f3b1ac1` before binding the runtime hooks.
+
+Implemented:
+
+- slot-less plugin manifest and npm/TypeScript build;
+- `agent_end` completed-turn extraction;
+- strict `ctx.agentId -> group_id` identity;
+- one in-memory capture buffer per agent, shared across that agent's conversations;
+- completed-turn threshold flush and idle flush;
+- failed flush retention without autonomous retry loops;
+- Graphiti Streamable HTTP MCP client for `add_memory` and `search_memory_facts`;
+- automatic bounded `<graphiti-context>` recall injection;
+- Graphiti/OpenViking wrapper stripping before Graphiti capture/query processing;
+- concise operational logging and unit tests.
+
+Still pending: the real-server acceptance sequence in section 12. Until that passes, v0.1 is code-complete but not live-accepted.
+
 ## 1. Goal
 
 Build the smallest production-shaped OpenClaw companion plugin that proves the complete path:
@@ -150,6 +169,8 @@ Requirements:
 - a failed Graphiti submission must not silently discard the batch;
 - no session boundary changes the agent-buffer semantics.
 
+v0.1 restores a failed batch to the same agent buffer and does not start an autonomous retry loop. A later new turn can make the retained batch eligible again. Explicit bounded retry/backoff is deferred until after the first live proof.
+
 A safe gateway/plugin shutdown flush is desirable, but must not complicate the first vertical slice until the actual OpenClaw lifecycle contract is verified.
 
 ## 7. Graphiti capture request
@@ -174,11 +195,11 @@ Graphiti `add_memory` is asynchronous. Queue acceptance is not persistence. For 
 
 ## 8. Auto-recall
 
-v0.1 performs automatic Graphiti recall from an OpenClaw pre-prompt hook using the current user-side query appropriate to the verified hook contract.
+v0.1 performs automatic Graphiti recall from OpenClaw `before_prompt_build` using the current user-side prompt text from the verified hook contract.
 
 The recall query MUST NOT intentionally include OpenViking injected context, Graphiti injected context, or a fully assembled model prompt.
 
-Graphiti search results are rendered into one bounded XML block and returned as transient prompt context.
+The first vertical slice calls Graphiti `search_memory_facts` scoped to exactly the current agent's `group_id`. Search results are rendered into one bounded XML block and returned as transient prompt context.
 
 Canonical v0.1 wrapper:
 
@@ -231,7 +252,9 @@ Keep the first config intentionally small:
 }
 ```
 
-Defaults may be tightened during implementation/testing, but their meaning must not change silently.
+For the first live proof, override only `captureBatchTurns` to `1` so every completed turn is immediately submitted.
+
+`captureMaxChars` is currently diagnostic rather than destructive: if a batch exceeds the configured value, v0.1 warns and submits the intact batch instead of silently truncating memory. Final cap/splitting semantics are chosen after observing real Graphiti episodes.
 
 Separate capture modes, agent-visible tools, node/fact-specific limits, cooldowns, background-turn capture, persistence polling, and advanced extraction controls are future work unless required for correctness.
 
@@ -263,7 +286,7 @@ v0.1 is accepted only after all of these are demonstrated on the real server:
 4. A later turn in the same conversation receives a relevant `<graphiti-context>` auto-recall block.
 5. The model can distinguish/report the OpenViking and Graphiti XML context blocks it received.
 6. Another conversation using the same agent recalls information captured from the first conversation.
-7. Another agent does not recall the first agent's Graphiti memory.
+7. Another agent does not recall or search the first agent's Graphiti memory.
 8. OpenViking behavior remains working and unchanged.
 9. Injected Graphiti/OpenViking blocks are not directly recaptured merely because they were injected into the model prompt.
 

@@ -2,25 +2,23 @@
 
 Roadmap for `graphiti-openclaw-plugin`.
 
-`TECHNICAL_SPEC.md` is authoritative for v0.1. Completed implementation work is removed from this file; Git history already remembers our sins.
+`TECHNICAL_SPEC.md` is authoritative for v0.1. Completed implementation/setup work is removed from this file as soon as it is proven; Git history already remembers our sins.
 
 ## v0.1 — remaining live acceptance
 
-- Pull/build the current `main` on `/home/openclaw/plugins/graphiti-openclaw-plugin` with npm.
-- Remove stale donor-era Graphiti config keys from the existing OpenClaw entry; do not run `doctor --fix` as a substitute for an intentional edit.
-- Keep the plugin slot-less and preserve `plugins.slots.contextEngine = "openviking"` unchanged.
-- Keep required hook permissions enabled:
-  - `allowPromptInjection=true`
-  - `allowConversationAccess=true`
-- Use `captureBatchTurns=1` for the first proof.
-- Temporarily use plugin diagnostics `logLevel=debug` and `logContent=true`.
-- Ensure OpenClaw file logging itself admits debug records during the proof (`logging.level=debug` or an equivalent temporary runtime override); restore normal verbosity afterward.
-- Verify the plugin loads cleanly and Graphiti MCP connectivity works on the live server.
+Completed on the live host already: repository pull/build, stale donor config removal, slot preservation, hook permissions, `captureBatchTurns=1`, Graphiti debug/content diagnostics, OpenClaw file debug logging, and `openclaw config validate` on OpenClaw 2026.8.1.
+
+Remaining:
+
+- Pull/build the latest `main` containing the current diagnostics/tests before Gateway restart.
+- Verify `openclaw plugins inspect graphiti-openclaw-plugin --runtime --json` returns a clean loaded/runtime view.
+- Restart the Gateway only after the latest build and runtime inspection are clean.
+- Verify Graphiti MCP connectivity from the loaded plugin.
 - Verify one completed turn produces one accepted `add_memory` submission.
-- Inspect debug logs for the exact sanitized `capture_payload` sent to Graphiti.
-- Verify FalkorDB shows the resulting Graphiti entities/facts/relationships.
+- Inspect debug logs for the exact post-sanitization `capture_turn` and `capture_payload` sent to Graphiti.
+- Verify FalkorDB shows resulting Graphiti entities/facts/relationships.
 - Verify same-dialog automatic recall through `<graphiti-context>`.
-- Inspect debug logs for the exact recall query, returned facts, and final `recall_payload` injected into the model.
+- Inspect debug logs for the exact post-sanitization recall query, returned facts, and final `recall_payload` injected into the model.
 - Verify another dialog of the same agent recalls information captured in the first dialog.
 - Verify another agent cannot recall the first agent's Graphiti memory.
 - Verify the model can see both independent OpenViking and Graphiti XML context blocks.
@@ -29,17 +27,18 @@ Roadmap for `graphiti-openclaw-plugin`.
 - After the proof, set `logContent=false` and return OpenClaw file logging to the desired normal level.
 - Decide from live evidence whether `captureMaxChars` should cap a batch, individual turns, or both. Current v0.1 warns and submits an oversized batch intact rather than silently dropping content.
 
-## Immediately after v0.1 proves the connection
+## Required before production release
 
-Priority order should be revisited from live evidence, but these are the expected first follow-ups:
+1. **Bound the retained capture backlog.** Current per-agent retained buffer has no hard maximum. Define both a turn limit and a UTF-8 byte limit. Overflow behavior must be explicit, observable, agent-scoped, and must never silently drop data. Do not implement a drop-oldest/drop-newest policy without owner approval.
+2. **Bounded capture retry/backoff.** Current v0.1 restores a failed batch and blocks autonomous idle retry until a new turn arrives. Replace that temporary behavior with a bounded policy that cannot hammer Graphiti forever and cannot silently lose retained data.
+3. **Persistence tracking.** Track Graphiti `queue accepted -> processing -> persisted UUID | failed | timeout` instead of treating queue acceptance as persistence.
+4. **Safe shutdown flush.** Decide and implement Gateway/plugin shutdown behavior using the verified OpenClaw lifecycle contract.
+5. **OpenViking Graphiti-tag filter patch.** Current `piqnyx/openviking-openclaw-plugin` strips `<relevant-memories>` and `<openviking-context>` but not `<graphiti-context>`. Add the symmetric filter as a separate reviewed OpenViking change, test it, release it, and update the live server.
+6. **Byte-aware request/injection bounds.** Add explicit UTF-8 byte budgets for capture requests and injected recall blocks. Define split/reject behavior before enforcing a hard cap.
+7. **Recall failure cooldown.** Prevent an unhealthy Graphiti endpoint from being hit on every user turn.
+8. **Persistence-safe backlog.** Evaluate a small crash-safe local spool for unsent in-memory batches if Gateway restarts prove to be a practical data-loss mode.
 
-1. **Bounded capture retry/backoff.** Current v0.1 intentionally restores a failed batch and blocks autonomous idle retry until a new turn arrives. Replace that temporary behavior with a bounded policy that cannot hammer Graphiti forever and cannot silently lose retained data.
-2. **Persistence tracking.** Track Graphiti `queue accepted -> processing -> persisted UUID | failed | timeout` instead of treating queue acceptance as persistence.
-3. **Safe shutdown flush.** Decide and implement gateway/plugin shutdown behavior using the verified OpenClaw lifecycle contract.
-4. **OpenViking Graphiti-tag filter patch.** Current `piqnyx/openviking-openclaw-plugin` strips `<relevant-memories>` and `<openviking-context>` but not `<graphiti-context>`. Add the symmetric filter as a separate reviewed OpenViking change, test it, release it, and update the live server.
-5. **Byte-aware bounds.** Add explicit UTF-8 byte limits for capture requests and injected recall blocks in addition to or instead of character limits. Define split/drop behavior before enforcing a hard cap.
-6. **Recall failure cooldown.** Prevent an unhealthy Graphiti endpoint from being hit on every user turn.
-7. **Persistence-safe backlog.** Evaluate a small crash-safe local spool for unsent in-memory batches if gateway restarts prove to be a practical data-loss mode.
+User-facing chat warnings for Graphiti outages are intentionally not the default design. Conversation flow should fail open. Operational failures belong in OpenClaw logs/health/status. If later required, add an explicit opt-in operator/user notification policy that cannot be accidentally recaptured as conversational memory.
 
 ## Richer Graphiti episode information
 
@@ -74,7 +73,7 @@ Any replay/overlap design must avoid turning old content into duplicate episodes
 - Tune search strategy and result rendering from real graph data.
 - Decide whether facts alone are sufficient or node + fact recall improves useful context.
 - Decide whether separate node/fact limits add value; do not resurrect donor knobs by habit.
-- Add richer structured diagnostics for queue state, persistence latency, recall latency, result counts, injected chars/bytes, and retry state.
+- Add richer structured diagnostics for queue state, persistence latency, recall latency, result counts, injected chars/bytes, backlog size, overflow state, and retry state.
 - Consider an operator-only status/force-flush command if it materially improves debugging.
 - Keep raw content logging explicitly opt-in; never make it an accidental permanent production default.
 
@@ -87,7 +86,7 @@ Planned names:
 - `graphiti_recall` — explicitly search Graphiti memory when requested or automatic recall is insufficient.
 - `graphiti_store` — explicitly store durable information when requested; derive `group_id` from tool context only.
 - `graphiti_forget` — explicitly forget/remove Graphiti information when requested; destructive and strictly agent-scoped.
-- `graphiti_status` — inspect plugin/Graphiti connection and recent queue state without exposing secrets.
+- `graphiti_status` — inspect plugin/Graphiti connection and recent queue/backlog state without exposing secrets.
 
 Permanent rules:
 
@@ -120,12 +119,13 @@ Before implementing `graphiti_forget`:
 - explicit connect timeout distinct from request timeout if the MCP transport benefits from it.
 - optional diagnostic/test mode enhancements that never expose secrets by default.
 - configurable capture/injection byte budgets with explicit split behavior.
+- optional outage notification policy, disabled by default and isolated from capture.
 
 ## Cross-memory defense
 
-- Keep Graphiti-side stripping of `<graphiti-context>`, `<relevant-memories>`, and `<openviking-context>` covered by regression tests.
+- Keep Graphiti-side stripping of `<graphiti-context>`, `<relevant-memories>`, and `<openviking-context>` covered by regression tests, including attributes, mixed case, multiline content, adjacent blocks, lookalike tags, and malformed/unclosed user XML.
 - Treat the missing `<graphiti-context>` filter in the current OpenViking fork as a known deferred issue, not an unknown.
-- Patch OpenViking separately after the first Graphiti live proof and add the reciprocal regression test there.
+- Patch OpenViking separately after the first Graphiti live proof and add the reciprocal regression tests there.
 - Do not promise semantic isolation from model paraphrases; the invariant is that raw injected blocks are not intentionally fed into the other store.
 
 ## Graphiti/Falkor follow-ups
@@ -140,6 +140,8 @@ Before implementing `graphiti_forget`:
 ## Testing / project hygiene
 
 - Follow `TESTING.md`; tests must catch behavior and failure regressions, not decorate CI.
+- Add regression tests alongside every behavior change; for reciprocal Graphiti/OpenViking isolation changes, add symmetric tests in both repositories.
+- Keep TODO/spec/changelog current during live testing so completed work is removed/marked immediately instead of being rediscovered later.
 - npm only; never introduce pnpm.
 - Keep direct-to-`main` small coherent commits unless the owner changes the workflow.
 - Keep CI deterministic with no production Graphiti/Falkor credentials.

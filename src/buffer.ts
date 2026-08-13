@@ -89,6 +89,8 @@ export class AgentTurnBuffer {
       this.idleTimer = undefined;
       this.runIdleSweep();
     }, Math.max(0, nextDueAt - now));
+    const maybeNodeTimer = this.idleTimer as unknown as { unref?: () => void };
+    maybeNodeTimer.unref?.();
   }
 
   private runIdleSweep(): void {

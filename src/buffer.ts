@@ -95,7 +95,6 @@ export class AgentTurnBuffer {
       await this.flushBatch(agentId, batch, reason);
     } catch (error) {
       state.turns.unshift(...batch);
-      this.armIdle(agentId, state);
       throw error;
     }
 

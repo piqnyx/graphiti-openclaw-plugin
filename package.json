@@ -1,0 +1,51 @@
+{
+  "name": "graphiti-openclaw-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Slot-less OpenClaw companion plugin for per-agent Graphiti capture and recall",
+  "main": "dist/index.js",
+  "exports": "./dist/index.js",
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run typecheck && npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=22",
+    "openclaw": ">=2026.8.1"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.8.1",
+      "minGatewayVersion": ">=2026.8.1"
+    },
+    "build": {
+      "openclawMainCommitChecked": "2ce420091e136da4c83e65071c6caea68f3b1ac1"
+    }
+  },
+  "keywords": [
+    "openclaw",
+    "graphiti",
+    "falkordb",
+    "memory",
+    "knowledge-graph",
+    "multi-agent"
+  ],
+  "author": "piqnyx",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/piqnyx/graphiti-openclaw-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/piqnyx/graphiti-openclaw-plugin/issues"
+  },
+  "homepage": "https://github.com/piqnyx/graphiti-openclaw-plugin#readme",
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

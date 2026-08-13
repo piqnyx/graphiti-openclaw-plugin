@@ -6,20 +6,23 @@ This file is the authority for v0.1. Older handoffs, donor plugins, experiments,
 
 ## Implementation status — 2026-08-13
 
-The code-side v0.1 vertical slice is implemented on `main` and passes npm CI (`typecheck + build + tests`). The OpenClaw 2026.8.1 hook contract was checked against core commit `2ce420091e136da4c83e65071c6caea68f3b1ac1` before binding the runtime hooks.
+The code-side v0.1 vertical slice is implemented on `main` and is validated by npm CI (`typecheck + build + tests`). The OpenClaw 2026.8.1 hook contract was checked against core commit `2ce420091e136da4c83e65071c6caea68f3b1ac1` before binding runtime hooks.
 
 Implemented:
 
 - slot-less plugin manifest and npm/TypeScript build;
 - `agent_end` completed-turn extraction;
 - strict `ctx.agentId -> group_id` identity;
-- one in-memory capture buffer per agent, shared across that agent's conversations;
-- completed-turn threshold flush and idle flush;
+- one in-memory capture buffer per agent, shared across all conversations of that agent;
+- one shared idle scheduler that monitors all per-agent buffers;
+- completed-turn threshold flush and five-minute idle flush;
 - failed flush retention without autonomous retry loops;
+- same-agent flush serialization, including turns arriving while a request is in flight;
 - Graphiti Streamable HTTP MCP client for `add_memory` and `search_memory_facts`;
 - automatic bounded `<graphiti-context>` recall injection;
 - Graphiti/OpenViking wrapper stripping before Graphiti capture/query processing;
-- concise operational logging and unit tests.
+- leveled OpenClaw logging with optional live-debug content logging;
+- behavioral tests covering routing, isolation, batching, failure retention, concurrent arrivals, sanitization, MCP request shape, and recall injection.
 
 Still pending: the real-server acceptance sequence in section 12. Until that passes, v0.1 is code-complete but not live-accepted.
 
@@ -33,7 +36,7 @@ Build the smallest production-shaped OpenClaw companion plugin that proves the c
 4. Relevant Graphiti memory is automatically recalled before a model turn.
 5. Recall works in the same conversation and across different conversations of the same agent.
 6. Different OpenClaw agents remain strictly isolated.
-7. OpenViking continues operating independently and unchanged.
+7. OpenViking continues operating independently.
 
 v0.1 is intentionally small. Agent-visible Graphiti tools are not part of the first live test.
 
@@ -43,8 +46,8 @@ The plugin is a slot-less companion plugin.
 
 ```text
 OpenClaw
-├── OpenViking                  existing contextEngine, untouched
-├── existing memory component   existing memory slot, untouched
+├── OpenViking                  existing contextEngine
+├── existing memory component   existing memory slot, if configured
 └── graphiti-openclaw-plugin     companion hooks only
         │
         └── MCP -> http://127.0.0.1:8000/mcp/
@@ -58,10 +61,11 @@ The plugin MUST NOT:
 - register as `kind: context-engine`;
 - claim an exclusive OpenClaw slot;
 - start, stop, supervise, patch, reconfigure, or embed Graphiti/FalkorDB;
-- modify OpenViking;
 - modify OpenClaw core;
 - modify `openclaw.json` itself;
 - bypass Graphiti through direct Redis/FalkorDB queries.
+
+Changes to OpenViking are a separate reviewed change and release, never an implicit side effect of this plugin.
 
 Any need to change another subsystem is a stop-and-discuss event before making the change.
 
@@ -75,13 +79,13 @@ OpenClaw ctx.agentId -> Graphiti group_id
 
 Rules:
 
-- `group_id` is never supplied by the model.
-- `group_id` is never derived from conversation/session identity.
-- no hardcoded list of agent IDs exists in the plugin.
-- missing/invalid `ctx.agentId` fails closed for capture/recall.
+- `group_id` is never supplied by the model;
+- `group_id` is never derived from conversation/session identity;
+- no hardcoded list of agent IDs exists in the plugin;
+- missing/invalid `ctx.agentId` fails closed for capture/recall;
 - every Graphiti operation performed for an agent uses that agent's resolved `group_id`.
 
-The existing `piqnyx/graphiti` fork contains FalkorDB group isolation fixes, including request-scoped driver handling for concurrent `group_id` operations. The plugin relies on that backend contract but does not patch it.
+The existing `piqnyx/graphiti` fork contains FalkorDB group-isolation fixes, including request-scoped driver handling for concurrent `group_id` operations. The plugin relies on that backend contract but does not patch it.
 
 ## 4. Agent is the memory personality boundary
 
@@ -99,7 +103,7 @@ all share Graphiti group_id = main
 
 Another agent has a different graph and MUST NOT see `main` memory.
 
-Capture buffers are therefore keyed by **agentId only**, not by session ID/session key:
+Capture state is process-wide for the plugin and keyed by **agentId only**:
 
 ```text
 Map<agentId, AgentCaptureBuffer>
@@ -146,19 +150,22 @@ captureBatchIdleFlushSeconds = 300
 
 `captureBatchTurns = 1` is explicitly supported and is the preferred first live-debug setting. Each completed turn then becomes immediately eligible for one Graphiti episode.
 
-Per-agent behavior:
+The plugin owns one shared scheduler for idle flushing. It does **not** allocate one long-lived timer per conversation or one independent timer object per agent. Agent buffers keep their own last-activity timestamps; the shared scheduler wakes for the earliest due buffer and then reevaluates all buffers.
+
+Behavior:
 
 ```text
 agent_end
   -> extract completed turn
   -> append to buffer[agentId]
-  -> reset that agent's idle timer
+  -> update that buffer's last activity time
+  -> shared scheduler recalculates the next idle deadline
 
-if turns >= captureBatchTurns
-  -> flush all currently buffered turns for that agent
+if buffer[agentId].turns >= captureBatchTurns
+  -> flush that agent's currently buffered turns
 
-if no new completed turn arrives for captureBatchIdleFlushSeconds
-  -> flush all currently buffered turns for that agent
+if buffer[agentId] has waited >= captureBatchIdleFlushSeconds
+  -> shared scheduler flushes that agent's partial batch
 ```
 
 Requirements:
@@ -166,12 +173,22 @@ Requirements:
 - agent buffers never mix;
 - concurrent flushes for the same agent must not duplicate/interleave a batch;
 - turns arriving during a flush remain safe for the next batch;
-- a failed Graphiti submission must not silently discard the batch;
-- no session boundary changes the agent-buffer semantics.
+- no session boundary changes agent-buffer semantics;
+- failure must never silently discard a batch.
 
-v0.1 restores a failed batch to the same agent buffer and does not start an autonomous retry loop. A later new turn can make the retained batch eligible again. Explicit bounded retry/backoff is deferred until after the first live proof.
+### v0.1 failed-flush contract
 
-A safe gateway/plugin shutdown flush is desirable, but must not complicate the first vertical slice until the actual OpenClaw lifecycle contract is verified.
+If Graphiti submission fails:
+
+1. the exact batch is restored to the same agent buffer;
+2. that retained batch is marked as blocked from autonomous idle retry;
+3. the five-minute scheduler MUST NOT repeatedly hammer Graphiti with the same failed batch;
+4. a later new completed turn clears the retry block and makes the retained data eligible again;
+5. if that new turn makes the threshold true, retry may happen immediately; otherwise normal idle timing starts from the new turn.
+
+This behavior is intentional for v0.1. **Bounded retry/backoff remains mandatory follow-up work** after the live connection is proven; it must not be forgotten or silently replaced by an infinite retry loop.
+
+A safe gateway/plugin shutdown flush is also follow-up work after the actual lifecycle behavior is proven live.
 
 ## 7. Graphiti capture request
 
@@ -192,6 +209,8 @@ The plugin MUST NOT generate or send a client episode UUID. Graphiti owns UUID c
 One flushed batch becomes one Graphiti episode. The episode body contains completed turns in chronological order with explicit USER/ASSISTANT boundaries.
 
 Graphiti `add_memory` is asynchronous. Queue acceptance is not persistence. For the first vertical slice, queue acceptance is logged accurately and persistence is verified through Graphiti/FalkorDB. Persisted-UUID tracking is roadmap work after the connection is proven.
+
+The MCP API exposes richer metadata and extraction controls. v0.1 deliberately does not use them yet. After the basic path works, the plugin should forward useful information that OpenClaw already knows rather than inventing data or throwing useful provenance away.
 
 ## 8. Auto-recall
 
@@ -216,7 +235,7 @@ The model may see both systems' injected blocks:
 OpenViking -> model <- Graphiti
 ```
 
-OpenViking and Graphiti should not consume each other's injected blocks as memory input.
+Neither system should intentionally persist the other's raw injected block.
 
 ## 9. Cross-memory isolation defense
 
@@ -225,16 +244,17 @@ Primary isolation comes from lifecycle boundaries: capture clean conversation tu
 Defense in depth in this plugin:
 
 - strip `<graphiti-context>...</graphiti-context>` before Graphiti capture/query processing;
-- strip the OpenViking injection forms used by the installed plugin: `<relevant-memories>...</relevant-memories>` and `<openviking-context ...>...</openviking-context>`;
-- strip only known wrappers, not arbitrary user XML.
+- strip `<relevant-memories>...</relevant-memories>`;
+- strip `<openviking-context ...>...</openviking-context>`;
+- strip only these known wrappers, not arbitrary user XML.
 
-This filtering is a safety net, not the architecture. A model may naturally paraphrase a remembered fact in its visible answer.
+The current `piqnyx/openviking-openclaw-plugin` already strips its two own injection forms, `<relevant-memories>` and `<openviking-context>`, before OpenViking capture. It does **not** currently strip `<graphiti-context>`. That asymmetry is known and is explicitly deferred to a small separate OpenViking patch/release after the first Graphiti live proof.
 
-OpenViking itself is not modified in v0.1. Symmetric Graphiti-tag stripping in OpenViking is a separate reviewed change only if later testing proves it necessary.
+This filtering is a safety net, not magic semantic isolation. A model may naturally paraphrase a remembered fact in its visible answer; the invariant is that raw injected XML blocks are not intentionally fed back into a memory store.
 
 ## 10. v0.1 configuration
 
-Keep the first config intentionally small:
+Default configuration:
 
 ```json
 {
@@ -248,33 +268,76 @@ Keep the first config intentionally small:
   "recallQueryMaxChars": 2000,
   "recallMaxInjectedChars": 4000,
   "captureMaxChars": 12000,
-  "logOperations": true
+  "logOperations": true,
+  "logLevel": "info",
+  "logContent": false
 }
 ```
 
-For the first live proof, override only `captureBatchTurns` to `1` so every completed turn is immediately submitted.
+For the first live proof use:
 
-`captureMaxChars` is currently diagnostic rather than destructive: if a batch exceeds the configured value, v0.1 warns and submits the intact batch instead of silently truncating memory. Final cap/splitting semantics are chosen after observing real Graphiti episodes.
+```json
+{
+  "captureBatchTurns": 1,
+  "logOperations": true,
+  "logLevel": "debug",
+  "logContent": true
+}
+```
 
-Separate capture modes, agent-visible tools, node/fact-specific limits, cooldowns, background-turn capture, persistence polling, and advanced extraction controls are future work unless required for correctness.
+`logContent=true` is a temporary diagnostic mode. It logs the sanitized capture episode body, recall query, recalled fact texts, and final injected Graphiti block. It MUST be switched back off after live inspection unless there is a deliberate reason to keep conversation content in gateway logs.
 
-## 11. Logging
+`captureMaxChars` is currently diagnostic rather than destructive: if a batch exceeds the configured value, v0.1 warns and submits the intact batch instead of silently truncating memory. Final byte/character cap and splitting semantics are roadmap work.
 
-Logs must not print secrets, full prompts, full conversation bodies, or full recalled memory bodies.
+Removed donor-era options such as capture modes, agent tools, separate fact/node limits, cooldowns, and connection timeout knobs are intentionally not accepted by v0.1 configuration.
 
-Useful v0.1 fields:
+## 11. Logging and diagnostics
+
+All plugin logs go through the OpenClaw plugin logger, not stdout/stderr ad-hoc prints. OpenClaw therefore owns file/console routing, JSONL formatting, rotation, redaction, and global log-level filtering.
+
+Plugin levels:
+
+- `error`: capture submission failure, invalid plugin configuration;
+- `warn`: recall failure, invalid/missing agent identity, oversize capture warning;
+- `info`: plugin loaded, capture queue accepted, recall completed;
+- `debug`: buffer state, skip reasons, flush start and diagnostic content events.
+
+Messages use stable event names such as:
+
+```text
+plugin_loaded
+capture_buffered
+capture_turn
+capture_flush_start
+capture_payload
+capture_queue_accepted
+capture_flush_failed
+capture_skipped
+recall_query
+recall_payload
+recall_completed
+recall_failed
+recall_skipped
+```
+
+Useful fields include:
 
 ```text
 agentId
 group_id
-buffer turns
-flush reason: threshold | idle
+bufferTurns
+flush reason
 batch turns
+chars
 queue accepted / failure
+retained=true on failed capture
+automaticRetry=false on retained v0.1 failures
 recall result count
 injected chars
 request duration
 ```
+
+Diagnostic content is one-line escaped in the log message so the surrounding OpenClaw JSONL remains parseable.
 
 ## 12. v0.1 live acceptance test
 
@@ -282,22 +345,29 @@ v0.1 is accepted only after all of these are demonstrated on the real server:
 
 1. Plugin loads without occupying the OpenViking or memory slots.
 2. With `captureBatchTurns=1`, one completed turn causes one Graphiti submission.
-3. FalkorDB UI shows resulting graph data and Graphiti-created entities/facts/relationships.
-4. A later turn in the same conversation receives a relevant `<graphiti-context>` auto-recall block.
-5. The model can distinguish/report the OpenViking and Graphiti XML context blocks it received.
-6. Another conversation using the same agent recalls information captured from the first conversation.
-7. Another agent does not recall or search the first agent's Graphiti memory.
-8. OpenViking behavior remains working and unchanged.
-9. Injected Graphiti/OpenViking blocks are not directly recaptured merely because they were injected into the model prompt.
+3. Debug logs show the sanitized capture payload actually sent to Graphiti.
+4. FalkorDB UI shows resulting graph data and Graphiti-created entities/facts/relationships.
+5. A later turn in the same conversation receives a relevant `<graphiti-context>` auto-recall block.
+6. Debug logs show the recall query, returned fact texts, and exact Graphiti block injected into the model.
+7. The model can distinguish/report the OpenViking and Graphiti XML context blocks it received.
+8. Another conversation using the same agent recalls information captured from the first conversation.
+9. Another agent does not recall or search the first agent's Graphiti memory.
+10. OpenViking behavior remains working.
+11. Injected Graphiti/OpenViking blocks are not directly recaptured merely because they were injected into the model prompt.
+12. After diagnostics are complete, `logContent` is returned to `false`.
 
-## 13. Development policy
+## 13. Development and test policy
 
-- npm only; commit `package-lock.json`.
-- TypeScript with strict type checking.
-- build/test/typecheck in CI.
-- work directly on `main` with small coherent commits; no routine side branches.
-- do not modify unrelated repositories or server components without explicit discussion.
-- do not make destructive database changes from this plugin.
-- when live server evidence is required, stop and provide exact minimal commands for the owner to run.
+- npm only; commit `package-lock.json`;
+- TypeScript with strict type checking;
+- build/test/typecheck in CI;
+- work directly on `main` with small coherent commits; no routine side branches;
+- do not modify unrelated repositories or server components without explicit discussion;
+- do not make destructive database changes from this plugin;
+- when live server evidence is required, provide exact minimal commands rather than asking the owner to perform work the development environment can do itself;
+- tests must exercise behavior, failure modes, routing boundaries, payload shape, and concurrency invariants; tautological tests written merely to satisfy coverage are not acceptable;
+- never weaken production behavior merely to make a test pass; fix the design or the test fixture according to the actual contract.
+
+See `TESTING.md` for the test philosophy and required invariant classes.
 
 This codebase is the base for future functionality. v0.1 should be small, but not throwaway.

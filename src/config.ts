@@ -1,3 +1,5 @@
+export type LogLevel = "error" | "warn" | "info" | "debug";
+
 export type GraphitiPluginConfig = {
   baseUrl: string;
   autoCapture: boolean;
@@ -10,6 +12,8 @@ export type GraphitiPluginConfig = {
   recallMaxInjectedChars: number;
   captureMaxChars: number;
   logOperations: boolean;
+  logLevel: LogLevel;
+  logContent: boolean;
 };
 
 export const DEFAULT_CONFIG: GraphitiPluginConfig = {
@@ -24,6 +28,8 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   recallMaxInjectedChars: 4_000,
   captureMaxChars: 12_000,
   logOperations: true,
+  logLevel: "info",
+  logContent: false,
 };
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -54,6 +60,12 @@ function integerValue(
   return raw;
 }
 
+function logLevelValue(raw: unknown): LogLevel {
+  if (raw === undefined) return DEFAULT_CONFIG.logLevel;
+  if (raw === "error" || raw === "warn" || raw === "info" || raw === "debug") return raw;
+  throw new Error('logLevel must be one of "error", "warn", "info", "debug"');
+}
+
 function baseUrlValue(raw: unknown): string {
   if (raw === undefined) return DEFAULT_CONFIG.baseUrl;
   if (typeof raw !== "string" || raw.trim() === "") {
@@ -80,6 +92,8 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "recallMaxInjectedChars",
     "captureMaxChars",
     "logOperations",
+    "logLevel",
+    "logContent",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -136,5 +150,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       200_000,
     ),
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
+    logLevel: logLevelValue(raw.logLevel),
+    logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
   };
 }

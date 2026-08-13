@@ -4,8 +4,10 @@ type TimerHandle = ReturnType<typeof setTimeout>;
 
 type BufferState = {
   turns: CompletedTurn[];
-  timer?: TimerHandle;
-  flushTail: Promise<void>;
+  lastBufferedAt?: number;
+  version: number;
+  retryBlocked: boolean;
+  flushPromise?: Promise<void>;
 };
 
 export type FlushBatch = (
@@ -21,6 +23,7 @@ export type BufferLogger = {
 
 export class AgentTurnBuffer {
   private readonly states = new Map<string, BufferState>();
+  private idleTimer?: TimerHandle;
 
   constructor(
     private readonly threshold: number,
@@ -32,12 +35,15 @@ export class AgentTurnBuffer {
   add(agentId: string, turn: CompletedTurn): void {
     const state = this.stateFor(agentId);
     state.turns.push(turn);
+    state.version += 1;
+    state.lastBufferedAt = Date.now();
+    state.retryBlocked = false;
     this.logger.onBuffered?.(agentId, state.turns.length);
-    this.armIdle(agentId, state);
 
     if (state.turns.length >= this.threshold) {
       void this.enqueueFlush(agentId, "threshold");
     }
+    this.scheduleIdleSweep();
   }
 
   bufferedTurns(agentId: string): number {
@@ -51,31 +57,78 @@ export class AgentTurnBuffer {
   private stateFor(agentId: string): BufferState {
     let state = this.states.get(agentId);
     if (!state) {
-      state = { turns: [], flushTail: Promise.resolve() };
+      state = { turns: [], version: 0, retryBlocked: false };
       this.states.set(agentId, state);
     }
     return state;
   }
 
-  private armIdle(agentId: string, state: BufferState): void {
-    if (state.timer !== undefined) clearTimeout(state.timer);
-    if (state.turns.length === 0) {
-      state.timer = undefined;
-      return;
+  private scheduleIdleSweep(): void {
+    if (this.idleTimer !== undefined) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
     }
-    state.timer = setTimeout(() => {
-      state.timer = undefined;
-      void this.enqueueFlush(agentId, "idle");
-    }, this.idleFlushMs);
+
+    const now = Date.now();
+    let nextDueAt: number | undefined;
+    for (const state of this.states.values()) {
+      if (
+        state.turns.length === 0 ||
+        state.lastBufferedAt === undefined ||
+        state.retryBlocked ||
+        state.flushPromise
+      ) {
+        continue;
+      }
+      const dueAt = state.lastBufferedAt + this.idleFlushMs;
+      if (nextDueAt === undefined || dueAt < nextDueAt) nextDueAt = dueAt;
+    }
+
+    if (nextDueAt === undefined) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      this.runIdleSweep();
+    }, Math.max(0, nextDueAt - now));
+  }
+
+  private runIdleSweep(): void {
+    const now = Date.now();
+    for (const [agentId, state] of this.states.entries()) {
+      if (
+        state.turns.length === 0 ||
+        state.lastBufferedAt === undefined ||
+        state.retryBlocked ||
+        state.flushPromise
+      ) {
+        continue;
+      }
+      if (now - state.lastBufferedAt >= this.idleFlushMs) {
+        void this.enqueueFlush(agentId, "idle");
+      }
+    }
+    this.scheduleIdleSweep();
   }
 
   private enqueueFlush(agentId: string, reason: FlushReason): Promise<void> {
     const state = this.stateFor(agentId);
-    const run = state.flushTail.then(() => this.flushOnce(agentId, state, reason));
-    state.flushTail = run.catch((error) => {
-      this.logger.onFlushError?.(agentId, reason, error);
-    });
-    return run;
+    if (state.flushPromise) return state.flushPromise;
+    if (state.turns.length === 0) return Promise.resolve();
+
+    const flushPromise = this.flushOnce(agentId, state, reason)
+      .catch((error) => {
+        this.logger.onFlushError?.(agentId, reason, error);
+        throw error;
+      })
+      .finally(() => {
+        state.flushPromise = undefined;
+        if (!state.retryBlocked && state.turns.length >= this.threshold) {
+          void this.enqueueFlush(agentId, "threshold");
+        }
+        this.scheduleIdleSweep();
+      });
+    state.flushPromise = flushPromise;
+    this.scheduleIdleSweep();
+    return flushPromise;
   }
 
   private async flushOnce(
@@ -83,25 +136,14 @@ export class AgentTurnBuffer {
     state: BufferState,
     reason: FlushReason,
   ): Promise<void> {
-    if (state.turns.length === 0) return;
-
-    if (state.timer !== undefined) {
-      clearTimeout(state.timer);
-      state.timer = undefined;
-    }
-
+    const versionAtStart = state.version;
     const batch = state.turns.splice(0, state.turns.length);
     try {
       await this.flushBatch(agentId, batch, reason);
     } catch (error) {
       state.turns.unshift(...batch);
+      state.retryBlocked = state.version === versionAtStart;
       throw error;
-    }
-
-    if (state.turns.length >= this.threshold) {
-      void this.enqueueFlush(agentId, "threshold");
-    } else {
-      this.armIdle(agentId, state);
     }
   }
 }

@@ -1,0 +1,133 @@
+import type { CompletedTurn } from "./types.js";
+
+const GRAPHITI_CONTEXT_RE = /<graphiti-context\b[^>]*>[\s\S]*?<\/graphiti-context>/gi;
+const OPENVIKING_CONTEXT_RE = /<openviking-context\b[^>]*>[\s\S]*?<\/openviking-context>/gi;
+const OPENVIKING_MEMORIES_RE = /<relevant-memories\b[^>]*>[\s\S]*?<\/relevant-memories>/gi;
+const CONVERSATION_METADATA_RE =
+  /(?:^|\n)\s*(?:Conversation info|Conversation metadata)\s*(?:\([^)]+\))?\s*:\s*```(?:json)?[\s\S]*?```/gi;
+const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\S]*?```/gi;
+const LEADING_TIMESTAMP_RE =
+  /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
+
+export const SLUG_GENERATOR_SESSION_KEY = "temp:slug-generator";
+export const SESSION_RESET_PROMPT_PREFIX = "A new session was started via /new or /reset";
+
+type ContentBlock = {
+  type?: unknown;
+  text?: unknown;
+};
+
+type MessageLike = {
+  role?: unknown;
+  content?: unknown;
+};
+
+export function stripInjectedContexts(text: string): string {
+  return text
+    .replace(GRAPHITI_CONTEXT_RE, " ")
+    .replace(OPENVIKING_CONTEXT_RE, " ")
+    .replace(OPENVIKING_MEMORIES_RE, " ");
+}
+
+export function sanitizeConversationText(text: string): string {
+  return stripInjectedContexts(text)
+    .replace(CONVERSATION_METADATA_RE, "\n")
+    .replace(SENDER_METADATA_RE, "\n")
+    .replace(LEADING_TIMESTAMP_RE, "")
+    .replace(/\u0000/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts: string[] = [];
+  for (const rawBlock of content) {
+    if (!rawBlock || typeof rawBlock !== "object") continue;
+    const block = rawBlock as ContentBlock;
+    if (
+      (block.type === "text" || block.type === "output_text") &&
+      typeof block.text === "string"
+    ) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+export function extractCompletedTurn(messages: unknown[]): CompletedTurn | null {
+  let lastUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i] as MessageLike | undefined;
+    if (message && message.role === "user") {
+      lastUserIndex = i;
+      break;
+    }
+  }
+  if (lastUserIndex < 0) return null;
+
+  let finalAssistantIndex = -1;
+  for (let i = messages.length - 1; i > lastUserIndex; i -= 1) {
+    const message = messages[i] as MessageLike | undefined;
+    if (message && message.role === "assistant") {
+      finalAssistantIndex = i;
+      break;
+    }
+  }
+  if (finalAssistantIndex < 0) return null;
+
+  const userMessage = messages[lastUserIndex] as MessageLike;
+  const assistantMessage = messages[finalAssistantIndex] as MessageLike;
+  const user = sanitizeConversationText(textFromContent(userMessage.content));
+  const assistant = sanitizeConversationText(textFromContent(assistantMessage.content));
+
+  if (!user || !assistant) return null;
+  if (user.startsWith(SESSION_RESET_PROMPT_PREFIX)) return null;
+
+  return { user, assistant };
+}
+
+export function formatTurnsForEpisode(turns: readonly CompletedTurn[]): string {
+  return turns
+    .map(
+      (turn, index) =>
+        `[TURN ${index + 1}]\nUSER:\n${turn.user}\n\nASSISTANT:\n${turn.assistant}`,
+    )
+    .join("\n\n");
+}
+
+export function prepareRecallQuery(text: string, maxChars: number): string {
+  const clean = sanitizeConversationText(text);
+  if (clean.length <= maxChars) return clean;
+  return clean.slice(0, maxChars).trim();
+}
+
+function xmlEscape(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+export function buildRecallBlock(facts: readonly string[], maxChars: number): string | undefined {
+  const prefix = "<graphiti-context>\nSource: graphiti-auto-recall\nRelevant Graphiti facts:\n";
+  const suffix = "\n</graphiti-context>";
+  const lines: string[] = [];
+  let used = prefix.length + suffix.length;
+
+  for (const fact of facts) {
+    const clean = sanitizeConversationText(fact);
+    if (!clean) continue;
+    const line = `- ${xmlEscape(clean)}`;
+    const extra = line.length + (lines.length > 0 ? 1 : 0);
+    if (used + extra > maxChars) continue;
+    lines.push(line);
+    used += extra;
+  }
+
+  if (lines.length === 0) return undefined;
+  return `${prefix}${lines.join("\n")}${suffix}`;
+}

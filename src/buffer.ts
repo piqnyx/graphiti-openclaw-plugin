@@ -117,7 +117,6 @@ export class AgentTurnBuffer {
     const flushPromise = this.flushOnce(agentId, state, reason)
       .catch((error) => {
         this.logger.onFlushError?.(agentId, reason, error);
-        throw error;
       })
       .finally(() => {
         state.flushPromise = undefined;

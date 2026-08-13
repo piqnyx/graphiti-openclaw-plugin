@@ -20,7 +20,9 @@
       "recallQueryMaxChars": { "type": "integer", "minimum": 32, "maximum": 32000 },
       "recallMaxInjectedChars": { "type": "integer", "minimum": 128, "maximum": 64000 },
       "captureMaxChars": { "type": "integer", "minimum": 256, "maximum": 200000 },
-      "logOperations": { "type": "boolean" }
+      "logOperations": { "type": "boolean" },
+      "logLevel": { "type": "string", "enum": ["error", "warn", "info", "debug"] },
+      "logContent": { "type": "boolean" }
     }
   }
 }

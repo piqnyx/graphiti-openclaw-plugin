@@ -1,0 +1,10 @@
+{
+  "id": "graphiti-openclaw-plugin",
+  "name": "Graphiti Companion",
+  "description": "Graphiti companion plugin for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

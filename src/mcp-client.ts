@@ -1,5 +1,12 @@
 type JsonObject = Record<string, unknown>;
 
+/**
+ * Надстройка над дефолтным extract_json промптом Graphiti (вставляется в
+ * custom_extraction_instructions). Объясняет модели структуру нашего JSON и
+ * что сущности живут в messages[].text. Зашита в код — из конфига не управляется.
+ */
+export const CUSTOM_EXTRACTION_PROMPT = `This JSON is a conversation between the two participants whose canonical names are in "participants.user" and "participants.assistant". "messages" is an ARRAY of message objects, each with a "text" field. Extract ALL entities from the "text" field of each message in the "messages" array. The participants often refer to each other and to people by name; a name may appear in slightly different forms (case, nicknames). When a mentioned name clearly refers to one of the participants, treat it as the same entity. Do not merge different people into one unless it is clearly the same person. Respect all other extraction rules.`;
+
 type JsonRpcResponse = {
   jsonrpc?: unknown;
   id?: unknown;
@@ -86,7 +93,6 @@ export class GraphitiMcpClient {
     groupId: string;
     saga: string;
     referenceTime: string;
-    customExtractionInstructions?: string;
   }): Promise<JsonObject> {
     return this.callTool("add_memory", {
       name: params.name,
@@ -95,9 +101,7 @@ export class GraphitiMcpClient {
       source: "json",
       saga: params.saga,
       reference_time: params.referenceTime,
-      ...(params.customExtractionInstructions
-        ? { custom_extraction_instructions: params.customExtractionInstructions }
-        : {}),
+      custom_extraction_instructions: CUSTOM_EXTRACTION_PROMPT,
     });
   }
 

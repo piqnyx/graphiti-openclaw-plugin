@@ -87,7 +87,6 @@ export function register(api: OpenClawPluginApi): void {
       groupId: agentId,
       saga: entry.buffer.sessionKey,
       referenceTime,
-      customExtractionInstructions: cfg.customExtractionInstructions || undefined,
     });
 
     // Логируем ПОЛНЫЙ ответ MCP (не только факт успеха), чтобы видеть, что

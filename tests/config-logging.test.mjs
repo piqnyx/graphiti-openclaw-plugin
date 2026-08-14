@@ -73,12 +73,12 @@ test("agents replaces obsolete participants; aliases are gone", () => {
   );
 });
 
-test("customExtractionInstructions defaults empty and accepts a string", () => {
-  const cfg = parseConfig({});
-  assert.equal(cfg.customExtractionInstructions, "");
-  const withPrompt = parseConfig({ customExtractionInstructions: "Extract ALL entities." });
-  assert.equal(withPrompt.customExtractionInstructions, "Extract ALL entities.");
-  assert.throws(() => parseConfig({ customExtractionInstructions: 42 }), /customExtractionInstructions/);
+test("customExtractionInstructions is not a config key (hardcoded in code)", () => {
+  // Промпт зашит в код, из конфига не управляется — ключ должен отвергаться.
+  assert.throws(
+    () => parseConfig({ customExtractionInstructions: "Extract ALL entities." }),
+    /unknown plugin config key/,
+  );
 });
 
 test("obsolete v0.1 buffer flags are rejected", () => {

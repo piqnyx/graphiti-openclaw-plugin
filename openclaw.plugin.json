@@ -33,8 +33,7 @@
             "assistant": { "type": "string", "minLength": 1 }
           }
         }
-      },
-      "customExtractionInstructions": { "type": "string" }
+      }
     }
   }
 }

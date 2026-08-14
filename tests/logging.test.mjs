@@ -72,7 +72,8 @@ test("content logging is opt-in and emits escaped one-line payloads", () => {
   enabledLogger.debugContent("capture_payload", { agentId: "main" }, { body: "first\nsecond" });
 
   assert.equal(enabled.records.length, 1);
-  assert.equal(enabled.records[0].level, "debug");
+  // Контент пишем на INFO (виден в journald), не на DEBUG.
+  assert.equal(enabled.records[0].level, "info");
   assert.match(enabled.records[0].message, /event=capture_payload/);
   assert.match(enabled.records[0].message, /body="first\\nsecond"/);
   assert.equal(enabled.records[0].message.includes("first\nsecond"), false);

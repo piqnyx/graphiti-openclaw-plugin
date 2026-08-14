@@ -67,8 +67,13 @@ export function createGraphitiLogger(
     info: (event, fields) => emit("info", event, fields),
     debug: (event, fields) => emit("debug", event, fields),
     debugContent: (event, fields, content) => {
+      // Контент-логи пишем на INFO, а не DEBUG: при `logContent: true` юзер явно
+      // хочет видеть, что реально уходит (payload, recall-инъекции) — а DEBUG
+      // во многих сетапах (journald) не доходит до лога плагина. INFO виден всегда.
       if (!cfg.logContent) return;
-      emit("debug", event, { ...fields, ...content });
+      if (!cfg.logOperations) return; // контент — тоже операция, уважаем отключение
+      if (LEVEL_RANK[cfg.logLevel] < LEVEL_RANK.info) return; // ниже info — не пишем
+      emit("info", event, { ...fields, ...content });
     },
   };
 }

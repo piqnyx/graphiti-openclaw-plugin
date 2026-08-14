@@ -40,9 +40,9 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   t.after(() => engine.stop());
 
   // Формируем 3 заполненных буфера в очереди одного агента.
+  // limit=2 → два сообщения сразу флашатся.
   for (const s of ["a", "b", "c"]) {
     addTurn(engine, "main", s, 1);
-    engine.addMessage("main", s, "user", "u2");
   }
 
   // Снимаем gate: очередь агента должна опустошиться за один pass, строго по порядку.
@@ -73,15 +73,13 @@ test("a failing agent does not block another agent's flush (parallel across agen
   t.after(() => engine.stop());
 
   // Сначала «сломаный» агент — его очередь падает.
-  addTurn(engine, "broken", "b1", 1);
-  engine.addMessage("broken", "b1", "user", "u2"); // limit → enqueue → sink throws
+  addTurn(engine, "broken", "b1", 1); // limit=2 → flush → sink throws
 
   await waitFor(() => flushes.some((f) => f.agentId === "broken"), 2000);
   await waitFor(() => errors.length === 1, 2000);
 
   // Здоровый агент продолжает работать независимо.
-  addTurn(engine, "healthy", "h1", 1);
-  engine.addMessage("healthy", "h1", "user", "u2");
+  addTurn(engine, "healthy", "h1", 1); // limit=2 → flush
   await waitFor(() => flushes.some((f) => f.agentId === "healthy"), 2000);
 
   const healthy = flushes.find((f) => f.agentId === "healthy");

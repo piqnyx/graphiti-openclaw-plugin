@@ -36,39 +36,46 @@ function addTurn(engine, agentId, sessionKey, n) {
 // чтобы покрыть фазу тика (~ один полный интервал сверху).
 const TIMEOUT_TEST_WINDOW_MS = (CHECK_INTERVAL_SEC * 2 + 10) * 1000;
 
-test("limit trigger: full buffer detaches as one episode and continues in a fresh buffer", async (t) => {
+test("limit trigger: detaches EXACTLY at bufferLimit, not at N+1", async (t) => {
   const flushes = [];
-  const engine = new BufferEngine(agents, 2, 3600, async (agentId, entry, reason) => {
+  const engine = new BufferEngine(agents, 3, 3600, async (agentId, entry, reason) => {
     flushes.push({
       agentId,
       sessionKey: entry.buffer.sessionKey,
+      count: entry.buffer.messages.length,
       roles: entry.buffer.messages.map((m) => m.role),
       reason,
     });
   });
   t.after(() => engine.stop());
 
-  // 1 ход = 2 сообщения = буфер полон (limit=2).
-  addTurn(engine, "main", "s1", 1);
-  // Следующее сообщение триггерит отцепление ПОЛНОГО буфера + новый буфер.
-  engine.addMessage("main", "s1", "user", "user-2");
+  // 2 сообщения — лимит 3 не достигнут, флаша нет.
+  engine.addMessage("main", "s1", "user", "u1");
+  engine.addMessage("main", "s1", "assistant", "a1");
+  await sleep(50);
+  assert.equal(flushes.length, 0, "no flush below limit");
+
+  // 3-е сообщение достигает лимит ровно на 3 -> эпизод должен уйти ТУТ ЖЕ, не на 4-м.
+  engine.addMessage("main", "s1", "user", "u2");
 
   await waitFor(() => flushes.length === 1, 2000);
   assert.deepEqual(flushes[0], {
     agentId: "main",
     sessionKey: "s1",
-    roles: ["user", "assistant"],
+    count: 3,
+    roles: ["user", "assistant", "user"],
     reason: "limit",
   });
-  // Новое сообщение живёт в свежем буфере той же сессии.
+  // После флаша — свежий пустой буфер сессии.
   assert.equal(engine.activeBufferCount("main"), 1);
+  assert.equal(engine.queueLength(), 0);
 });
 
 test("buffers are isolated per session within an agent", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
     agents,
-    2,
+    4,
     3600,
     async (_agentId, entry, reason) => {
       flushes.push({
@@ -89,7 +96,7 @@ test("buffers are isolated per session within an agent", async (t) => {
 test("FIFO queue per agent preserves chronological order", async (t) => {
   const flushes = [];
   const gate = deferred();
-  // limit=2 → каждый ход сразу отцепляется, очередь формируется по порядку добавления сессий.
+  // limit=2 → два сообщения уже достигают лимит и отцепляются сразу.
   const engine = new BufferEngine(
     agents,
     2,
@@ -101,10 +108,12 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "first", 1);
-  engine.addMessage("main", "first", "user", "u2"); // предел → enqueue first
-  addTurn(engine, "main", "second", 3);
-  engine.addMessage("main", "second", "user", "u4"); // предел → enqueue second
+  // first: 2 сообщения -> flush
+  engine.addMessage("main", "first", "user", "u1");
+  engine.addMessage("main", "first", "assistant", "a1");
+  // second: 2 сообщения -> flush (держит первый в gate)
+  engine.addMessage("main", "second", "user", "u2");
+  engine.addMessage("main", "second", "assistant", "a2");
 
   await waitFor(() => flushes.length === 1, 2000);
   gate.resolve();
@@ -124,12 +133,17 @@ test("agents are isolated: one agent's buffer does not affect another", async (t
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "igor", "s1", 1);
-  engine.addMessage("igor", "s1", "assistant", "a1"); // предел → igor эпизод
-  addTurn(engine, "main", "s2", 2);
+  // igor: 2 сообщения -> flush (limit=2)
+  engine.addMessage("igor", "s1", "user", "i1");
+  engine.addMessage("igor", "s1", "assistant", "ia1");
 
   await waitFor(() => flushes.some((f) => f.agentId === "igor"), 2000);
-  assert.equal(flushes.some((f) => f.agentId === "main"), false, "main buffer not yet full");
+  assert.equal(flushes.some((f) => f.agentId === "main"), false, "main not written yet");
+
+  // main: 1 сообщение (ниже лимита 2) -> НЕ флашится
+  engine.addMessage("main", "s2", "user", "m1");
+  await sleep(50);
+  assert.equal(flushes.some((f) => f.agentId === "main"), false, "main below limit");
   assert.equal(engine.activeBufferCount("main"), 1);
   assert.equal(engine.queueLength(), 0, "igor episode already drained; nothing queued");
 });
@@ -152,8 +166,8 @@ test("failed sink drops buffer without retry or re-enqueue", async (t) => {
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "s1", 1);
-  engine.addMessage("main", "s1", "user", "u2"); // предел → enqueue → sink throws
+  engine.addMessage("main", "s1", "user", "u1");
+  engine.addMessage("main", "s1", "assistant", "a1"); // limit=2 -> flush -> sink throws
 
   await waitFor(() => flushes.length === 1, 2000);
   await sleep(250);

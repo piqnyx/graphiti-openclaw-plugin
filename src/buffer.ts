@@ -100,29 +100,29 @@ export class BufferEngine {
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
-    // Проверка триггера ПЕРЕД добавлением нового сообщения (BUFFER_SPEC):
-    // лимит заполнен или таймаут уже сработал.
     const now = Date.now();
-    const limitHit = buffer.messages.length >= this.bufferLimit;
-    const timeoutHit = now - buffer.lastActivityAt >= this.bufferTimeoutMs;
 
-    if (limitHit || timeoutHit) {
-      // Отцепляем существующий буфер, ТОЛЬКО если он элиджибл (>=2 сообщений).
-      if (this.eligibility(buffer)) {
-        agent.queue.push({ buffer, enqueuedAt: now });
-        void this.pump(agent);
-      }
-      // Буфер с 0/1 сообщением НЕ отцепляется и НЕ заменяется: в него же добавляем.
-      if (!this.eligibility(buffer)) {
-        this.pushMessage(buffer, role, text, now);
-        return;
-      }
-      // Элиджибл буфер: ушёл в очередь, открываем свежий с новым пустым JSON.
+    // Таймаут: если буфер давно простаивал И в нём уже есть пара — отцепляем
+    // его до добавления нового сообщения (это «застрявший» буфер, страховка).
+    const timeoutHit = now - buffer.lastActivityAt >= this.bufferTimeoutMs;
+    if (timeoutHit && this.eligibility(buffer)) {
+      agent.queue.push({ buffer, enqueuedAt: now });
+      void this.pump(agent);
       buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
+    // Добавляем сообщение.
     this.pushMessage(buffer, role, text, now);
+
+    // Лимит: если ПОСЛЕ добавления буфер достиг bufferLimit и элиджибл —
+    // отцепляем его (ровно bufferLimit сообщений) и отдаём свежий буфер.
+    if (buffer.messages.length >= this.bufferLimit && this.eligibility(buffer)) {
+      agent.queue.push({ buffer, enqueuedAt: now });
+      void this.pump(agent);
+      const next = this.createBuffer(sessionKey, agentId);
+      agent.activeBuffers.set(sessionKey, next);
+    }
   }
 
   /** Канонические имена акторов для агента (fallback на User/Assistant). */

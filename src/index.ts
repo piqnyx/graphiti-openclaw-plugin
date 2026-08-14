@@ -1,12 +1,10 @@
-import { BufferEngine, type AgentSink } from "./buffer.js";
+import { BufferEngine, type AgentSink, type EpisodeJson } from "./buffer.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient } from "./mcp-client.js";
 import {
-  buildEpisodeJson,
   buildRecallBlock,
-  compileAliasMatchers,
   extractCompletedTurn,
   prepareRecallQuery,
   SESSION_RESET_PROMPT_PREFIX,
@@ -53,12 +51,11 @@ export function register(api: OpenClawPluginApi): void {
 
   const logger = createGraphitiLogger(api.logger, cfg);
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
-  const aliasMatchers = compileAliasMatchers(cfg.participants);
 
-  // Sink: из очереди-записи собираем JSON-эпизод и отправляем в Graphiti.
-  // `agentId` подставляет движок при processинге (спека: agent = group_id).
+  // Sink: берёт готовый JSON-эпизод из буфера (акторы + нормализованные сообщения)
+  // и отправляет в Graphiti. `agentId` подставляет движок при processинге (agent = group_id).
   const sink: AgentSink = async (agentId, entry, reason) => {
-    const episode = buildEpisodeJson(entry, cfg.participants, aliasMatchers);
+    const episode: EpisodeJson = entry.buffer.episode;
     const jsonBody = JSON.stringify(episode);
     const referenceTime = new Date(entry.enqueuedAt).toISOString();
 

@@ -36,9 +36,9 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logOperations: true,
   logLevel: "info",
   logContent: false,
-  // v0.2: buffer / queue
+  // v0.2: buffer / queue  (bufferTimeout — в секундах)
   bufferLimit: 50,
-  bufferTimeout: 900_000,
+  bufferTimeout: 900,
   participants: [
     { role: "user", name: "Вит", aliases: [] },
     { role: "assistant", name: "Краб", aliases: [] },
@@ -208,8 +208,8 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       raw.bufferTimeout,
       DEFAULT_CONFIG.bufferTimeout,
       "bufferTimeout",
-      30_000,
-      7 * 24 * 60 * 60 * 1000,
+      30,
+      7 * 24 * 60 * 60,
     ),
     participants: participantsValue(raw.participants),
   };

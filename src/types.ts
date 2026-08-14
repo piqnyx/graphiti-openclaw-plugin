@@ -39,9 +39,4 @@ export type OpenClawPluginApi = {
   ) => void;
 };
 
-export type CompletedTurn = {
-  user: string;
-  assistant: string;
-};
 
-export type FlushReason = "threshold" | "idle";

@@ -1,5 +1,4 @@
-import type { ParticipantConfig, ParticipantRole } from "./config.js";
-import type { Buffer, BufferMessage, QueueEntry } from "./buffer.js";
+// (text.ts — утилиты санитизации и recall; UUID/JSON-логика буфера в buffer.ts)
 
 const GRAPHITI_CONTEXT_RE = /<graphiti-context\b[^>]*>[\s\S]*?<\/graphiti-context>/gi;
 const OPENVIKING_CONTEXT_RE = /<openviking-context\b[^>]*>[\s\S]*?<\/openviking-context>/gi;
@@ -130,93 +129,6 @@ export function buildRecallBlock(facts: readonly string[], maxChars: number): st
 }
 
 // ---------------------------------------------------------------------------
-// v0.2: канонические имена, алиасы и сборка JSON-эпизода (json-format.md)
-// ---------------------------------------------------------------------------
-
-/** Компилирует регулярки алиасов каждого участника один раз при старте. */
-export function compileAliasMatchers(
-  participants: readonly ParticipantConfig[],
-): Map<ParticipantRole, RegExp[]> {
-  const map = new Map<ParticipantRole, RegExp[]>();
-  for (const p of participants) {
-    const matchers: RegExp[] = [];
-    for (const alias of p.aliases) {
-      try {
-        // Алиас трактуется как литеральная фраза; экранируем спецсимволы,
-        // чтобы пользователь писал обычные имена/слова, а не регулярки.
-        matchers.push(new RegExp(escapeRegExp(alias), "gi"));
-      } catch {
-        // Некорректный алиас пропускаем при компиляции — конфиг уже валидирован.
-      }
-    }
-    map.set(p.role, matchers);
-  }
-  return map;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Нормализует текст сообщения: заменяет алиасы всех участников на канонические имена. */
-export function normalizeText(
-  text: string,
-  matchers: Map<ParticipantRole, RegExp[]>,
-  participants: readonly ParticipantConfig[],
-): string {
-  let result = text;
-  for (const p of participants) {
-    const regexps = matchers.get(p.role);
-    if (!regexps) continue;
-    for (const re of regexps) {
-      result = result.replace(re, p.name);
-    }
-  }
-  return result;
-}
-
-export type EpisodeJson = {
-  participants: Record<ParticipantRole, string>;
-  messages: BufferMessage[];
-};
-
-/** Собирает JSON-эпизод из очереди-записи (json-format.md). */
-export function buildEpisodeJson(
-  entry: QueueEntry,
-  participants: readonly ParticipantConfig[],
-  aliasMatchers: Map<ParticipantRole, RegExp[]>,
-): EpisodeJson {
-  const names: Record<ParticipantRole, string> = {
-    user: "user",
-    assistant: "assistant",
-  };
-  for (const p of participants) {
-    names[p.role] = p.name;
-  }
-
-  const messages = entry.buffer.messages.map((m) => ({
-    role: m.role,
-    text: normalizeText(m.text, aliasMatchers, participants),
-  }));
-
-  return { participants: names, messages };
-}
-
-/**
- * Полная карта участников: role -> { name, aliases }.
- * Удобно для движка/логов.
- */
-export function participantMap(
-  participants: readonly ParticipantConfig[],
-): Record<ParticipantRole, { name: string; aliases: string[] }> {
-  const map: Record<ParticipantRole, { name: string; aliases: string[] }> = {
-    user: { name: "user", aliases: [] },
-    assistant: { name: "assistant", aliases: [] },
-  };
-  for (const p of participants) map[p.role] = { name: p.name, aliases: p.aliases };
-  return map;
-}
-
-// ---------------------------------------------------------------------------
-// (удалено) formatTurnsForEpisode — заменено на buildEpisodeJson (v0.2)
+// (пусто) JSON/алиасы-функции перенесены в BufferEngine (buffer.ts),
+// где JSON живёт внутри буфера и сообщения нормализуются при добавлении.
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 test("v0.2 defaults: buffer fields and canonical participants", () => {
   const cfg = parseConfig({});
   assert.equal(cfg.bufferLimit, 50);
-  assert.equal(cfg.bufferTimeout, 900_000);
+  assert.equal(cfg.bufferTimeout, 900);
   assert.deepEqual(cfg.participants, [
     { role: "user", name: "Вит", aliases: [] },
     { role: "assistant", name: "Краб", aliases: [] },
@@ -33,9 +33,9 @@ test("bufferLimit must be >= 30", () => {
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 1000 }));
 });
 
-test("bufferTimeout must be >= 30000 ms", () => {
-  assert.throws(() => parseConfig({ bufferTimeout: 29_999 }), /bufferTimeout/);
-  assert.doesNotThrow(() => parseConfig({ bufferTimeout: 30_000 }));
+test("bufferTimeout must be >= 30 seconds", () => {
+  assert.throws(() => parseConfig({ bufferTimeout: 29 }), /bufferTimeout/);
+  assert.doesNotThrow(() => parseConfig({ bufferTimeout: 30 }));
 });
 
 test("participants require exactly one user and one assistant with names", () => {

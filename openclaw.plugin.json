@@ -21,7 +21,7 @@
       "logLevel": { "type": "string", "enum": ["error", "warn", "info", "debug"] },
       "logContent": { "type": "boolean" },
       "bufferLimit": { "type": "integer", "minimum": 30, "maximum": 1000 },
-      "bufferTimeout": { "type": "integer", "minimum": 30000, "maximum": 604800000 },
+      "bufferTimeout": { "type": "integer", "minimum": 30, "maximum": 604800 },
       "participants": {
         "type": "array",
         "minItems": 2,

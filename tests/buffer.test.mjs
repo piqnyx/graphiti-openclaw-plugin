@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BufferEngine } from "../dist/buffer.js";
+import { BufferEngine, CHECK_INTERVAL_SEC } from "../dist/buffer.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitFor(predicate, timeoutMs = 1000) {
+async function waitFor(predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
-    await sleep(5);
+    await sleep(250);
   }
   assert.fail("condition was not met before timeout");
 }
@@ -33,9 +33,13 @@ function addTurn(engine, agentId, sessionKey, n) {
   engine.addMessage(agentId, sessionKey, "assistant", `assistant-${n}`);
 }
 
+// Реальный тик = CHECK_INTERVAL_SEC (30c). Для timeout-тестов ждём с большим запасом,
+// чтобы покрыть фазу тика (~ один полный интервал сверху).
+const TIMEOUT_TEST_WINDOW_MS = (CHECK_INTERVAL_SEC * 2 + 10) * 1000;
+
 test("limit trigger: full buffer detaches as one episode and continues in a fresh buffer", async (t) => {
   const flushes = [];
-  const engine = new BufferEngine(participants, 2, 60_000, async (agentId, entry, reason) => {
+  const engine = new BufferEngine(participants, 2, 3600, async (agentId, entry, reason) => {
     flushes.push({
       agentId,
       sessionKey: entry.buffer.sessionKey,
@@ -50,7 +54,7 @@ test("limit trigger: full buffer detaches as one episode and continues in a fres
   // Следующее сообщение триггерит отцепление ПОЛНОГО буфера + новый буфер.
   engine.addMessage("main", "s1", "user", "user-2");
 
-  await waitFor(() => flushes.length === 1);
+  await waitFor(() => flushes.length === 1, 2000);
   assert.deepEqual(flushes[0], {
     agentId: "main",
     sessionKey: "s1",
@@ -61,57 +65,12 @@ test("limit trigger: full buffer detaches as one episode and continues in a fres
   assert.equal(engine.activeBufferCount("main"), 1);
 });
 
-test("eligibility: single message never publishes as an episode", async (t) => {
-  const flushes = [];
-  const engine = new BufferEngine(
-    participants,
-    50,
-    30,
-    async (_agentId, entry, reason) => {
-      flushes.push({ count: entry.buffer.messages.length, reason });
-    },
-    { checkIntervalMs: 10 },
-  );
-  t.after(() => engine.stop());
-
-  // Только user — одиночное сообщение, даже по таймауту не эпизод.
-  engine.addMessage("main", "s1", "user", "only-user");
-  await sleep(60);
-  assert.equal(flushes.length, 0, "single message must not be published");
-  assert.equal(engine.activeBufferCount("main"), 1, "buffer stays alive waiting");
-
-  // Добиваем до пары → теперь эпизод уйдёт по таймауту.
-  engine.addMessage("main", "s1", "assistant", "now-a-pair");
-  await sleep(50); // даём таймауту (30мс) пройти после последней активности
-  await waitFor(() => flushes.length === 1);
-  assert.deepEqual(flushes[0], { count: 2, reason: "timeout" });
-});
-
-test("timeout detector detaches idle buffers via tick", async (t) => {
-  const flushes = [];
-  const engine = new BufferEngine(
-    participants,
-    10,
-    40,
-    async (_agentId, entry, reason) => {
-      flushes.push({ roles: entry.buffer.messages.map((m) => m.role), reason });
-    },
-    { checkIntervalMs: 10 },
-  );
-  t.after(() => engine.stop());
-
-  addTurn(engine, "main", "s1", 1);
-  // Ждём три тика, чтобы таймаут (40мс) сработал в детекторе.
-  await waitFor(() => flushes.length === 1);
-  assert.deepEqual(flushes[0], { roles: ["user", "assistant"], reason: "timeout" });
-});
-
 test("buffers are isolated per session within an agent", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600,
     async (_agentId, entry, reason) => {
       flushes.push({
         sessionKey: entry.buffer.sessionKey,
@@ -135,7 +94,7 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600,
     async (_agentId, entry) => {
       flushes.push(entry.buffer.sessionKey);
       if (flushes.length === 1) await gate.promise; // держим первый, копим хвосты
@@ -148,9 +107,9 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
   addTurn(engine, "main", "second", 3);
   engine.addMessage("main", "second", "user", "u4"); // предел → enqueue second
 
-  await waitFor(() => flushes.length === 1);
+  await waitFor(() => flushes.length === 1, 2000);
   gate.resolve();
-  await waitFor(() => flushes.length === 2);
+  await waitFor(() => flushes.length === 2, 2000);
   assert.deepEqual(flushes, ["first", "second"]);
 });
 
@@ -159,7 +118,7 @@ test("agents are isolated: one agent's buffer does not affect another", async (t
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600,
     async (agentId, entry) => {
       flushes.push({ agentId, sessionKey: entry.buffer.sessionKey });
     },
@@ -170,7 +129,7 @@ test("agents are isolated: one agent's buffer does not affect another", async (t
   engine.addMessage("igor", "s1", "assistant", "a1"); // предел → igor эпизод
   addTurn(engine, "main", "s2", 2);
 
-  await waitFor(() => flushes.some((f) => f.agentId === "igor"));
+  await waitFor(() => flushes.some((f) => f.agentId === "igor"), 2000);
   assert.equal(flushes.some((f) => f.agentId === "main"), false, "main buffer not yet full");
   assert.equal(engine.activeBufferCount("main"), 1);
   assert.equal(engine.queueLength(), 0, "igor episode already drained; nothing queued");
@@ -182,7 +141,7 @@ test("failed sink drops buffer without retry or re-enqueue", async (t) => {
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600,
     async (agentId, entry) => {
       flushes.push(entry.buffer.sessionKey);
       throw new Error("backend down");
@@ -197,31 +156,55 @@ test("failed sink drops buffer without retry or re-enqueue", async (t) => {
   addTurn(engine, "main", "s1", 1);
   engine.addMessage("main", "s1", "user", "u2"); // предел → enqueue → sink throws
 
-  await waitFor(() => flushes.length === 1);
-  await sleep(20);
+  await waitFor(() => flushes.length === 1, 2000);
+  await sleep(250);
   // Отцепленный буфер удалён из очереди, НЕ возвращён в неё; ошибка залогирована.
   assert.equal(engine.queueLength(), 0);
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
 });
 
-test("single agent with 2+ sessions both timeout and process", async (t) => {
+/**
+ * Реальный интеграционный тест timeout-детекции: дожидаемся настоящего тика.
+ *
+ * - сессия A: только 1 сообщение (user) — по таймауту НЕ уходит (eligibility),
+ *   буфер остаётся жив и ждёт второго сообщения.
+ * - сессия B: пара user+assistant — по таймауту уходит в очередь и processится.
+ *
+ * Это покрывает eligibility gate (одиночное сообщение не эпизод) и сам
+ * запуск отцепления по таймауту реальным таймером движка.
+ */
+test("timeout detection: single-message buffer waits, complete turn dispatches (real tick)", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
     participants,
     50,
-    30,
+    30, // bufferTimeout = 30 c — минимальный валидный
     async (_agentId, entry, reason) => {
-      flushes.push({ sessionKey: entry.buffer.sessionKey, reason });
+      flushes.push({ sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, reason });
     },
-    { checkIntervalMs: 10 },
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "s1", 1);
-  addTurn(engine, "main", "s2", 2);
+  engine.addMessage("main", "session-a", "user", "одиночное-без-ответа");
+  addTurn(engine, "main", "session-b", 1);
 
-  await waitFor(() => flushes.length === 2);
-  const order = flushes.map((f) => f.sessionKey).sort();
-  assert.deepEqual(order, ["s1", "s2"]);
-  assert.ok(flushes.every((f) => f.reason === "timeout"));
+  // Ждём, пока реальный тик (до ~30-70с) отцепит пару session-b.
+  await waitFor(() => flushes.some((f) => f.sessionKey === "session-b"), TIMEOUT_TEST_WINDOW_MS);
+
+  const dispatched = flushes.find((f) => f.sessionKey === "session-b");
+  assert.deepEqual(
+    { sessionKey: dispatched.sessionKey, count: dispatched.count, reason: dispatched.reason },
+    { sessionKey: "session-b", count: 2, reason: "timeout" },
+  );
+
+  // Одиночное сообщение session-a НЕ ушло и не собиралось в очередь.
+  assert.equal(flushes.some((f) => f.sessionKey === "session-a"), false, "single message must not publish");
+  assert.equal(engine.activeBufferCount("main"), 1, "session-a buffer stays alive waiting");
+
+  // Добиваем session-a до пары → уйдёт на следующем тике.
+  engine.addMessage("main", "session-a", "assistant", "теперь-пара");
+  await waitFor(() => flushes.some((f) => f.sessionKey === "session-a"), TIMEOUT_TEST_WINDOW_MS);
+  const a = flushes.find((f) => f.sessionKey === "session-a");
+  assert.equal(a.count, 2);
+  assert.equal(a.reason, "timeout");
 });

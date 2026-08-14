@@ -4,11 +4,11 @@ import { BufferEngine } from "../dist/buffer.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitFor(predicate, timeoutMs = 1000) {
+async function waitFor(predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
-    await sleep(5);
+    await sleep(25);
   }
   assert.fail("condition was not met before timeout");
 }
@@ -31,7 +31,7 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600, // bufferTimeout, сек (не влияет на limit-путь)
     async (_agentId, entry) => {
       order.push(entry.buffer.sessionKey);
       if (order.length < 3) await gate.promise; // держим первый, чтобы хвосты накопились
@@ -47,13 +47,12 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   }
 
   // Снимаем gate: очередь агента должна опустошиться за один pass, строго по порядку.
-  await waitFor(() => order.length === 1);
+  await waitFor(() => order.length === 1, 2000);
   gate.resolve();
-  await waitFor(() => order.length === 3);
+  await waitFor(() => order.length === 3, 2000);
   assert.deepEqual(order, ["a", "b", "c"]);
 
   assert.equal(released, 3);
-  engine.stop();
 });
 
 test("a failing agent does not block another agent's flush (parallel across agents)", async (t) => {
@@ -62,7 +61,7 @@ test("a failing agent does not block another agent's flush (parallel across agen
   const engine = new BufferEngine(
     participants,
     2,
-    60_000,
+    3600,
     async (agentId, entry) => {
       flushes.push({ agentId, sessionKey: entry.buffer.sessionKey });
       if (agentId === "broken") throw new Error("backend unavailable for broken agent");
@@ -78,44 +77,43 @@ test("a failing agent does not block another agent's flush (parallel across agen
   addTurn(engine, "broken", "b1", 1);
   engine.addMessage("broken", "b1", "user", "u2"); // limit → enqueue → sink throws
 
-  await waitFor(() => flushes.some((f) => f.agentId === "broken"));
-  await waitFor(() => errors.length === 1);
+  await waitFor(() => flushes.some((f) => f.agentId === "broken"), 2000);
+  await waitFor(() => errors.length === 1, 2000);
 
   // Здоровый агент продолжает работать независимо.
   addTurn(engine, "healthy", "h1", 1);
   engine.addMessage("healthy", "h1", "user", "u2");
-  await waitFor(() => flushes.some((f) => f.agentId === "healthy"));
+  await waitFor(() => flushes.some((f) => f.agentId === "healthy"), 2000);
 
   const healthy = flushes.find((f) => f.agentId === "healthy");
   assert.deepEqual(healthy, { agentId: "healthy", sessionKey: "h1" });
   assert.equal(errors.length, 1, "only the broken agent reported an error");
   assert.equal(engine.queueLength(), 0);
-  engine.stop();
 });
 
-test("single-skill buffer waits for the second message instead of publishing", async (t) => {
+test("single message buffer is never enqueued (no eligibility), stays alive", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
     participants,
     10,
-    30,
+    3600,
     async (_agentId, entry) => {
       flushes.push(entry.buffer.sessionKey);
     },
-    { checkIntervalMs: 10 },
   );
   t.after(() => engine.stop());
 
-  // Буфер создан, но ни одного сообщения — после таймаута его тихо убирают.
-  engine.addMessage("main", "empty", "user", "x"); // 1 сообщение — не эпизод
-  await sleep(60);
-  assert.equal(flushes.length, 0);
-  // Буфер с одиночным сообщением живёт (eligibility), но после завершения пары уйдёт.
+  // Одиночное сообщение — не эпизод: не попадает в очередь и не эвакуируется.
+  engine.addMessage("main", "empty", "user", "x");
+  await sleep(150); // даём движку шанс ошибочно обработать (его не должно быть)
+  assert.equal(flushes.length, 0, "single message must not be published");
+  assert.equal(engine.queueLength(), 0, "nothing in the queue");
+  assert.equal(engine.activeBufferCount("main"), 1, "buffer stays alive waiting");
+
+  // Добиваем до пары → теперь буфер элиджибл (но реальный timeout-уход проверен
+  // отдельно в buffer.test; здесь только подтверждаем, что пара стала элиджибл).
   engine.addMessage("main", "empty", "assistant", "y");
-  await sleep(50); // ждём, пока таймаут (30мс) покроет пару
-  await waitFor(() => flushes.length === 1);
-  assert.deepEqual(flushes, ["empty"]);
-  engine.stop();
+  assert.equal(engine.activeBufferCount("main"), 1);
 });
 
 function deferred() {

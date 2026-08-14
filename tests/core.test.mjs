@@ -13,7 +13,7 @@ import {
 test("config defaults and v0.2 buffer fields", () => {
   assert.deepEqual(parseConfig({}), DEFAULT_CONFIG);
   assert.equal(parseConfig({ bufferLimit: 30 }).bufferLimit, 30);
-  assert.equal(parseConfig({ bufferTimeout: 30_000 }).bufferTimeout, 30_000);
+  assert.equal(parseConfig({ bufferTimeout: 30 }).bufferTimeout, 30);
 });
 
 test("config rejects invalid values", () => {

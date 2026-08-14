@@ -88,6 +88,23 @@ export function register(api: OpenClawPluginApi): void {
       saga: entry.buffer.sessionKey,
       referenceTime,
     });
+
+    // Логируем ПОЛНЫЙ ответ MCP (не только факт успеха), чтобы видеть, что
+    // реально вернул Graphiti: structuredContent, возможную ошибку внутри 200,
+    // или isError. Без этого невозможно отличить «принято и обработается»
+    // от «принято, но фоновый процесс отклонил/уронил эпизод».
+    logger.debugContent(
+      "capture_mcp_response",
+      {
+        agentId,
+        group_id: agentId,
+        saga: entry.buffer.sessionKey,
+        messages: entry.buffer.messages.length,
+        durationMs: Date.now() - started,
+      },
+      { mcpResult: JSON.stringify(result) },
+    );
+
     if (typeof result.error === "string") throw new Error(result.error);
 
     logger.info("capture_queue_accepted", {

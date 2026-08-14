@@ -178,7 +178,7 @@ test("timeout detection: single-message buffer waits, complete turn dispatches (
   const engine = new BufferEngine(
     participants,
     50,
-    30, // bufferTimeout = 30 c — минимальный валидный
+    120, // bufferTimeout = 120 c (2 мин) — минимальный валидный
     async (_agentId, entry, reason) => {
       flushes.push({ sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, reason });
     },

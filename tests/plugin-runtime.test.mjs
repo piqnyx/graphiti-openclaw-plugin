@@ -62,9 +62,9 @@ function makeFetchRecorder(t) {
 }
 
 const validConfig = (overrides = {}) => ({
-  // v0.2: bufferLimit >= 30, bufferTimeout >= 30 секунд (минимальные валидные значения).
-  bufferLimit: 30,
-  bufferTimeout: 30,
+  // v0.2: bufferLimit >= 4, bufferTimeout >= 120 секунд (минимальные валидные значения).
+  bufferLimit: 4,
+  bufferTimeout: 120,
   participants: [
     { role: "user", name: "Вит", aliases: ["Виктор"] },
     { role: "assistant", name: "Краб", aliases: ["Крабушек"] },

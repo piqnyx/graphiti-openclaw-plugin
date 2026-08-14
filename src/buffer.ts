@@ -68,8 +68,11 @@ export class BufferEngine {
   private readonly agents = new Map<string, AgentCaptureState>();
   private readonly timer: ReturnType<typeof setInterval> | null = null;
   private readonly bufferTimeoutMs: number;
-  // Алиасы-регулярки компилируются один раз при старте (json-format.md),
-  // в порядке участников: user(алиасы), assistant(алиасы).
+  // Алиасы компилируются один раз при старте (json-format.md) как ЛИТЕРАЛЬНЫЕ
+  // Алиасы — это РЕГУЛЯРКИ (по json-format.md), компилируются один раз при
+  // старте. Юзер в конфиге пишет качественные паттерны с границами слова,
+  // например "\\bВиктор\\b" — тогда "в/вит/валЕра" внутри слов не цепляются.
+  // Некорректную регулярку пропускаем (try/catch), не роняя плагин.
   private readonly aliasMatchers: { re: RegExp; name: string }[];
 
   constructor(
@@ -86,7 +89,7 @@ export class BufferEngine {
       p.aliases
         .map((alias) => {
           try {
-            return { re: new RegExp(alias, "gi"), name: p.name } as const;
+            return { re: new RegExp(alias, "giu"), name: p.name } as const;
           } catch {
             return null;
           }
@@ -173,6 +176,8 @@ export class BufferEngine {
   private normalizeText(text: string): string {
     let result = text;
     for (const matcher of this.aliasMatchers) {
+      // Алиасы — это регулярки из конфига (с флагом giu). Юзер описывает паттерны
+      // сам (например с \b или lookaround на не-буквы), код их просто применяет.
       result = result.replace(matcher.re, matcher.name);
     }
     return result;

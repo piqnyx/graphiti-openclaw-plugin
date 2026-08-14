@@ -2,14 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 
-test("v0.2 defaults: buffer fields and canonical participants", () => {
+test("v0.2 defaults: buffer fields and per-agent canonical actors", () => {
   const cfg = parseConfig({});
   assert.equal(cfg.bufferLimit, 4);
   assert.equal(cfg.bufferTimeout, 900);
-  assert.deepEqual(cfg.participants, [
-    { role: "user", name: "Вит", aliases: [] },
-    { role: "assistant", name: "Краб", aliases: [] },
-  ]);
+  assert.deepEqual(cfg.agents, {
+    main: { user: "Вит", assistant: "Краб" },
+  });
   assert.deepEqual(cfg, DEFAULT_CONFIG);
 });
 
@@ -29,7 +28,6 @@ test("live diagnostic overrides are accepted", () => {
 test("bufferLimit must be >= 4", () => {
   assert.throws(() => parseConfig({ bufferLimit: 3 }), /bufferLimit/);
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 4 }));
-  // дефолт 4 — валиден; max допускается
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 1000 }));
 });
 
@@ -38,62 +36,40 @@ test("bufferTimeout must be >= 120 seconds (2 min)", () => {
   assert.doesNotThrow(() => parseConfig({ bufferTimeout: 120 }));
 });
 
-test("participants require exactly one user and one assistant with names", () => {
-  assert.throws(() => parseConfig({ participants: [] }), /user/);
+test("agents: each entry needs non-empty user and assistant names", () => {
+  assert.throws(() => parseConfig({ agents: { main: {} } }), /user/);
   assert.throws(
-    () => parseConfig({ participants: [{ role: "user", name: "Вит" }] }),
+    () => parseConfig({ agents: { main: { user: "Вит" } } }),
     /assistant/,
   );
   assert.throws(
-    () =>
-      parseConfig({
-        participants: [
-          { role: "user", name: "Вит" },
-          { role: "user", name: "Другой" },
-        ],
-      }),
-    /duplicate participant role/,
+    () => parseConfig({ agents: { main: { user: "", assistant: "Краб" } } }),
+    /user/,
   );
   assert.throws(
-    () =>
-      parseConfig({
-        participants: [
-          { role: "user", name: "" },
-          { role: "assistant", name: "Краб" },
-        ],
-      }),
-    /user name/,
+    () => parseConfig({ agents: { "": { user: "Вит", assistant: "Краб" } } }),
+    /agentId/,
   );
   assert.doesNotThrow(() =>
     parseConfig({
-      participants: [
-        { role: "user", name: "Вит", aliases: ["Виктор", "В."] },
-        { role: "assistant", name: "Краб", aliases: [] },
-      ],
+      agents: {
+        main: { user: "Вит", assistant: "Краб" },
+        igor: { user: "Игорь", assistant: "Ассистент" },
+      },
     }),
   );
 });
 
-test("aliases must be an array of non-empty strings", () => {
+test("agents replaces obsolete participants; aliases are gone", () => {
+  // Старая схема participants (даже корректная) не принимается.
   assert.throws(
-    () =>
-      parseConfig({
-        participants: [
-          { role: "user", name: "Вит", aliases: "Виктор" },
-          { role: "assistant", name: "Краб" },
-        ],
-      }),
-    /alias/,
+    () => parseConfig({ participants: [{ role: "user", name: "Вит" }] }),
+    /unknown plugin config key/,
   );
+  // Ключ aliases больше не существует ни у кого — любой алиас упадёт как unknown.
   assert.throws(
-    () =>
-      parseConfig({
-        participants: [
-          { role: "user", name: "Вит", aliases: [""] },
-          { role: "assistant", name: "Краб" },
-        ],
-      }),
-    /alias/,
+    () => parseConfig({ agents: { main: { user: "Вит", assistant: "Краб", aliases: [] } } }),
+    /aliases/,
   );
 });
 

@@ -118,7 +118,7 @@ export function register(api: OpenClawPluginApi): void {
   };
 
   const engine = new BufferEngine(
-    cfg.participants,
+    cfg.agents,
     cfg.bufferLimit,
     cfg.bufferTimeout,
     sink,
@@ -275,7 +275,7 @@ export function register(api: OpenClawPluginApi): void {
     autoRecall: cfg.autoRecall,
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
-    participants: cfg.participants.map((p) => `${p.role}:${p.name}`),
+    agents: Object.entries(cfg.agents).map(([id, a]) => `${id}:user=${a.user}:assistant=${a.assistant}`),
     requestTimeoutMs: cfg.requestTimeoutMs,
     recallLimit: cfg.recallLimit,
     logLevel: cfg.logLevel,

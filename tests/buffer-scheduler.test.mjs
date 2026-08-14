@@ -13,10 +13,9 @@ async function waitFor(predicate, timeoutMs) {
   assert.fail("condition was not met before timeout");
 }
 
-const participants = [
-  { role: "user", name: "Вит", aliases: [] },
-  { role: "assistant", name: "Краб", aliases: [] },
-];
+const agents = {
+  main: { user: "Вит", assistant: "Краб" },
+};
 
 function addTurn(engine, agentId, sessionKey, n) {
   engine.addMessage(agentId, sessionKey, "user", `user-${n}`);
@@ -29,7 +28,7 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   let released = 0;
 
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600, // bufferTimeout, сек (не влияет на limit-путь)
     async (_agentId, entry) => {
@@ -59,7 +58,7 @@ test("a failing agent does not block another agent's flush (parallel across agen
   const flushes = [];
   const errors = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600,
     async (agentId, entry) => {
@@ -94,7 +93,7 @@ test("a failing agent does not block another agent's flush (parallel across agen
 test("single message buffer is never enqueued (no eligibility), stays alive", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     10,
     3600,
     async (_agentId, entry) => {

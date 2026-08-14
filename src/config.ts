@@ -1,11 +1,14 @@
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
-export type ParticipantRole = "user" | "assistant";
-
-export type ParticipantConfig = {
-  role: ParticipantRole;
-  name: string;
-  aliases: string[];
+/**
+ * Канонические имена акторов одного агента.
+ * `user` — человек, `assistant` — его бот. Без алиасов-регулярок:
+ * имена служат только для participants в JSON-эпизоде Graphiti, текст
+ * сообщений НЕ переписывается (никакого поедания слогов/мусора).
+ */
+export type AgentActors = {
+  user: string;
+  assistant: string;
 };
 
 export type GraphitiPluginConfig = {
@@ -19,11 +22,15 @@ export type GraphitiPluginConfig = {
   logOperations: boolean;
   logLevel: LogLevel;
   logContent: boolean;
-  // v0.2: buffer / queue
+  // v0.2: buffer / queue  (bufferTimeout — в секундах)
   bufferLimit: number;
   bufferTimeout: number;
-  participants: ParticipantConfig[];
+  // v0.2: канонические имена акторов ПО АГЕНТАМ (мультиагент).
+  // Ключ — agentId (main, igor, red, orange...), значение — имена человека и бота.
+  agents: Record<string, AgentActors>;
 };
+
+export const DEFAULT_ACTORS: AgentActors = { user: "User", assistant: "Assistant" };
 
 export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   baseUrl: "http://127.0.0.1:8000/mcp/",
@@ -39,10 +46,9 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   // v0.2: buffer / queue  (bufferTimeout — в секундах)
   bufferLimit: 4,
   bufferTimeout: 900,
-  participants: [
-    { role: "user", name: "Вит", aliases: [] },
-    { role: "assistant", name: "Краб", aliases: [] },
-  ],
+  agents: {
+    main: { user: "Вит", assistant: "Краб" },
+  },
 };
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -91,55 +97,38 @@ function baseUrlValue(raw: unknown): string {
   return url.toString();
 }
 
-/**
- * Participants: ровно один `user` и один `assistant`, с непустыми именами и
- * опциональными массивами алиасов-регулярок.
- */
-function participantsValue(raw: unknown): ParticipantConfig[] {
-  if (raw === undefined) return DEFAULT_CONFIG.participants;
-  if (!Array.isArray(raw)) throw new Error("participants must be an array");
-
-  const seen = new Set<ParticipantRole>();
-  const result: ParticipantConfig[] = [];
-
-  for (const item of raw) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      throw new Error("each participant must be an object");
-    }
-    const p = item as Record<string, unknown>;
-
-    const role = p.role;
-    if (role !== "user" && role !== "assistant") {
-      throw new Error('participant role must be "user" or "assistant"');
-    }
-    if (seen.has(role)) {
-      throw new Error(`duplicate participant role: ${role}`);
-    }
-
-    const name = p.name;
-    if (typeof name !== "string" || name.trim() === "") {
-      throw new Error(`participant ${role} name must be a non-empty string`);
-    }
-
-    let aliases: string[] = [];
-    if (p.aliases !== undefined) {
-      if (!Array.isArray(p.aliases)) {
-        throw new Error(`participant ${role} aliases must be an array of strings`);
-      }
-      aliases = p.aliases.map((alias, idx) => {
-        if (typeof alias !== "string" || alias.trim() === "") {
-          throw new Error(`participant ${role} alias at index ${idx} must be a non-empty string`);
-        }
-        return alias.trim();
-      });
-    }
-
-    seen.add(role);
-    result.push({ role, name: name.trim(), aliases });
+function nonEmptyName(value: unknown, what: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${what} must be a non-empty string`);
   }
+  return value.trim();
+}
 
-  if (!seen.has("user")) throw new Error("participants must include a user role");
-  if (!seen.has("assistant")) throw new Error("participants must include an assistant role");
+/**
+ * Агенты: объект { agentId: { user: string, assistant: string } }.
+ * Алиасов-регулярок нет — только канонические имена человека и бота.
+ */
+function agentsValue(raw: unknown): Record<string, AgentActors> {
+  if (raw === undefined) return DEFAULT_CONFIG.agents;
+  const obj = asObject(raw);
+  const result: Record<string, AgentActors> = {};
+
+  for (const [agentId, value] of Object.entries(obj)) {
+    if (agentId.trim() === "") {
+      throw new Error("agents key (agentId) must be a non-empty string");
+    }
+    const entry = asObject(value);
+    const allowedEntry = new Set(["user", "assistant"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowedEntry.has(key)) {
+        throw new Error(`agents[${agentId}] contains unknown key: ${key}`);
+      }
+    }
+    result[agentId] = {
+      user: nonEmptyName(entry.user, `agents[${agentId}].user`),
+      assistant: nonEmptyName(entry.assistant, `agents[${agentId}].assistant`),
+    };
+  }
 
   return result;
 }
@@ -159,7 +148,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "logContent",
     "bufferLimit",
     "bufferTimeout",
-    "participants",
+    "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -211,6 +200,6 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       120,
       7 * 24 * 60 * 60,
     ),
-    participants: participantsValue(raw.participants),
+    agents: agentsValue(raw.agents),
   };
 }

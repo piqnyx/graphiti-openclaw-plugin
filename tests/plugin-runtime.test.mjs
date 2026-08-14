@@ -65,10 +65,9 @@ const validConfig = (overrides = {}) => ({
   // v0.2: bufferLimit >= 4, bufferTimeout >= 120 секунд (минимальные валидные значения).
   bufferLimit: 4,
   bufferTimeout: 120,
-  participants: [
-    { role: "user", name: "Вит", aliases: ["Виктор"] },
-    { role: "assistant", name: "Краб", aliases: ["Крабушек"] },
-  ],
+  agents: {
+    main: { user: "Вит", assistant: "Краб" },
+  },
   ...overrides,
 });
 
@@ -161,16 +160,13 @@ test("agent_end with no assistant reply publishes nothing", async (t) => {
   assert.equal(turnLog, undefined, "nothing added to buffer without assistant reply");
 });
 
-test("invalid participants config is rejected at plugin load", async (t) => {
+test("invalid agents config is rejected at plugin load", async (t) => {
   makeFetchRecorder(t);
   const { api } = makeApi(
     validConfig({
-      participants: [
-        { role: "user", name: "Вит" },
-        { role: "user", name: "Другой" },
-      ],
+      agents: { main: { user: "Вит" } }, // нет assistant → invalid
     }),
   );
 
-  assert.throws(() => register(api), /duplicate participant role/);
+  assert.throws(() => register(api), /assistant/);
 });

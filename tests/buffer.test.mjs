@@ -23,10 +23,9 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-const participants = [
-  { role: "user", name: "Вит", aliases: [] },
-  { role: "assistant", name: "Краб", aliases: [] },
-];
+const agents = {
+  main: { user: "Вит", assistant: "Краб" },
+};
 
 function addTurn(engine, agentId, sessionKey, n) {
   engine.addMessage(agentId, sessionKey, "user", `user-${n}`);
@@ -39,7 +38,7 @@ const TIMEOUT_TEST_WINDOW_MS = (CHECK_INTERVAL_SEC * 2 + 10) * 1000;
 
 test("limit trigger: full buffer detaches as one episode and continues in a fresh buffer", async (t) => {
   const flushes = [];
-  const engine = new BufferEngine(participants, 2, 3600, async (agentId, entry, reason) => {
+  const engine = new BufferEngine(agents, 2, 3600, async (agentId, entry, reason) => {
     flushes.push({
       agentId,
       sessionKey: entry.buffer.sessionKey,
@@ -68,7 +67,7 @@ test("limit trigger: full buffer detaches as one episode and continues in a fres
 test("buffers are isolated per session within an agent", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600,
     async (_agentId, entry, reason) => {
@@ -92,7 +91,7 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
   const gate = deferred();
   // limit=2 → каждый ход сразу отцепляется, очередь формируется по порядку добавления сессий.
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600,
     async (_agentId, entry) => {
@@ -116,7 +115,7 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
 test("agents are isolated: one agent's buffer does not affect another", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600,
     async (agentId, entry) => {
@@ -139,7 +138,7 @@ test("failed sink drops buffer without retry or re-enqueue", async (t) => {
   const errors = [];
   const flushes = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     2,
     3600,
     async (agentId, entry) => {
@@ -176,9 +175,9 @@ test("failed sink drops buffer without retry or re-enqueue", async (t) => {
 test("timeout detection: single-message buffer waits, complete turn dispatches (real tick)", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
-    participants,
+    agents,
     50,
-    120, // bufferTimeout = 120 c (2 мин) — минимальный валидный
+    30, // bufferTimeout = 30 c — движок принимает секунды напрямую (не parseConfig)
     async (_agentId, entry, reason) => {
       flushes.push({ sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, reason });
     },

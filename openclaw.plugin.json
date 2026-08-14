@@ -22,21 +22,15 @@
       "logContent": { "type": "boolean" },
       "bufferLimit": { "type": "integer", "minimum": 4, "maximum": 1000 },
       "bufferTimeout": { "type": "integer", "minimum": 120, "maximum": 604800 },
-      "participants": {
-        "type": "array",
-        "minItems": 2,
-        "maxItems": 2,
-        "items": {
+      "agents": {
+        "type": "object",
+        "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["role", "name"],
+          "required": ["user", "assistant"],
           "properties": {
-            "role": { "type": "string", "enum": ["user", "assistant"] },
-            "name": { "type": "string", "minLength": 1 },
-            "aliases": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
-            }
+            "user": { "type": "string", "minLength": 1 },
+            "assistant": { "type": "string", "minLength": 1 }
           }
         }
       }

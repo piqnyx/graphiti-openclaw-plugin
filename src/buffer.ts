@@ -1,4 +1,5 @@
-import type { ParticipantConfig, ParticipantRole } from "./config.js";
+import type { AgentActors } from "./config.js";
+import { DEFAULT_ACTORS } from "./config.js";
 
 export type MessageRole = "user" | "assistant";
 
@@ -9,11 +10,12 @@ export type BufferMessage = {
 
 /**
  * Пустой JSON-эпизод создаётся вместе с буфером (Lifecycle JSON, json-format.md):
- * `participants` (акторы) присутствуют, `messages` = `[]`.
- * Сообщения нормализуются и наталкиваются в `messages` по мере добавления.
+ * `participants` (канонические имена акторов агента) присутствуют, `messages` = `[]`.
+ * Сообщения наталкиваются в `messages` по мере добавления. Текст НЕ переписывается
+ * (никаких алиасов-регулярок) — Graphiti получает реальные сообщения как есть.
  */
 export type EpisodeJson = {
-  participants: Record<ParticipantRole, string>;
+  participants: { user: string; assistant: string };
   messages: BufferMessage[];
 };
 
@@ -58,25 +60,20 @@ export const CHECK_INTERVAL_SEC = 30;
  * - Очередь FIFO на агента.
  * - Буфер отцепляется в очередь по лимиту (bufferLimit) или таймауту
  *   неактивности (bufferTimeout, в секундах). Eligibility: минимум 2 сообщения.
- * - Пустой JSON (акторы + messages=[]) создаётся вместе с буфером; сообщения
- *   нормализуются (алиасы) и наталкиваются в него при добавлении.
+ * - Пустой JSON (акторы агента + messages=[]) создаётся вместе с буфером;
+ *   сообщения наталкиваются в него при добавлении (без переписывания текста).
  * - Внутри агента очередь processится строго последовательно (FIFO),
  *   между агентами — параллельно.
  * - При ошибке отправки буфер удаляется и НЕ возвращается в очередь (нет retry).
  */
 export class BufferEngine {
-  private readonly agents = new Map<string, AgentCaptureState>();
+  private readonly captureStates = new Map<string, AgentCaptureState>();
   private readonly timer: ReturnType<typeof setInterval> | null = null;
   private readonly bufferTimeoutMs: number;
-  // Алиасы компилируются один раз при старте (json-format.md) как ЛИТЕРАЛЬНЫЕ
-  // Алиасы — это РЕГУЛЯРКИ (по json-format.md), компилируются один раз при
-  // старте. Юзер в конфиге пишет качественные паттерны с границами слова,
-  // например "\\bВиктор\\b" — тогда "в/вит/валЕра" внутри слов не цепляются.
-  // Некорректную регулярку пропускаем (try/catch), не роняя плагин.
-  private readonly aliasMatchers: { re: RegExp; name: string }[];
 
   constructor(
-    private readonly participants: ParticipantConfig[],
+    // Канонические имена акторов ПО АГЕНТАМ (мультиагент).
+    private readonly agents: Record<string, AgentActors>,
     private readonly bufferLimit: number,
     bufferTimeoutSec: number, // в секундах (конфиг); внутри конвертируем в мс
     private readonly sink: AgentSink,
@@ -85,17 +82,6 @@ export class BufferEngine {
     } = {},
   ) {
     this.bufferTimeoutMs = bufferTimeoutSec * 1000;
-    this.aliasMatchers = this.participants.flatMap((p) =>
-      p.aliases
-        .map((alias) => {
-          try {
-            return { re: new RegExp(alias, "giu"), name: p.name } as const;
-          } catch {
-            return null;
-          }
-        })
-        .filter((m): m is { re: RegExp; name: string } => m !== null),
-    );
     this.timer = setInterval(() => {
       this.tick().catch((error: unknown) => {
         // Tick-обработка не должна ронять процесс из-за одной ошибки.
@@ -110,7 +96,7 @@ export class BufferEngine {
     let buffer = agent.activeBuffers.get(sessionKey);
 
     if (!buffer) {
-      buffer = this.createBuffer(sessionKey);
+      buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
@@ -132,23 +118,26 @@ export class BufferEngine {
         return;
       }
       // Элиджибл буфер: ушёл в очередь, открываем свежий с новым пустым JSON.
-      buffer = this.createBuffer(sessionKey);
+      buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
     this.pushMessage(buffer, role, text, now);
   }
 
-  /** Создаёт буфер с пустым JSON-эпизодом (акторы есть, messages=[]). */
-  private createBuffer(sessionKey: string): Buffer {
-    const now = Date.now();
-    const names: Record<ParticipantRole, string> = {
-      user: "user",
-      assistant: "assistant",
-    };
-    for (const p of this.participants) names[p.role] = p.name;
+  /** Канонические имена акторов для агента (fallback на User/Assistant). */
+  private actorsFor(agentId: string): AgentActors {
+    return this.agents[agentId] ?? DEFAULT_ACTORS;
+  }
 
-    const episode: EpisodeJson = { participants: names, messages: [] };
+  /** Создаёт буфер с пустым JSON-эпизодом (акторы агента есть, messages=[]). */
+  private createBuffer(sessionKey: string, agentId: string): Buffer {
+    const now = Date.now();
+    const actors = this.actorsFor(agentId);
+    const episode: EpisodeJson = {
+      participants: { user: actors.user, assistant: actors.assistant },
+      messages: [],
+    };
     return {
       sessionKey,
       messages: episode.messages,
@@ -158,29 +147,18 @@ export class BufferEngine {
     };
   }
 
-  /** Нормализует текст и наталкивает сообщение в JSON буфера. */
+  /** Наталкивает сообщение в JSON буфера без переписывания текста. */
   private pushMessage(
     buffer: Buffer,
     role: MessageRole,
     text: string,
     now: number,
   ): void {
-    const normalized = this.normalizeText(text);
-    const message: BufferMessage = { role, text: normalized };
+    const message: BufferMessage = { role, text };
     // buffer.messages === buffer.episode.messages (одна ссылка, см. createBuffer),
     // поэтому достаточно одного push — JSON обновится автоматически.
     buffer.messages.push(message);
     buffer.lastActivityAt = now;
-  }
-
-  private normalizeText(text: string): string {
-    let result = text;
-    for (const matcher of this.aliasMatchers) {
-      // Алиасы — это регулярки из конфига (с флагом giu). Юзер описывает паттерны
-      // сам (например с \b или lookaround на не-буквы), код их просто применяет.
-      result = result.replace(matcher.re, matcher.name);
-    }
-    return result;
   }
 
   /** Буфер — эпизод только если в нём минимум 2 сообщения (BUFFER_SPEC eligibility). */
@@ -189,17 +167,17 @@ export class BufferEngine {
   }
 
   private ensureAgent(agentId: string): AgentCaptureState {
-    let agent = this.agents.get(agentId);
+    let agent = this.captureStates.get(agentId);
     if (!agent) {
       agent = { agentId, activeBuffers: new Map(), queue: [], processing: false };
-      this.agents.set(agentId, agent);
+      this.captureStates.set(agentId, agent);
     }
     return agent;
   }
 
   private async tick(): Promise<void> {
     const now = Date.now();
-    for (const agent of this.agents.values()) {
+    for (const agent of this.captureStates.values()) {
       for (const [sessionKey, buffer] of agent.activeBuffers) {
         if (buffer.messages.length === 0) continue;
         const elapsed = now - buffer.lastActivityAt;
@@ -248,13 +226,13 @@ export class BufferEngine {
   /** Активная (живая) очередь всех агентов — для диагностики. */
   queueLength(): number {
     let total = 0;
-    for (const state of this.agents.values()) total += state.queue.length;
+    for (const state of this.captureStates.values()) total += state.queue.length;
     return total;
   }
 
   /** Количество живых буферов по агенту. */
   activeBufferCount(agentId: string): number {
-    return this.agents.get(agentId)?.activeBuffers.size ?? 0;
+    return this.captureStates.get(agentId)?.activeBuffers.size ?? 0;
   }
 
   stop(): void {

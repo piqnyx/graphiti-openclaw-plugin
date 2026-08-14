@@ -119,3 +119,43 @@ test("add_memory sends source json, saga and reference_time", async (t) => {
   assert.equal(typeof args.custom_extraction_instructions, "string");
   assert.match(args.custom_extraction_instructions, /messages.*ARRAY/);
 });
+
+test("raw logger receives full request and response bodies", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const raws = [];
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, init) => {
+    if (JSON.parse(init.body).method === "initialize") {
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: JSON.parse(init.body).id,
+        result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: {} },
+      });
+    }
+    if (JSON.parse(init.body).method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: JSON.parse(init.body).id,
+      result: { structuredContent: { message: "queued" }, content: [], isError: false },
+    });
+  };
+
+  const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000, (kind, body) =>
+    raws.push({ kind, body }),
+  );
+  await client.addMemory({
+    name: "test",
+    jsonBody: '{"participants":{"user":"Вит"}}',
+    groupId: "main",
+    saga: "s1",
+    referenceTime: "2026-08-14T00:00:00.000Z",
+  });
+
+  assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("add_memory")));
+  assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("episode_body")));
+  assert.ok(raws.some((r) => r.kind === "response" && r.body.includes("queued")));
+});

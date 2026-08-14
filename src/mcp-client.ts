@@ -81,11 +81,15 @@ export class GraphitiMcpClient {
   private protocolVersion = "2025-06-18";
   private initialized = false;
   private nextId = 1;
+  private readonly rawLogger?: (kind: "request" | "response", body: string) => void;
 
   constructor(
     private readonly baseUrl: string,
     private readonly timeoutMs: number,
-  ) {}
+    rawLogger?: (kind: "request" | "response", body: string) => void,
+  ) {
+    this.rawLogger = rawLogger;
+  }
 
   async addMemory(params: {
     name: string;
@@ -199,6 +203,14 @@ export class GraphitiMcpClient {
       if (this.sessionId) headers.set("Mcp-Session-Id", this.sessionId);
       if (includeProtocolHeader) headers.set("MCP-Protocol-Version", this.protocolVersion);
 
+      // Сырой HTTP-запрос: метод + URL + полные аргументы (как уходит на сервер).
+      this.rawLogger?.(
+        "request",
+        `POST ${this.baseUrl}\n${[...headers.entries()]
+          .map(([k, v]) => `${k}: ${v}`)
+          .join("\n")}\n\n${JSON.stringify(payload)}`,
+      );
+
       const response = await fetch(this.baseUrl, {
         method: "POST",
         headers,
@@ -211,12 +223,16 @@ export class GraphitiMcpClient {
 
       if (!response.ok) {
         const detail = (await response.text()).slice(0, 300);
+        // Сырой ответ при ошибке тоже фиксируем.
+        this.rawLogger?.("response", `HTTP ${response.status}\n${detail}`);
         throw new Error(`Graphiti MCP HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
       }
 
       if (notification || response.status === 202 || response.status === 204) return {};
 
       const body = await response.text();
+      // Сырое тело ответа (что реально отдал сервер).
+      this.rawLogger?.("response", `HTTP ${response.status} ${response.headers.get("content-type") ?? ""}\n${body}`);
       if (!body.trim()) throw new Error("Graphiti MCP returned an empty response");
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) {

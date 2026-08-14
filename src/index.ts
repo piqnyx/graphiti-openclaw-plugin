@@ -50,7 +50,15 @@ export function register(api: OpenClawPluginApi): void {
   }
 
   const logger = createGraphitiLogger(api.logger, cfg);
-  const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
+  // Сырой лог запроса/ответа MCP (виден при logContent=true в debug-уровне):
+  // фиксирует полный HTTP-запрос и сырое тело ответа — для проверки протокола.
+  const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs, (kind, body) => {
+    logger.debugContent(
+      kind === "request" ? "mcp_raw_request" : "mcp_raw_response",
+      { baseUrl: cfg.baseUrl },
+      { raw: body },
+    );
+  });
 
   // Sink: берёт готовый JSON-эпизод из буфера (акторы + нормализованные сообщения)
   // и отправляет в Graphiti. `agentId` подставляет движок при processинге (agent = group_id).

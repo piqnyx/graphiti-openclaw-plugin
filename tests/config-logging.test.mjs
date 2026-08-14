@@ -73,6 +73,14 @@ test("agents replaces obsolete participants; aliases are gone", () => {
   );
 });
 
+test("customExtractionInstructions defaults empty and accepts a string", () => {
+  const cfg = parseConfig({});
+  assert.equal(cfg.customExtractionInstructions, "");
+  const withPrompt = parseConfig({ customExtractionInstructions: "Extract ALL entities." });
+  assert.equal(withPrompt.customExtractionInstructions, "Extract ALL entities.");
+  assert.throws(() => parseConfig({ customExtractionInstructions: 42 }), /customExtractionInstructions/);
+});
+
 test("obsolete v0.1 buffer flags are rejected", () => {
   assert.throws(() => parseConfig({ captureBatchTurns: 1 }), /unknown plugin config key/);
   assert.throws(

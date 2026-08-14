@@ -106,6 +106,7 @@ test("add_memory sends source json, saga and reference_time", async (t) => {
     groupId: "main",
     saga: "session-1",
     referenceTime: "2026-08-14T00:00:00.000Z",
+    customExtractionInstructions: "Extract ALL entities from the text field.",
   });
 
   assert.equal(calls.length, 1);
@@ -114,5 +115,6 @@ test("add_memory sends source json, saga and reference_time", async (t) => {
   assert.equal(args.source, "json");
   assert.equal(args.saga, "session-1");
   assert.equal(args.reference_time, "2026-08-14T00:00:00.000Z");
+  assert.equal(args.custom_extraction_instructions, "Extract ALL entities from the text field.");
   assert.equal("uuid" in args, false);
 });

@@ -86,6 +86,7 @@ export class GraphitiMcpClient {
     groupId: string;
     saga: string;
     referenceTime: string;
+    customExtractionInstructions?: string;
   }): Promise<JsonObject> {
     return this.callTool("add_memory", {
       name: params.name,
@@ -94,6 +95,9 @@ export class GraphitiMcpClient {
       source: "json",
       saga: params.saga,
       reference_time: params.referenceTime,
+      ...(params.customExtractionInstructions
+        ? { custom_extraction_instructions: params.customExtractionInstructions }
+        : {}),
     });
   }
 

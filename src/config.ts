@@ -28,6 +28,9 @@ export type GraphitiPluginConfig = {
   // v0.2: канонические имена акторов ПО АГЕНТАМ (мультиагент).
   // Ключ — agentId (main, igor, red, orange...), значение — имена человека и бота.
   agents: Record<string, AgentActors>;
+  // v0.2: natural-language надстройка над дефолтным extract_json промптом
+  // (custom_extraction_instructions в add_memory). Пусто = без надстройки.
+  customExtractionInstructions: string;
 };
 
 export const DEFAULT_ACTORS: AgentActors = { user: "User", assistant: "Assistant" };
@@ -49,6 +52,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   agents: {
     main: { user: "Вит", assistant: "Краб" },
   },
+  customExtractionInstructions: "",
 };
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -62,6 +66,12 @@ function asObject(value: unknown): Record<string, unknown> {
 function booleanValue(raw: unknown, fallback: boolean, name: string): boolean {
   if (raw === undefined) return fallback;
   if (typeof raw !== "boolean") throw new Error(`${name} must be a boolean`);
+  return raw;
+}
+
+function stringValue(raw: unknown, fallback: string, name: string): string {
+  if (raw === undefined) return fallback;
+  if (typeof raw !== "string") throw new Error(`${name} must be a string`);
   return raw;
 }
 
@@ -149,6 +159,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "bufferLimit",
     "bufferTimeout",
     "agents",
+    "customExtractionInstructions",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -201,5 +212,10 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       7 * 24 * 60 * 60,
     ),
     agents: agentsValue(raw.agents),
+    customExtractionInstructions: stringValue(
+      raw.customExtractionInstructions,
+      DEFAULT_CONFIG.customExtractionInstructions,
+      "customExtractionInstructions",
+    ),
   };
 }

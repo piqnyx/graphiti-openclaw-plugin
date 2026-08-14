@@ -82,16 +82,18 @@ export class GraphitiMcpClient {
 
   async addMemory(params: {
     name: string;
-    episodeBody: string;
+    jsonBody: string;
     groupId: string;
-    sourceDescription: string;
+    saga: string;
+    referenceTime: string;
   }): Promise<JsonObject> {
     return this.callTool("add_memory", {
       name: params.name,
-      episode_body: params.episodeBody,
+      episode_body: params.jsonBody,
       group_id: params.groupId,
-      source: "text",
-      source_description: params.sourceDescription,
+      source: "json",
+      saga: params.saga,
+      reference_time: params.referenceTime,
     });
   }
 

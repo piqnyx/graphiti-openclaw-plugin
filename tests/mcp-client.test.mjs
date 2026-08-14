@@ -65,7 +65,7 @@ test("MCP client initializes once and scopes fact search to group_id", async (t)
   assert.equal(call.headers.get("Mcp-Session-Id"), "session-one");
 });
 
-test("add_memory does not send a client-generated uuid", async (t) => {
+test("add_memory sends source json, saga and reference_time", async (t) => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   t.after(() => {
@@ -102,12 +102,17 @@ test("add_memory does not send a client-generated uuid", async (t) => {
   const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
   await client.addMemory({
     name: "test",
-    episodeBody: "USER: one\nASSISTANT: two",
+    jsonBody: '{"participants":{"user":"Вит","assistant":"Краб"}}',
     groupId: "main",
-    sourceDescription: "test source",
+    saga: "session-1",
+    referenceTime: "2026-08-14T00:00:00.000Z",
   });
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].group_id, "main");
-  assert.equal("uuid" in calls[0], false);
+  const args = calls[0];
+  assert.equal(args.group_id, "main");
+  assert.equal(args.source, "json");
+  assert.equal(args.saga, "session-1");
+  assert.equal(args.reference_time, "2026-08-14T00:00:00.000Z");
+  assert.equal("uuid" in args, false);
 });

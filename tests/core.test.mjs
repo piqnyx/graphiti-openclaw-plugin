@@ -10,14 +10,16 @@ import {
   stripInjectedContexts,
 } from "../dist/text.js";
 
-test("config defaults and threshold one", () => {
+test("config defaults and v0.2 buffer fields", () => {
   assert.deepEqual(parseConfig({}), DEFAULT_CONFIG);
-  assert.equal(parseConfig({ captureBatchTurns: 1 }).captureBatchTurns, 1);
+  assert.equal(parseConfig({ bufferLimit: 30 }).bufferLimit, 30);
+  assert.equal(parseConfig({ bufferTimeout: 30_000 }).bufferTimeout, 30_000);
 });
 
 test("config rejects invalid values", () => {
   assert.throws(() => parseConfig({ surprise: true }), /unknown plugin config key/);
-  assert.throws(() => parseConfig({ captureBatchTurns: 0 }), /captureBatchTurns/);
+  assert.throws(() => parseConfig({ bufferLimit: 29 }), /bufferLimit/);
+  assert.throws(() => parseConfig({ captureBatchTurns: 1 }), /unknown plugin config key/);
 });
 
 test("agent identity fails closed", () => {

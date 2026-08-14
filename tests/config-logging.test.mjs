@@ -2,23 +2,110 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 
+test("v0.2 defaults: buffer fields and canonical participants", () => {
+  const cfg = parseConfig({});
+  assert.equal(cfg.bufferLimit, 50);
+  assert.equal(cfg.bufferTimeout, 900_000);
+  assert.deepEqual(cfg.participants, [
+    { role: "user", name: "Вит", aliases: [] },
+    { role: "assistant", name: "Краб", aliases: [] },
+  ]);
+  assert.deepEqual(cfg, DEFAULT_CONFIG);
+});
+
 test("diagnostic defaults stay non-content and info-level", () => {
   const cfg = parseConfig({});
   assert.equal(cfg.logLevel, "info");
   assert.equal(cfg.logContent, false);
   assert.equal(cfg.logOperations, true);
-  assert.deepEqual(cfg, DEFAULT_CONFIG);
 });
 
 test("live diagnostic overrides are accepted", () => {
-  const cfg = parseConfig({ captureBatchTurns: 1, logLevel: "debug", logContent: true });
-  assert.equal(cfg.captureBatchTurns, 1);
+  const cfg = parseConfig({ logLevel: "debug", logContent: true });
   assert.equal(cfg.logLevel, "debug");
   assert.equal(cfg.logContent, true);
 });
 
-test("invalid diagnostic values fail closed", () => {
-  assert.throws(() => parseConfig({ logLevel: "trace" }), /logLevel/);
-  assert.throws(() => parseConfig({ logContent: "yes" }), /logContent/);
+test("bufferLimit must be >= 30", () => {
+  assert.throws(() => parseConfig({ bufferLimit: 29 }), /bufferLimit/);
+  assert.doesNotThrow(() => parseConfig({ bufferLimit: 30 }));
+  // дефолт 50 — валиден; max допускается
+  assert.doesNotThrow(() => parseConfig({ bufferLimit: 1000 }));
+});
+
+test("bufferTimeout must be >= 30000 ms", () => {
+  assert.throws(() => parseConfig({ bufferTimeout: 29_999 }), /bufferTimeout/);
+  assert.doesNotThrow(() => parseConfig({ bufferTimeout: 30_000 }));
+});
+
+test("participants require exactly one user and one assistant with names", () => {
+  assert.throws(() => parseConfig({ participants: [] }), /user/);
+  assert.throws(
+    () => parseConfig({ participants: [{ role: "user", name: "Вит" }] }),
+    /assistant/,
+  );
+  assert.throws(
+    () =>
+      parseConfig({
+        participants: [
+          { role: "user", name: "Вит" },
+          { role: "user", name: "Другой" },
+        ],
+      }),
+    /duplicate participant role/,
+  );
+  assert.throws(
+    () =>
+      parseConfig({
+        participants: [
+          { role: "user", name: "" },
+          { role: "assistant", name: "Краб" },
+        ],
+      }),
+    /user name/,
+  );
+  assert.doesNotThrow(() =>
+    parseConfig({
+      participants: [
+        { role: "user", name: "Вит", aliases: ["Виктор", "В."] },
+        { role: "assistant", name: "Краб", aliases: [] },
+      ],
+    }),
+  );
+});
+
+test("aliases must be an array of non-empty strings", () => {
+  assert.throws(
+    () =>
+      parseConfig({
+        participants: [
+          { role: "user", name: "Вит", aliases: "Виктор" },
+          { role: "assistant", name: "Краб" },
+        ],
+      }),
+    /alias/,
+  );
+  assert.throws(
+    () =>
+      parseConfig({
+        participants: [
+          { role: "user", name: "Вит", aliases: [""] },
+          { role: "assistant", name: "Краб" },
+        ],
+      }),
+    /alias/,
+  );
+});
+
+test("obsolete v0.1 buffer flags are rejected", () => {
+  assert.throws(() => parseConfig({ captureBatchTurns: 1 }), /unknown plugin config key/);
+  assert.throws(
+    () => parseConfig({ captureBatchIdleFlushSeconds: 1 }),
+    /unknown plugin config key/,
+  );
+  assert.throws(() => parseConfig({ captureMaxChars: 1000 }), /unknown plugin config key/);
+});
+
+test("unknown keys still fail closed", () => {
   assert.throws(() => parseConfig({ oldOption: true }), /unknown plugin config key/);
 });

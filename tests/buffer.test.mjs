@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AgentTurnBuffer } from "../dist/buffer.js";
+import { BufferEngine } from "../dist/buffer.js";
 
-const makeTurn = (n) => ({ user: `user-${n}`, assistant: `assistant-${n}` });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(predicate, timeoutMs = 1000) {
@@ -24,119 +23,205 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-test("threshold batches are isolated by agentId", async () => {
-  const calls = [];
-  const buffer = new AgentTurnBuffer(2, 10_000, async (agentId, turns, reason) => {
-    calls.push({ agentId, users: turns.map((turn) => turn.user), reason });
+const participants = [
+  { role: "user", name: "Вит", aliases: [] },
+  { role: "assistant", name: "Краб", aliases: [] },
+];
+
+function addTurn(engine, agentId, sessionKey, n) {
+  engine.addMessage(agentId, sessionKey, "user", `user-${n}`);
+  engine.addMessage(agentId, sessionKey, "assistant", `assistant-${n}`);
+}
+
+test("limit trigger: full buffer detaches as one episode and continues in a fresh buffer", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(participants, 2, 60_000, async (agentId, entry, reason) => {
+    flushes.push({
+      agentId,
+      sessionKey: entry.buffer.sessionKey,
+      roles: entry.buffer.messages.map((m) => m.role),
+      reason,
+    });
   });
+  t.after(() => engine.stop());
 
-  buffer.add("main", makeTurn(1));
-  buffer.add("igor", makeTurn(10));
-  buffer.add("main", makeTurn(2));
+  // 1 ход = 2 сообщения = буфер полон (limit=2).
+  addTurn(engine, "main", "s1", 1);
+  // Следующее сообщение триггерит отцепление ПОЛНОГО буфера + новый буфер.
+  engine.addMessage("main", "s1", "user", "user-2");
 
-  await waitFor(() => calls.length === 1);
-  assert.deepEqual(calls, [
-    { agentId: "main", users: ["user-1", "user-2"], reason: "threshold" },
-  ]);
-  assert.equal(buffer.bufferedTurns("igor"), 1);
+  await waitFor(() => flushes.length === 1);
+  assert.deepEqual(flushes[0], {
+    agentId: "main",
+    sessionKey: "s1",
+    roles: ["user", "assistant"],
+    reason: "limit",
+  });
+  // Новое сообщение живёт в свежем буфере той же сессии.
+  assert.equal(engine.activeBufferCount("main"), 1);
 });
 
-test("one idle scheduler respects each agent buffer age", async () => {
-  const calls = [];
-  const buffer = new AgentTurnBuffer(10, 200, async (agentId, turns, reason) => {
-    calls.push({ agentId, users: turns.map((turn) => turn.user), reason, at: Date.now() });
-  });
+test("eligibility: single message never publishes as an episode", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    50,
+    30,
+    async (_agentId, entry, reason) => {
+      flushes.push({ count: entry.buffer.messages.length, reason });
+    },
+    { checkIntervalMs: 10 },
+  );
+  t.after(() => engine.stop());
 
-  buffer.add("main", makeTurn(1));
-  await sleep(80);
-  buffer.add("igor", makeTurn(2));
+  // Только user — одиночное сообщение, даже по таймауту не эпизод.
+  engine.addMessage("main", "s1", "user", "only-user");
+  await sleep(60);
+  assert.equal(flushes.length, 0, "single message must not be published");
+  assert.equal(engine.activeBufferCount("main"), 1, "buffer stays alive waiting");
 
-  await waitFor(() => calls.length >= 1);
-  assert.equal(calls[0].agentId, "main");
-  assert.equal(calls[0].reason, "idle");
-  assert.equal(buffer.bufferedTurns("igor"), 1);
-
-  await waitFor(() => calls.length === 2);
-  assert.equal(calls[1].agentId, "igor");
-  assert.equal(calls[1].reason, "idle");
+  // Добиваем до пары → теперь эпизод уйдёт по таймауту.
+  engine.addMessage("main", "s1", "assistant", "now-a-pair");
+  await sleep(50); // даём таймауту (30мс) пройти после последней активности
+  await waitFor(() => flushes.length === 1);
+  assert.deepEqual(flushes[0], { count: 2, reason: "timeout" });
 });
 
-test("turns arriving during a flush form the next intact batch", async () => {
-  const firstFlushGate = deferred();
-  const batches = [];
-  let call = 0;
-  const buffer = new AgentTurnBuffer(2, 10_000, async (_agentId, turns) => {
-    call += 1;
-    batches.push(turns.map((turn) => turn.user));
-    if (call === 1) await firstFlushGate.promise;
-  });
+test("timeout detector detaches idle buffers via tick", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    10,
+    40,
+    async (_agentId, entry, reason) => {
+      flushes.push({ roles: entry.buffer.messages.map((m) => m.role), reason });
+    },
+    { checkIntervalMs: 10 },
+  );
+  t.after(() => engine.stop());
 
-  buffer.add("main", makeTurn(1));
-  buffer.add("main", makeTurn(2));
-  await waitFor(() => batches.length === 1);
-
-  buffer.add("main", makeTurn(3));
-  buffer.add("main", makeTurn(4));
-  assert.equal(buffer.bufferedTurns("main"), 2);
-
-  firstFlushGate.resolve();
-  await waitFor(() => batches.length === 2);
-  assert.deepEqual(batches, [
-    ["user-1", "user-2"],
-    ["user-3", "user-4"],
-  ]);
+  addTurn(engine, "main", "s1", 1);
+  // Ждём три тика, чтобы таймаут (40мс) сработал в детекторе.
+  await waitFor(() => flushes.length === 1);
+  assert.deepEqual(flushes[0], { roles: ["user", "assistant"], reason: "timeout" });
 });
 
-test("failed flush is retained without autonomous retry and retries after a new turn", async () => {
-  const attempts = [];
-  let failFirst = true;
-  const buffer = new AgentTurnBuffer(2, 40, async (_agentId, turns, reason) => {
-    attempts.push({ users: turns.map((turn) => turn.user), reason });
-    if (failFirst) {
-      failFirst = false;
-      throw new Error("temporary unavailable");
-    }
-  });
+test("buffers are isolated per session within an agent", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    2,
+    60_000,
+    async (_agentId, entry, reason) => {
+      flushes.push({
+        sessionKey: entry.buffer.sessionKey,
+        roles: entry.buffer.messages.map((m) => m.role),
+      });
+    },
+  );
+  t.after(() => engine.stop());
 
-  buffer.add("main", makeTurn(1));
-  buffer.add("main", makeTurn(2));
-  await waitFor(() => attempts.length === 1 && buffer.bufferedTurns("main") === 2);
+  addTurn(engine, "main", "sA", 1);
+  addTurn(engine, "main", "sB", 2);
 
-  await sleep(140);
-  assert.equal(attempts.length, 1, "failed batch must not retry on the idle clock by itself");
-  assert.equal(buffer.bufferedTurns("main"), 2);
-
-  buffer.add("main", makeTurn(3));
-  await waitFor(() => attempts.length === 2);
-  assert.deepEqual(attempts[1], {
-    users: ["user-1", "user-2", "user-3"],
-    reason: "threshold",
-  });
-  await waitFor(() => buffer.bufferedTurns("main") === 0);
+  assert.equal(engine.activeBufferCount("main"), 2);
+  assert.equal(flushes.length, 0, "no threshold hit when each session separately below limit");
 });
 
-test("a new turn arriving while a failed request is in flight permits the next flush", async () => {
-  const firstFlushGate = deferred();
-  const attempts = [];
-  let call = 0;
-  const buffer = new AgentTurnBuffer(2, 10_000, async (_agentId, turns) => {
-    call += 1;
-    attempts.push(turns.map((turn) => turn.user));
-    if (call === 1) {
-      await firstFlushGate.promise;
-      throw new Error("first request failed");
-    }
-  });
+test("FIFO queue per agent preserves chronological order", async (t) => {
+  const flushes = [];
+  const gate = deferred();
+  // limit=2 → каждый ход сразу отцепляется, очередь формируется по порядку добавления сессий.
+  const engine = new BufferEngine(
+    participants,
+    2,
+    60_000,
+    async (_agentId, entry) => {
+      flushes.push(entry.buffer.sessionKey);
+      if (flushes.length === 1) await gate.promise; // держим первый, копим хвосты
+    },
+  );
+  t.after(() => engine.stop());
 
-  buffer.add("main", makeTurn(1));
-  buffer.add("main", makeTurn(2));
-  await waitFor(() => attempts.length === 1);
-  buffer.add("main", makeTurn(3));
+  addTurn(engine, "main", "first", 1);
+  engine.addMessage("main", "first", "user", "u2"); // предел → enqueue first
+  addTurn(engine, "main", "second", 3);
+  engine.addMessage("main", "second", "user", "u4"); // предел → enqueue second
 
-  firstFlushGate.resolve();
-  await waitFor(() => attempts.length === 2);
-  assert.deepEqual(attempts, [
-    ["user-1", "user-2"],
-    ["user-1", "user-2", "user-3"],
-  ]);
+  await waitFor(() => flushes.length === 1);
+  gate.resolve();
+  await waitFor(() => flushes.length === 2);
+  assert.deepEqual(flushes, ["first", "second"]);
+});
+
+test("agents are isolated: one agent's buffer does not affect another", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    2,
+    60_000,
+    async (agentId, entry) => {
+      flushes.push({ agentId, sessionKey: entry.buffer.sessionKey });
+    },
+  );
+  t.after(() => engine.stop());
+
+  addTurn(engine, "igor", "s1", 1);
+  engine.addMessage("igor", "s1", "assistant", "a1"); // предел → igor эпизод
+  addTurn(engine, "main", "s2", 2);
+
+  await waitFor(() => flushes.some((f) => f.agentId === "igor"));
+  assert.equal(flushes.some((f) => f.agentId === "main"), false, "main buffer not yet full");
+  assert.equal(engine.activeBufferCount("main"), 1);
+  assert.equal(engine.queueLength(), 0, "igor episode already drained; nothing queued");
+});
+
+test("failed sink drops buffer without retry or re-enqueue", async (t) => {
+  const errors = [];
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    2,
+    60_000,
+    async (agentId, entry) => {
+      flushes.push(entry.buffer.sessionKey);
+      throw new Error("backend down");
+    },
+    {
+      notifyError: (agentId, sessionKey, reason, error) =>
+        errors.push({ agentId, sessionKey, error: error.message }),
+    },
+  );
+  t.after(() => engine.stop());
+
+  addTurn(engine, "main", "s1", 1);
+  engine.addMessage("main", "s1", "user", "u2"); // предел → enqueue → sink throws
+
+  await waitFor(() => flushes.length === 1);
+  await sleep(20);
+  // Отцепленный буфер удалён из очереди, НЕ возвращён в неё; ошибка залогирована.
+  assert.equal(engine.queueLength(), 0);
+  assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
+});
+
+test("single agent with 2+ sessions both timeout and process", async (t) => {
+  const flushes = [];
+  const engine = new BufferEngine(
+    participants,
+    50,
+    30,
+    async (_agentId, entry, reason) => {
+      flushes.push({ sessionKey: entry.buffer.sessionKey, reason });
+    },
+    { checkIntervalMs: 10 },
+  );
+  t.after(() => engine.stop());
+
+  addTurn(engine, "main", "s1", 1);
+  addTurn(engine, "main", "s2", 2);
+
+  await waitFor(() => flushes.length === 2);
+  const order = flushes.map((f) => f.sessionKey).sort();
+  assert.deepEqual(order, ["s1", "s2"]);
+  assert.ok(flushes.every((f) => f.reason === "timeout"));
 });

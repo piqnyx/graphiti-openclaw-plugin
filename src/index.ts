@@ -1,12 +1,13 @@
-import { AgentTurnBuffer } from "./buffer.js";
+import { BufferEngine, type AgentSink } from "./buffer.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient } from "./mcp-client.js";
 import {
+  buildEpisodeJson,
   buildRecallBlock,
+  compileAliasMatchers,
   extractCompletedTurn,
-  formatTurnsForEpisode,
   prepareRecallQuery,
   SESSION_RESET_PROMPT_PREFIX,
   SLUG_GENERATOR_SESSION_KEY,
@@ -34,6 +35,13 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function requireSessionKey(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("missing OpenClaw ctx.sessionKey");
+  }
+  return value;
+}
+
 export function register(api: OpenClawPluginApi): void {
   let cfg: GraphitiPluginConfig;
   try {
@@ -45,67 +53,72 @@ export function register(api: OpenClawPluginApi): void {
 
   const logger = createGraphitiLogger(api.logger, cfg);
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
+  const aliasMatchers = compileAliasMatchers(cfg.participants);
 
-  const buffer = new AgentTurnBuffer(
-    cfg.captureBatchTurns,
-    cfg.captureBatchIdleFlushSeconds * 1_000,
-    async (agentId, turns, reason) => {
-      const body = formatTurnsForEpisode(turns);
-      logger.debug("capture_flush_start", {
+  // Sink: из очереди-записи собираем JSON-эпизод и отправляем в Graphiti.
+  // `agentId` подставляет движок при processинге (спека: agent = group_id).
+  const sink: AgentSink = async (agentId, entry, reason) => {
+    const episode = buildEpisodeJson(entry, cfg.participants, aliasMatchers);
+    const jsonBody = JSON.stringify(episode);
+    const referenceTime = new Date(entry.enqueuedAt).toISOString();
+
+    logger.debug("capture_flush_start", {
+      agentId,
+      group_id: agentId,
+      saga: entry.buffer.sessionKey,
+      messages: entry.buffer.messages.length,
+      reason,
+      chars: jsonBody.length,
+    });
+    logger.debugContent(
+      "capture_payload",
+      {
         agentId,
         group_id: agentId,
-        turns: turns.length,
+        saga: entry.buffer.sessionKey,
+        messages: entry.buffer.messages.length,
         reason,
-        chars: body.length,
-      });
-      logger.debugContent(
-        "capture_payload",
-        { agentId, group_id: agentId, turns: turns.length, reason, chars: body.length },
-        { episodeBody: body },
-      );
+        chars: jsonBody.length,
+      },
+      { episodeBody: jsonBody, source: "json", reference_time: referenceTime },
+    );
 
-      if (body.length > cfg.captureMaxChars) {
-        logger.warn("capture_batch_oversize", {
-          agentId,
-          group_id: agentId,
-          chars: body.length,
-          configured: cfg.captureMaxChars,
-          action: "submit_intact",
-        });
-      }
+    const started = Date.now();
+    const result = await client.addMemory({
+      name: `openclaw-${agentId}-${new Date().toISOString()}`,
+      jsonBody,
+      groupId: agentId,
+      saga: entry.buffer.sessionKey,
+      referenceTime,
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
 
-      const started = Date.now();
-      const result = await client.addMemory({
-        name: `openclaw-${agentId}-${new Date().toISOString()}`,
-        episodeBody: body,
-        groupId: agentId,
-        sourceDescription: `OpenClaw completed conversation turns for agent ${agentId}`,
-      });
-      if (typeof result.error === "string") throw new Error(result.error);
+    logger.info("capture_queue_accepted", {
+      agentId,
+      group_id: agentId,
+      saga: entry.buffer.sessionKey,
+      messages: entry.buffer.messages.length,
+      reason,
+      durationMs: Date.now() - started,
+    });
+  };
 
-      logger.info("capture_queue_accepted", {
-        agentId,
-        group_id: agentId,
-        turns: turns.length,
-        reason,
-        durationMs: Date.now() - started,
-      });
-    },
+  const engine = new BufferEngine(
+    cfg.participants,
+    cfg.bufferLimit,
+    cfg.bufferTimeout,
+    sink,
     {
-      onBuffered: (agentId, turns) =>
-        logger.debug("capture_buffered", {
-          agentId,
-          group_id: agentId,
-          bufferTurns: turns,
-        }),
-      onFlushError: (agentId, reason, error) =>
+      notifyError: (agentId, sessionKey, reason, error) =>
         logger.error("capture_flush_failed", {
           agentId,
           group_id: agentId,
+          saga: sessionKey,
           reason,
           error: errorText(error),
-          retained: true,
+          action: "dropped",
           automaticRetry: false,
+          uiNotification: "not_implemented_todo",
         }),
     },
   );
@@ -204,10 +217,12 @@ export function register(api: OpenClawPluginApi): void {
       }
 
       let agentId: string;
+      let sessionKey: string;
       try {
         agentId = requireAgentId(ctx?.agentId);
+        sessionKey = requireSessionKey(ctx?.sessionKey);
       } catch (error) {
-        logger.warn("capture_skipped", { reason: "invalid_agent_id", error: errorText(error) });
+        logger.warn("capture_skipped", { reason: "missing_context_id", error: errorText(error) });
         return;
       }
 
@@ -216,6 +231,7 @@ export function register(api: OpenClawPluginApi): void {
         logger.debug("capture_skipped", {
           agentId,
           group_id: agentId,
+          sessionKey,
           reason: "no_completed_turn",
           messageCount: Array.isArray(event.messages) ? event.messages.length : 0,
         });
@@ -227,20 +243,25 @@ export function register(api: OpenClawPluginApi): void {
         {
           agentId,
           group_id: agentId,
+          sessionKey,
           userChars: turn.user.length,
           assistantChars: turn.assistant.length,
         },
         { user: turn.user, assistant: turn.assistant },
       );
-      buffer.add(agentId, turn);
+
+      // Каждый завершённый ход = пара user+assistant → два сообщения в буфер.
+      engine.addMessage(agentId, sessionKey, "user", turn.user);
+      engine.addMessage(agentId, sessionKey, "assistant", turn.assistant);
     });
   }
 
   logger.info("plugin_loaded", {
     autoCapture: cfg.autoCapture,
     autoRecall: cfg.autoRecall,
-    captureBatchTurns: cfg.captureBatchTurns,
-    captureBatchIdleFlushSeconds: cfg.captureBatchIdleFlushSeconds,
+    bufferLimit: cfg.bufferLimit,
+    bufferTimeout: cfg.bufferTimeout,
+    participants: cfg.participants.map((p) => `${p.role}:${p.name}`),
     requestTimeoutMs: cfg.requestTimeoutMs,
     recallLimit: cfg.recallLimit,
     logLevel: cfg.logLevel,

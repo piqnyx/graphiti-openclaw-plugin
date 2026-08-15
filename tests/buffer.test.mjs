@@ -29,14 +29,14 @@ function addTurn(engine, agentId, sessionKey, n) {
   engine.addTurn(agentId, sessionKey, `user-${n}`, `assistant-${n}`);
 }
 
-test("odd bufferLimit is rejected so a completed turn cannot be split", () => {
-  assert.throws(
-    () => new BufferEngine(agents, 3, 3600, async () => {}),
-    /bufferLimit must be an even integer/,
-  );
+test("odd bufferLimit is valid because the limit counts individual messages", () => {
+  assert.doesNotThrow(() => {
+    const engine = new BufferEngine(agents, 3, 3600, async () => {});
+    engine.stop();
+  });
 });
 
-test("limit trigger flushes exactly at an even message limit", async (t) => {
+test("limit trigger flushes exactly at the configured message limit", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(agents, 4, 3600, async (agentId, entry, reason) => {
     flushes.push({
@@ -140,7 +140,7 @@ test("failed sink retains the detached FIFO head and reports the error", async (
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
 });
 
-test("timeout ticker flushes a complete turn exactly after the configured inactivity", async (t) => {
+test("timeout ticker flushes a non-empty message buffer exactly after inactivity", async (t) => {
   const originalSetInterval = globalThis.setInterval;
   const originalClearInterval = globalThis.clearInterval;
   const originalNow = Date.now;
@@ -172,7 +172,7 @@ test("timeout ticker flushes a complete turn exactly after the configured inacti
   });
 
   assert.equal(scheduledMs, CHECK_INTERVAL_SEC * 1000);
-  addTurn(engine, "main", "session-a", 1);
+  engine.addMessage("main", "session-a", "user", "single-user");
 
   now += 29_999;
   scheduled();
@@ -184,7 +184,7 @@ test("timeout ticker flushes a complete turn exactly after the configured inacti
   await waitFor(() => flushes.length === 1, 500);
   assert.deepEqual(flushes[0], {
     sessionKey: "session-a",
-    count: 2,
+    count: 1,
     reason: "timeout",
     enqueuedAt: now,
   });

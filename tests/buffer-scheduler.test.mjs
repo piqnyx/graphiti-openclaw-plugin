@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BufferEngine } from "../dist/buffer.js";
+import { BufferEngine, CHECK_INTERVAL_SEC } from "../dist/buffer.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -49,15 +49,15 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   assert.equal(released, 3);
 });
 
-test("a failing agent does not block another agent's flush", async (t) => {
-  const flushes = [];
+test("a failed agent retains its FIFO head while another agent continues", async (t) => {
+  const attempts = [];
   const errors = [];
   const engine = new BufferEngine(
     agents,
     2,
     3600,
     async (agentId, entry) => {
-      flushes.push({ agentId, sessionKey: entry.buffer.sessionKey });
+      attempts.push({ agentId, sessionKey: entry.buffer.sessionKey });
       if (agentId === "broken") throw new Error("backend unavailable for broken agent");
     },
     {
@@ -69,15 +69,71 @@ test("a failing agent does not block another agent's flush", async (t) => {
 
   addTurn(engine, "broken", "b1", 1);
   await waitFor(() => errors.length === 1, 2000);
+  assert.equal(engine.queueLength(), 1, "failed head must stay queued");
 
   addTurn(engine, "healthy", "h1", 1);
-  await waitFor(() => flushes.some((f) => f.agentId === "healthy"), 2000);
+  await waitFor(() => attempts.some((f) => f.agentId === "healthy"), 2000);
 
   assert.deepEqual(
-    flushes.find((f) => f.agentId === "healthy"),
+    attempts.find((f) => f.agentId === "healthy"),
     { agentId: "healthy", sessionKey: "h1" },
   );
-  assert.equal(errors.length, 1);
+  assert.equal(errors.length, 1, "one failure incident emits one notification");
+  assert.equal(engine.queueLength(), 1, "only broken agent head remains queued");
+});
+
+test("failed head retries before later entries and recovery resumes FIFO", async (t) => {
+  const originalNow = Date.now;
+  let now = 1_700_000_000_000;
+  Date.now = () => now;
+  t.after(() => {
+    Date.now = originalNow;
+  });
+
+  const attempts = [];
+  const errors = [];
+  const recovered = [];
+  let firstAttempts = 0;
+
+  const engine = new BufferEngine(
+    agents,
+    2,
+    3600,
+    async (_agentId, entry) => {
+      attempts.push(entry.buffer.sessionKey);
+      if (entry.buffer.sessionKey === "b1") {
+        firstAttempts += 1;
+        if (firstAttempts === 1) throw new Error("temporary failure");
+      }
+    },
+    {
+      notifyError: (_agentId, sessionKey) => errors.push(sessionKey),
+      notifyRecovered: (_agentId, sessionKey) => recovered.push(sessionKey),
+    },
+  );
+  t.after(() => engine.stop());
+
+  addTurn(engine, "main", "b1", 1);
+  await sleep(0);
+  assert.deepEqual(attempts, ["b1"]);
+  assert.deepEqual(errors, ["b1"]);
+  assert.equal(engine.queueLength(), 1);
+
+  // Queue a later item while retry backoff is active. It must not overtake b1.
+  addTurn(engine, "main", "b2", 2);
+  await sleep(0);
+  assert.deepEqual(attempts, ["b1"]);
+  assert.equal(engine.queueLength(), 2);
+
+  now += CHECK_INTERVAL_SEC * 1000;
+  // A new enqueue is enough to kick pump after retryAfter; the real ticker does
+  // the same in production.
+  addTurn(engine, "main", "b3", 3);
+  await sleep(0);
+  await sleep(0);
+
+  assert.deepEqual(attempts, ["b1", "b1", "b2", "b3"]);
+  assert.deepEqual(recovered, ["b1"]);
   assert.equal(engine.queueLength(), 0);
 });
 

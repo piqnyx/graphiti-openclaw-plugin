@@ -27,6 +27,8 @@ export const description =
 
 const CAPTURE_STATUS_NAMESPACE = "capture-status";
 const CAPTURE_STATUS_DESCRIPTOR_ID = "capture-error";
+const BACKEND_STATUS_NAMESPACE = "backend-queue-status";
+const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
 
 function isBackgroundRun(ctx: HookContext): boolean {
   if (ctx.trigger === "cron" || ctx.trigger === "heartbeat") return true;
@@ -80,17 +82,25 @@ export function register(api: OpenClawPluginApi): void {
   });
   const sequences = new EpisodeSequenceTracker();
   const hydratedSequences = new Set<string>();
+  const lastSessionByAgent = new Map<string, string>();
+  const backendReportedSessionByAgent = new Map<string, string>();
+  const backendFingerprintByAgent = new Map<string, string>();
 
   api.session?.state?.registerSessionExtension({
     namespace: CAPTURE_STATUS_NAMESPACE,
-    description: "Graphiti auto-capture error state for this OpenClaw session",
+    description: "Graphiti auto-capture transport error state for this OpenClaw session",
+    project: ({ state }) => state,
+  });
+  api.session?.state?.registerSessionExtension({
+    namespace: BACKEND_STATUS_NAMESPACE,
+    description: "Graphiti asynchronous backend queue error state for this OpenClaw session",
     project: ({ state }) => state,
   });
   api.session?.controls?.registerControlUiDescriptor({
     id: CAPTURE_STATUS_DESCRIPTOR_ID,
     surface: "session",
     label: "Graphiti capture",
-    description: "Shows Graphiti capture failures for the current session",
+    description: "Shows Graphiti capture transport failures for the current session",
     schema: {
       type: "object",
       properties: {
@@ -104,10 +114,32 @@ export function register(api: OpenClawPluginApi): void {
       required: ["status", "message", "reason", "retryIntervalSeconds", "occurredAt"],
     },
   });
+  api.session?.controls?.registerControlUiDescriptor({
+    id: BACKEND_STATUS_DESCRIPTOR_ID,
+    surface: "session",
+    label: "Graphiti backend",
+    description: "Shows terminal Graphiti backend processing or health failures",
+    schema: {
+      type: "object",
+      properties: {
+        status: { const: "error" },
+        source: { enum: ["backend_queue", "backend_health"] },
+        message: { type: "string" },
+        error: { type: "string" },
+        attempts: { type: "integer" },
+        pending: { type: "integer" },
+        episodeUuid: { type: "string" },
+        episodeName: { type: "string" },
+        occurredAt: { type: "string" },
+      },
+      required: ["status", "source", "message", "occurredAt"],
+    },
+  });
 
-  const patchCaptureStatus = async (
+  const patchSessionStatus = async (
     agentId: string,
     sessionKey: string,
+    namespace: string,
     value: PluginJsonValue | undefined,
   ): Promise<void> => {
     const patchSessionEntry = api.runtime?.agent?.session?.patchSessionEntry;
@@ -121,9 +153,9 @@ export function register(api: OpenClawPluginApi): void {
         const pluginExtensions = { ...(entry.pluginExtensions ?? {}) };
         const pluginState = { ...(pluginExtensions[id] ?? {}) };
         if (value === undefined) {
-          delete pluginState[CAPTURE_STATUS_NAMESPACE];
+          delete pluginState[namespace];
         } else {
-          pluginState[CAPTURE_STATUS_NAMESPACE] = value;
+          pluginState[namespace] = value;
         }
         if (Object.keys(pluginState).length > 0) {
           pluginExtensions[id] = pluginState;
@@ -152,27 +184,157 @@ export function register(api: OpenClawPluginApi): void {
       retryIntervalSeconds: CHECK_INTERVAL_SEC,
       occurredAt: new Date().toISOString(),
     };
-    void patchCaptureStatus(agentId, sessionKey, value).catch((statusError) => {
-      logger.warn("capture_ui_status_failed", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        action: "publish_error",
-        error: errorText(statusError),
-      });
-    });
+    void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, value).catch(
+      (statusError) => {
+        logger.warn("capture_ui_status_failed", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          action: "publish_error",
+          error: errorText(statusError),
+        });
+      },
+    );
   };
 
   const clearCaptureError = (agentId: string, sessionKey: string): void => {
-    void patchCaptureStatus(agentId, sessionKey, undefined).catch((statusError) => {
-      logger.warn("capture_ui_status_failed", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        action: "clear_recovered_error",
-        error: errorText(statusError),
-      });
-    });
+    void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, undefined).catch(
+      (statusError) => {
+        logger.warn("capture_ui_status_failed", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          action: "clear_recovered_error",
+          error: errorText(statusError),
+        });
+      },
+    );
+  };
+
+  const publishBackendError = (
+    agentId: string,
+    sessionKey: string,
+    value: PluginJsonValue,
+  ): void => {
+    void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, value).catch(
+      (statusError) => {
+        logger.warn("capture_ui_status_failed", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          action: "publish_backend_error",
+          error: errorText(statusError),
+        });
+      },
+    );
+  };
+
+  const clearBackendError = (agentId: string, sessionKey: string): void => {
+    void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, undefined).catch(
+      (statusError) => {
+        logger.warn("capture_ui_status_failed", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          action: "clear_backend_error",
+          error: errorText(statusError),
+        });
+      },
+    );
+  };
+
+  const pollBackendQueueStatus = async (): Promise<void> => {
+    for (const agentId of Object.keys(cfg.agents)) {
+      try {
+        const status = await client.getQueueStatus(agentId);
+        if (status.groupId !== agentId) {
+          throw new Error(
+            `Graphiti get_queue_status identity mismatch: requested ${agentId}, got ${status.groupId}`,
+          );
+        }
+
+        if (status.blocked) {
+          const sessionKey = status.saga ?? lastSessionByAgent.get(agentId);
+          const fingerprint = `blocked:${status.episodeUuid ?? ""}:${status.attempts}:${status.lastError ?? ""}`;
+          const previousSession = backendReportedSessionByAgent.get(agentId);
+          if (previousSession && sessionKey && previousSession !== sessionKey) {
+            clearBackendError(agentId, previousSession);
+          }
+
+          if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
+            publishBackendError(agentId, sessionKey, {
+              status: "error",
+              source: "backend_queue",
+              message: `Graphiti backend queue is blocked after ${status.attempts} failed attempts; memory persistence for this agent is stopped`,
+              error: status.lastError ?? "unknown backend processing error",
+              attempts: status.attempts,
+              pending: status.pending,
+              episodeUuid: status.episodeUuid ?? "",
+              episodeName: status.episodeName ?? "",
+              occurredAt: new Date().toISOString(),
+            });
+            backendReportedSessionByAgent.set(agentId, sessionKey);
+            backendFingerprintByAgent.set(agentId, fingerprint);
+            logger.error("capture_backend_blocked", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              uuid: status.episodeUuid,
+              name: status.episodeName,
+              attempts: status.attempts,
+              pending: status.pending,
+              error: status.lastError,
+              uiNotification: "session_status",
+            });
+          }
+          continue;
+        }
+
+        const previousSession = backendReportedSessionByAgent.get(agentId);
+        if (previousSession) {
+          clearBackendError(agentId, previousSession);
+          logger.info("capture_backend_recovered", {
+            agentId,
+            group_id: agentId,
+            saga: previousSession,
+          });
+        }
+        backendReportedSessionByAgent.delete(agentId);
+        backendFingerprintByAgent.delete(agentId);
+      } catch (error) {
+        const previousFingerprint = backendFingerprintByAgent.get(agentId);
+        if (previousFingerprint?.startsWith("blocked:")) {
+          logger.warn("capture_backend_healthcheck_failed", {
+            agentId,
+            group_id: agentId,
+            error: errorText(error),
+            preservedStatus: "backend_queue_blocked",
+          });
+          continue;
+        }
+
+        const sessionKey = lastSessionByAgent.get(agentId);
+        const fingerprint = `health:${errorText(error)}`;
+        if (sessionKey && previousFingerprint !== fingerprint) {
+          publishBackendError(agentId, sessionKey, {
+            status: "error",
+            source: "backend_health",
+            message: "Graphiti backend health check failed; memory persistence cannot be verified",
+            error: errorText(error),
+            occurredAt: new Date().toISOString(),
+          });
+          backendReportedSessionByAgent.set(agentId, sessionKey);
+          backendFingerprintByAgent.set(agentId, fingerprint);
+          logger.error("capture_backend_healthcheck_failed", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            error: errorText(error),
+            uiNotification: "session_status",
+          });
+        }
+      }
+    }
   };
 
   const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
@@ -336,6 +498,19 @@ export function register(api: OpenClawPluginApi): void {
     },
   );
 
+  let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
+  if (cfg.autoCapture) {
+    queueHealthTimer = setInterval(() => {
+      void pollBackendQueueStatus();
+    }, CHECK_INTERVAL_SEC * 1000);
+    queueHealthTimer.unref?.();
+
+    api.on("gateway_stop", () => {
+      if (queueHealthTimer) clearInterval(queueHealthTimer);
+      engine.stop();
+    });
+  }
+
   // Recall remains intentionally unchanged while capture is being stabilized.
   if (cfg.autoRecall) {
     api.on(
@@ -441,6 +616,8 @@ export function register(api: OpenClawPluginApi): void {
         return;
       }
 
+      lastSessionByAgent.set(agentId, sessionKey);
+
       const turn = extractCompletedTurn(Array.isArray(event.messages) ? event.messages : []);
       if (!turn) {
         logger.debug("capture_skipped", {
@@ -486,6 +663,8 @@ export function register(api: OpenClawPluginApi): void {
         api.session?.controls?.registerControlUiDescriptor &&
         api.runtime?.agent?.session?.patchSessionEntry,
     ),
+    backendQueueHealthPolling: cfg.autoCapture,
+    backendQueueHealthIntervalSeconds: CHECK_INTERVAL_SEC,
   });
 }
 

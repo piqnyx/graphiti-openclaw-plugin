@@ -17,8 +17,8 @@ const agents = {
   main: { user: "Вит", assistant: "Краб" },
 };
 
-function addTurn(engine, agentId, sessionKey, n) {
-  engine.addTurn(agentId, sessionKey, `user-${n}`, `assistant-${n}`);
+function enqueueOne(engine, agentId, sessionKey, text) {
+  engine.addMessage(agentId, sessionKey, "user", text);
 }
 
 test("one agent processing sequentially drains its whole queue in a single pass", async (t) => {
@@ -28,7 +28,7 @@ test("one agent processing sequentially drains its whole queue in a single pass"
 
   const engine = new BufferEngine(
     agents,
-    2,
+    1,
     3600,
     async (_agentId, entry) => {
       order.push(entry.buffer.sessionKey);
@@ -39,7 +39,7 @@ test("one agent processing sequentially drains its whole queue in a single pass"
   t.after(() => engine.stop());
 
   for (const s of ["a", "b", "c"]) {
-    addTurn(engine, "main", s, 1);
+    enqueueOne(engine, "main", s, `message-${s}`);
   }
 
   await waitFor(() => order.length === 1, 2000);
@@ -54,7 +54,7 @@ test("a failed agent retains its FIFO head while another agent continues", async
   const errors = [];
   const engine = new BufferEngine(
     agents,
-    2,
+    1,
     3600,
     async (agentId, entry) => {
       attempts.push({ agentId, sessionKey: entry.buffer.sessionKey });
@@ -67,11 +67,11 @@ test("a failed agent retains its FIFO head while another agent continues", async
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "broken", "b1", 1);
+  enqueueOne(engine, "broken", "b1", "broken");
   await waitFor(() => errors.length === 1, 2000);
   assert.equal(engine.queueLength(), 1, "failed head must stay queued");
 
-  addTurn(engine, "healthy", "h1", 1);
+  enqueueOne(engine, "healthy", "h1", "healthy");
   await waitFor(() => attempts.some((f) => f.agentId === "healthy"), 2000);
 
   assert.deepEqual(
@@ -97,7 +97,7 @@ test("failed head retries before later entries and recovery resumes FIFO", async
 
   const engine = new BufferEngine(
     agents,
-    2,
+    1,
     3600,
     async (_agentId, entry) => {
       attempts.push(entry.buffer.sessionKey);
@@ -113,19 +113,19 @@ test("failed head retries before later entries and recovery resumes FIFO", async
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "b1", 1);
+  enqueueOne(engine, "main", "b1", "first");
   await sleep(0);
   assert.deepEqual(attempts, ["b1"]);
   assert.deepEqual(errors, ["b1"]);
   assert.equal(engine.queueLength(), 1);
 
-  addTurn(engine, "main", "b2", 2);
+  enqueueOne(engine, "main", "b2", "second");
   await sleep(0);
   assert.deepEqual(attempts, ["b1"]);
   assert.equal(engine.queueLength(), 2);
 
   now += CHECK_INTERVAL_SEC * 1000;
-  addTurn(engine, "main", "b3", 3);
+  enqueueOne(engine, "main", "b3", "third");
   await sleep(0);
   await sleep(0);
 

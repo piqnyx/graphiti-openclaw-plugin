@@ -26,7 +26,11 @@ export const description =
 function isBackgroundRun(ctx: HookContext): boolean {
   if (ctx.trigger === "cron" || ctx.trigger === "heartbeat") return true;
   const sessionKey = ctx.sessionKey ?? "";
-  return sessionKey.includes(":cron:") || sessionKey.includes(":subagent:");
+  return (
+    sessionKey.includes(":cron:") ||
+    sessionKey.includes(":heartbeat:") ||
+    sessionKey.includes(":subagent:")
+  );
 }
 
 function errorText(error: unknown): string {
@@ -50,8 +54,6 @@ export function register(api: OpenClawPluginApi): void {
   }
 
   const logger = createGraphitiLogger(api.logger, cfg);
-  // Сырой лог запроса/ответа MCP (виден при logContent=true в debug-уровне):
-  // фиксирует полный HTTP-запрос и сырое тело ответа — для проверки протокола.
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs, (kind, body) => {
     logger.debugContent(
       kind === "request" ? "mcp_raw_request" : "mcp_raw_response",
@@ -60,8 +62,6 @@ export function register(api: OpenClawPluginApi): void {
     );
   });
 
-  // Sink: берёт готовый JSON-эпизод из буфера (акторы + нормализованные сообщения)
-  // и отправляет в Graphiti. `agentId` подставляет движок при processинге (agent = group_id).
   const sink: AgentSink = async (agentId, entry, reason) => {
     const episode: EpisodeJson = entry.buffer.episode;
     const jsonBody = JSON.stringify(episode);
@@ -97,10 +97,6 @@ export function register(api: OpenClawPluginApi): void {
       referenceTime,
     });
 
-    // Логируем ПОЛНЫЙ ответ MCP (не только факт успеха), чтобы видеть, что
-    // реально вернул Graphiti: structuredContent, возможную ошибку внутри 200,
-    // или isError. Без этого невозможно отличить «принято и обработается»
-    // от «принято, но фоновый процесс отклонил/уронил эпизод».
     logger.debugContent(
       "capture_mcp_response",
       {
@@ -230,6 +226,7 @@ export function register(api: OpenClawPluginApi): void {
           agentId: ctx?.agentId,
           reason: "background_run",
           trigger: ctx?.trigger,
+          sessionKey: ctx?.sessionKey,
         });
         return;
       }
@@ -272,9 +269,7 @@ export function register(api: OpenClawPluginApi): void {
         { user: turn.user, assistant: turn.assistant },
       );
 
-      // Каждый завершённый ход = пара user+assistant → два сообщения в буфер.
-      engine.addMessage(agentId, sessionKey, "user", turn.user);
-      engine.addMessage(agentId, sessionKey, "assistant", turn.assistant);
+      engine.addTurn(agentId, sessionKey, turn.user, turn.assistant);
     });
   }
 

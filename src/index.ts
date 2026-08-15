@@ -17,12 +17,16 @@ import type {
   BeforePromptBuildResult,
   HookContext,
   OpenClawPluginApi,
+  PluginJsonValue,
 } from "./types.js";
 
 export const id = "graphiti-openclaw-plugin";
 export const name = "Graphiti Companion";
 export const description =
   "Slot-less per-agent Graphiti auto-capture and auto-recall companion for OpenClaw";
+
+const CAPTURE_STATUS_NAMESPACE = "capture-status";
+const CAPTURE_STATUS_DESCRIPTOR_ID = "capture-error";
 
 function isBackgroundRun(ctx: HookContext): boolean {
   if (ctx.trigger === "cron" || ctx.trigger === "heartbeat") return true;
@@ -76,6 +80,100 @@ export function register(api: OpenClawPluginApi): void {
   });
   const sequences = new EpisodeSequenceTracker();
   const hydratedSequences = new Set<string>();
+
+  api.session?.state?.registerSessionExtension({
+    namespace: CAPTURE_STATUS_NAMESPACE,
+    description: "Graphiti auto-capture error state for this OpenClaw session",
+    project: ({ state }) => state,
+  });
+  api.session?.controls?.registerControlUiDescriptor({
+    id: CAPTURE_STATUS_DESCRIPTOR_ID,
+    surface: "session",
+    label: "Graphiti capture",
+    description: "Shows Graphiti capture failures for the current session",
+    schema: {
+      type: "object",
+      properties: {
+        status: { const: "error" },
+        message: { type: "string" },
+        error: { type: "string" },
+        reason: { enum: ["limit", "timeout"] },
+        retryIntervalSeconds: { type: "integer" },
+        occurredAt: { type: "string" },
+      },
+      required: ["status", "message", "reason", "retryIntervalSeconds", "occurredAt"],
+    },
+  });
+
+  const patchCaptureStatus = async (
+    agentId: string,
+    sessionKey: string,
+    value: PluginJsonValue | undefined,
+  ): Promise<void> => {
+    const patchSessionEntry = api.runtime?.agent?.session?.patchSessionEntry;
+    if (!patchSessionEntry || !sessionKey || agentId === "__tick__") return;
+
+    await patchSessionEntry({
+      agentId,
+      sessionKey,
+      preserveActivity: true,
+      update: (entry) => {
+        const pluginExtensions = { ...(entry.pluginExtensions ?? {}) };
+        const pluginState = { ...(pluginExtensions[id] ?? {}) };
+        if (value === undefined) {
+          delete pluginState[CAPTURE_STATUS_NAMESPACE];
+        } else {
+          pluginState[CAPTURE_STATUS_NAMESPACE] = value;
+        }
+        if (Object.keys(pluginState).length > 0) {
+          pluginExtensions[id] = pluginState;
+        } else {
+          delete pluginExtensions[id];
+        }
+        return {
+          pluginExtensions:
+            Object.keys(pluginExtensions).length > 0 ? pluginExtensions : undefined,
+        };
+      },
+    });
+  };
+
+  const publishCaptureError = (
+    agentId: string,
+    sessionKey: string,
+    reason: "limit" | "timeout",
+    error: Error,
+  ): void => {
+    const value: PluginJsonValue = {
+      status: "error",
+      message: "Graphiti capture failed; batch retained for automatic retry",
+      error: errorText(error),
+      reason,
+      retryIntervalSeconds: CHECK_INTERVAL_SEC,
+      occurredAt: new Date().toISOString(),
+    };
+    void patchCaptureStatus(agentId, sessionKey, value).catch((statusError) => {
+      logger.warn("capture_ui_status_failed", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        action: "publish_error",
+        error: errorText(statusError),
+      });
+    });
+  };
+
+  const clearCaptureError = (agentId: string, sessionKey: string): void => {
+    void patchCaptureStatus(agentId, sessionKey, undefined).catch((statusError) => {
+      logger.warn("capture_ui_status_failed", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        action: "clear_recovered_error",
+        error: errorText(statusError),
+      });
+    });
+  };
 
   const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
     const key = sequenceKey(agentId, sessionKey);
@@ -212,7 +310,7 @@ export function register(api: OpenClawPluginApi): void {
     cfg.bufferTimeout,
     sink,
     {
-      notifyError: (agentId, sessionKey, reason, error) =>
+      notifyError: (agentId, sessionKey, reason, error) => {
         logger.error("capture_flush_failed", {
           agentId,
           group_id: agentId,
@@ -222,15 +320,19 @@ export function register(api: OpenClawPluginApi): void {
           action: "retained_for_retry",
           automaticRetry: true,
           retryIntervalSeconds: CHECK_INTERVAL_SEC,
-          uiNotification: "pending_host_integration",
-        }),
-      notifyRecovered: (agentId, sessionKey, reason) =>
+          uiNotification: "session_status",
+        });
+        publishCaptureError(agentId, sessionKey, reason, error);
+      },
+      notifyRecovered: (agentId, sessionKey, reason) => {
         logger.info("capture_flush_recovered", {
           agentId,
           group_id: agentId,
           saga: sessionKey,
           reason,
-        }),
+        });
+        clearCaptureError(agentId, sessionKey);
+      },
     },
   );
 
@@ -379,6 +481,11 @@ export function register(api: OpenClawPluginApi): void {
     recallLimit: cfg.recallLimit,
     logLevel: cfg.logLevel,
     logContent: cfg.logContent,
+    captureErrorUiStatus: Boolean(
+      api.session?.state?.registerSessionExtension &&
+        api.session?.controls?.registerControlUiDescriptor &&
+        api.runtime?.agent?.session?.patchSessionEntry,
+    ),
   });
 }
 

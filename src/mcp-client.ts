@@ -11,6 +11,17 @@ type JsonRpcResponse = {
   error?: unknown;
 };
 
+export type SagaState = {
+  uuid: string;
+  name: string;
+  groupId: string;
+  createdAt?: string;
+  summary: string;
+  firstEpisodeUuid?: string;
+  lastEpisodeUuid?: string;
+  episodeCount: number;
+};
+
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -79,6 +90,17 @@ function decodeToolResult(result: unknown): JsonObject {
   return {};
 }
 
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Graphiti get_saga returned invalid ${field}`);
+  }
+  return value;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
 export class GraphitiMcpClient {
   private sessionId?: string;
   private protocolVersion = "2025-06-18";
@@ -120,6 +142,31 @@ export class GraphitiMcpClient {
       args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
     }
     return this.callTool("add_memory", args);
+  }
+
+  async getSaga(sagaName: string, groupId: string): Promise<SagaState | undefined> {
+    const result = await this.callTool("get_saga", {
+      saga_name: sagaName,
+      group_id: groupId,
+    });
+    if (typeof result.error === "string") {
+      if (/^No saga named /.test(result.error)) return undefined;
+      throw new Error(result.error);
+    }
+    const episodeCount = result.episode_count;
+    if (!Number.isInteger(episodeCount) || Number(episodeCount) < 0) {
+      throw new Error("Graphiti get_saga returned invalid episode_count");
+    }
+    return {
+      uuid: requiredString(result.uuid, "uuid"),
+      name: requiredString(result.name, "name"),
+      groupId: requiredString(result.group_id, "group_id"),
+      createdAt: optionalString(result.created_at),
+      summary: typeof result.summary === "string" ? result.summary : "",
+      firstEpisodeUuid: optionalString(result.first_episode_uuid),
+      lastEpisodeUuid: optionalString(result.last_episode_uuid),
+      episodeCount: Number(episodeCount),
+    };
   }
 
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {

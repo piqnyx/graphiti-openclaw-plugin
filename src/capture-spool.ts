@@ -140,11 +140,13 @@ function hasData(snapshot: BufferEngineSnapshot): boolean {
 /**
  * Atomic local checkpoint for unaccepted capture data.
  *
- * The file is deleted only after every active buffer and local FIFO entry has
- * either been accepted by Graphiti or otherwise removed from the engine state.
+ * A CaptureSpool instance may remove the shared file only after that same
+ * instance has successfully loaded or written it. This prevents another empty
+ * plugin runtime from deleting capture data that appeared after its own startup.
  */
 export class CaptureSpool {
   readonly path: string;
+  private ownsFile = false;
 
   constructor(path = resolveCaptureSpoolPath()) {
     this.path = path;
@@ -153,7 +155,9 @@ export class CaptureSpool {
   load(): BufferEngineSnapshot | undefined {
     if (!existsSync(this.path)) return undefined;
     try {
-      return parseSnapshot(JSON.parse(readFileSync(this.path, "utf8")) as unknown);
+      const snapshot = parseSnapshot(JSON.parse(readFileSync(this.path, "utf8")) as unknown);
+      this.ownsFile = true;
+      return snapshot;
     } catch (error) {
       throw new Error(
         `failed to read durable Graphiti capture spool ${this.path}; refusing to overwrite it: ${error instanceof Error ? error.message : String(error)}`,
@@ -163,11 +167,16 @@ export class CaptureSpool {
 
   save(snapshot: BufferEngineSnapshot): void {
     if (!hasData(snapshot)) {
+      // register() may run in more than one OpenClaw runtime/process. An instance
+      // that started with no spool and never wrote capture data must not unlink a
+      // file created later by another live instance.
+      if (!this.ownsFile) return;
       try {
         unlinkSync(this.path);
       } catch (error) {
         if (!isObject(error) || error.code !== "ENOENT") throw error;
       }
+      this.ownsFile = false;
       return;
     }
 
@@ -192,6 +201,7 @@ export class CaptureSpool {
       } finally {
         closeSync(dirFd);
       }
+      this.ownsFile = true;
     } catch (error) {
       try {
         unlinkSync(tempPath);

@@ -53,6 +53,10 @@ function acceptedEpisodeUuid(result: Record<string, unknown>): string {
   return result.uuid;
 }
 
+function sequenceKey(agentId: string, sessionKey: string): string {
+  return JSON.stringify([agentId, sessionKey]);
+}
+
 export function register(api: OpenClawPluginApi): void {
   let cfg: GraphitiPluginConfig;
   try {
@@ -71,9 +75,53 @@ export function register(api: OpenClawPluginApi): void {
     );
   });
   const sequences = new EpisodeSequenceTracker();
+  const hydratedSequences = new Set<string>();
+
+  const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
+    const key = sequenceKey(agentId, sessionKey);
+    if (hydratedSequences.has(key)) return;
+
+    const saga = await client.getSaga(sessionKey, agentId);
+    if (!saga) {
+      sequences.hydrate(agentId, sessionKey, 0);
+      hydratedSequences.add(key);
+      logger.debug("capture_sequence_hydrated", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        episodeCount: 0,
+        source: "graphiti",
+      });
+      return;
+    }
+
+    if (saga.groupId !== agentId || saga.name !== sessionKey) {
+      throw new Error(
+        `Graphiti get_saga identity mismatch: requested ${agentId}/${sessionKey}, got ${saga.groupId}/${saga.name}`,
+      );
+    }
+    if (saga.episodeCount > 0 && !saga.lastEpisodeUuid) {
+      throw new Error(
+        `Graphiti saga ${agentId}/${sessionKey} has ${saga.episodeCount} episodes but no last_episode_uuid`,
+      );
+    }
+
+    sequences.hydrate(agentId, sessionKey, saga.episodeCount, saga.lastEpisodeUuid);
+    hydratedSequences.add(key);
+    logger.debug("capture_sequence_hydrated", {
+      agentId,
+      group_id: agentId,
+      saga: sessionKey,
+      episodeCount: saga.episodeCount,
+      lastEpisodeUuid: saga.lastEpisodeUuid,
+      source: "graphiti",
+    });
+  };
 
   const sink: AgentSink = async (agentId, entry, reason) => {
     const sessionKey = entry.buffer.sessionKey;
+    await ensureSequenceHydrated(agentId, sessionKey);
+
     const sequence = sequences.prepare(agentId, sessionKey);
     const episode: EpisodeJson = entry.buffer.episode;
     const jsonBody = JSON.stringify(episode);
@@ -85,6 +133,7 @@ export function register(api: OpenClawPluginApi): void {
       saga: sessionKey,
       name: sequence.name,
       batchNumber: sequence.batchNumber,
+      uuid: sequence.episodeUuid,
       previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
       messages: entry.buffer.messages.length,
       reason,
@@ -99,6 +148,7 @@ export function register(api: OpenClawPluginApi): void {
         saga: sessionKey,
         name: sequence.name,
         batchNumber: sequence.batchNumber,
+        uuid: sequence.episodeUuid,
         messages: entry.buffer.messages.length,
         reason,
         chars: jsonBody.length,
@@ -114,6 +164,7 @@ export function register(api: OpenClawPluginApi): void {
 
     const started = Date.now();
     const result = await client.addMemory({
+      uuid: sequence.episodeUuid,
       name: sequence.name,
       jsonBody,
       groupId: agentId,
@@ -131,6 +182,7 @@ export function register(api: OpenClawPluginApi): void {
         saga: sessionKey,
         name: sequence.name,
         batchNumber: sequence.batchNumber,
+        uuid: sequence.episodeUuid,
         messages: entry.buffer.messages.length,
         durationMs: Date.now() - started,
       },
@@ -167,9 +219,17 @@ export function register(api: OpenClawPluginApi): void {
           saga: sessionKey,
           reason,
           error: errorText(error),
-          action: "dropped",
-          automaticRetry: false,
-          uiNotification: "not_implemented_todo",
+          action: "retained_for_retry",
+          automaticRetry: true,
+          retryIntervalSeconds: 30,
+          uiNotification: "pending_host_integration",
+        }),
+      notifyRecovered: (agentId, sessionKey, reason) =>
+        logger.info("capture_flush_recovered", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          reason,
         }),
     },
   );

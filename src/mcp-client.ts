@@ -95,6 +95,7 @@ export class GraphitiMcpClient {
   }
 
   async addMemory(params: {
+    uuid: string;
     name: string;
     jsonBody: string;
     groupId: string;
@@ -104,6 +105,7 @@ export class GraphitiMcpClient {
     sagaPreviousEpisodeUuid?: string;
   }): Promise<JsonObject> {
     const args: JsonObject = {
+      uuid: params.uuid,
       name: params.name,
       episode_body: params.jsonBody,
       group_id: params.groupId,

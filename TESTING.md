@@ -1,40 +1,53 @@
 # Testing policy
 
-Tests in this repository exist to catch real regressions in memory routing, capture, recall, batching, and failure behavior. A green suite is not a goal by itself; it is evidence that important invariants still hold.
+Tests in this repository exist to catch real regressions in memory routing, capture, recall, batching, saga continuity, and failure behavior. A green suite is evidence only when the assertions match the current architecture.
 
-## Required test classes
+## Required invariants
 
-Every non-trivial behavior should be tested through at least one externally observable contract, not only through the implementation detail that happens to produce it.
+- **identity isolation** — `ctx.agentId` is the only source of Graphiti `group_id`;
+- **session isolation** — each `agentId + sessionKey` has its own active buffer and Saga state;
+- **message-delta capture** — `agent_end.messages` is treated as a transcript snapshot; only newly observed `user|assistant` messages are buffered;
+- **arbitrary role sequences** — `U U U A`, `A A`, and user-only tails are valid capture input;
+- **abort retention** — `event.success=false` does not by itself discard newly observed conversation messages;
+- **cross-memory filtering** — Graphiti/OpenViking recall wrappers are stripped from every captured message;
+- **hard message batching** — `bufferLimit` counts individual messages, accepts any integer `1..1000`, and never assumes evenness or pairs;
+- **timeout batching** — every non-empty buffer, including one message, is eligible after inactivity;
+- **FIFO** — detached batches are ordered per agent; sessions may interleave but never overtake the agent queue head;
+- **failure retention** — transport/MCP failure retains the exact queue head, detach reason, Saga sequence and caller-reserved UUID for retry;
+- **backend failure visibility** — terminal asynchronous Graphiti queue failures are surfaced through error-only plugin session status;
+- **restart Saga continuity** — `get_saga` restores persisted episode count and last UUID before the next accepted batch;
+- **MCP shape** — caller UUID, `group_id`, `saga`, predecessor fields and `reference_time` match the fork contract;
+- **recall safety** — query sanitization happens before search and injected XML cannot be broken by fact text;
+- **logging privacy** — raw message/request content appears only with explicit debug content logging.
 
-High-value invariants include:
+## Regression cases required for message capture
 
-- **identity isolation** — `ctx.agentId` is the only source of Graphiti `group_id`, and two agents never share a batch or search scope;
-- **conversation independence** — sessions may change while the same agent retains one memory personality and one capture buffer;
-- **capture correctness** — only the trailing completed USER + final ASSISTANT turn is captured, without tool noise or injected memory wrappers;
-- **cross-memory filtering** — Graphiti/OpenViking XML wrappers are removed while unrelated user XML survives;
-- **batch integrity** — threshold and idle flushes contain complete turns in chronological order;
-- **concurrency** — turns arriving during an in-flight flush are not lost, duplicated, or interleaved into the request already in flight;
-- **failure retention** — a failed batch remains buffered and v0.1 does not autonomously retry it forever;
-- **retry unblock semantics** — a later real turn makes retained data eligible again;
-- **MCP shape** — tool name, arguments, session handling, `group_id`, limits, and absence of client-generated UUID match the Graphiti contract;
-- **recall safety** — query sanitization happens before search, result markup is escaped, and the injected wrapper cannot be broken by fact text;
-- **logging privacy controls** — content is absent unless explicitly enabled, and diagnostic payloads remain one-line escaped.
+At minimum keep explicit coverage for:
+
+```text
+U A
+U U U A
+U A U U U A
+7xU + A with bufferLimit=6
+U followed by timeout
+U on an aborted/stopped run
+successive full snapshots without duplicate replay
+snapshot rewrite/overlap fallback
+```
 
 ## What not to do
 
-Do not add tests that merely restate constants, mirror the implementation line-for-line, or prove that a mock returns what the mock was told to return.
+Do not reintroduce `turn`, `pair`, even-limit, or minimum-two-message assumptions as compatibility helpers. They are not part of the capture contract anymore.
 
-Do not change production semantics solely to satisfy a failing test. First decide which side is wrong according to `TECHNICAL_SPEC.md`, the verified OpenClaw hook contract, and the Graphiti MCP contract.
+Do not change production semantics solely to satisfy a stale test. First decide which behavior matches `TECHNICAL_SPEC.md`, the verified OpenClaw hook contract, and the Graphiti MCP contract.
 
-Do not hide race conditions with arbitrary sleeps when a state transition can be observed directly. Timing tests should use bounded polling and generous margins when real timers are the behavior under test.
-
-Do not weaken negative assertions. Isolation, sanitization, destructive operations, and failure recovery need explicit tests for what **must not** happen.
+Do not hide race conditions with arbitrary sleeps when a state transition can be observed directly. Do not weaken negative assertions around isolation, sanitization, FIFO, UUID stability, or error retention.
 
 ## Test layers
 
-1. **Pure behavior tests** cover config, identity, text extraction/sanitization, XML rendering, and buffer state transitions.
-2. **Protocol tests** exercise the real `GraphitiMcpClient` request/response code against a controlled in-process HTTP/fetch boundary.
-3. **Plugin runtime tests** register the actual plugin against a fake OpenClaw hook API and drive `agent_end` / `before_prompt_build` through the MCP boundary.
-4. **Live acceptance** is manual against the real OpenClaw + Graphiti + FalkorDB stack and is never replaced by mocks.
+1. Pure behavior tests: config, identity, sanitization, transcript delta and buffer transitions.
+2. Protocol tests: real `GraphitiMcpClient` request/response code against a controlled HTTP/fetch boundary.
+3. Plugin runtime tests: actual plugin registration and `agent_end` / recall hook behavior through the MCP boundary.
+4. Live acceptance: real OpenClaw + Graphiti + FalkorDB. Mocks never replace this layer.
 
-Production Graphiti/FalkorDB credentials and data do not belong in CI. A future live integration job must use an explicitly disposable test backend.
+Production Graphiti/FalkorDB credentials and data do not belong in CI. Live validators must be read-only unless a deliberately disposable graph is selected.

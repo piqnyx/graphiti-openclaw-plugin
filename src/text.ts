@@ -22,6 +22,11 @@ type MessageLike = {
   content?: unknown;
 };
 
+export type ConversationMessage = {
+  role: "user" | "assistant";
+  text: string;
+};
+
 export function stripInjectedContexts(text: string): string {
   return text
     .replace(GRAPHITI_CONTEXT_RE, " ")
@@ -58,16 +63,30 @@ export function textFromContent(content: unknown): string {
   return parts.join("\n");
 }
 
+export function extractConversationMessages(messages: unknown[]): ConversationMessage[] {
+  const result: ConversationMessage[] = [];
+  for (const rawMessage of messages) {
+    if (!rawMessage || typeof rawMessage !== "object") continue;
+    const message = rawMessage as MessageLike;
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const text = sanitizeConversationText(textFromContent(message.content));
+    if (!text) continue;
+    if (message.role === "user" && text.startsWith(SESSION_RESET_PROMPT_PREFIX)) continue;
+    result.push({ role: message.role, text });
+  }
+  return result;
+}
+
 export type CompletedTurn = {
   user: string;
   assistant: string;
 };
 
 export function extractCompletedTurn(messages: unknown[]): CompletedTurn | null {
+  const conversation = extractConversationMessages(messages);
   let lastUserIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i] as MessageLike | undefined;
-    if (message && message.role === "user") {
+  for (let i = conversation.length - 1; i >= 0; i -= 1) {
+    if (conversation[i]?.role === "user") {
       lastUserIndex = i;
       break;
     }
@@ -75,24 +94,18 @@ export function extractCompletedTurn(messages: unknown[]): CompletedTurn | null 
   if (lastUserIndex < 0) return null;
 
   let finalAssistantIndex = -1;
-  for (let i = messages.length - 1; i > lastUserIndex; i -= 1) {
-    const message = messages[i] as MessageLike | undefined;
-    if (message && message.role === "assistant") {
+  for (let i = conversation.length - 1; i > lastUserIndex; i -= 1) {
+    if (conversation[i]?.role === "assistant") {
       finalAssistantIndex = i;
       break;
     }
   }
   if (finalAssistantIndex < 0) return null;
 
-  const userMessage = messages[lastUserIndex] as MessageLike;
-  const assistantMessage = messages[finalAssistantIndex] as MessageLike;
-  const user = sanitizeConversationText(textFromContent(userMessage.content));
-  const assistant = sanitizeConversationText(textFromContent(assistantMessage.content));
-
-  if (!user || !assistant) return null;
-  if (user.startsWith(SESSION_RESET_PROMPT_PREFIX)) return null;
-
-  return { user, assistant };
+  return {
+    user: conversation[lastUserIndex]!.text,
+    assistant: conversation[finalAssistantIndex]!.text,
+  };
 }
 
 export function prepareRecallQuery(text: string, maxChars: number): string {
@@ -129,6 +142,6 @@ export function buildRecallBlock(facts: readonly string[], maxChars: number): st
 }
 
 // ---------------------------------------------------------------------------
-// (пусто) JSON/алиасы-функции перенесены в BufferEngine (buffer.ts),
-// где JSON живёт внутри буфера и сообщения нормализуются при добавлении.
+// JSON/aliases are owned by BufferEngine. Capture now consumes individual
+// sanitized user/assistant messages rather than synthetic user+assistant pairs.
 // ---------------------------------------------------------------------------

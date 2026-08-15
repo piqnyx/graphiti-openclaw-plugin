@@ -64,9 +64,10 @@ test("MCP client initializes once and scopes fact search to group_id", async (t)
   assert.equal(call.headers.get("Mcp-Session-Id"), "session-one");
 });
 
-test("first add_memory explicitly sends empty previous context and no saga predecessor", async (t) => {
+test("first add_memory sends reserved UUID, empty previous context and no saga predecessor", async (t) => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const reservedUuid = "11111111-1111-4111-8111-111111111111";
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
@@ -86,7 +87,7 @@ test("first add_memory explicitly sends empty previous context and no saga prede
       jsonrpc: "2.0",
       id: payload.id,
       result: {
-        structuredContent: { result: { message: "queued", uuid: "uuid-1" } },
+        structuredContent: { result: { message: "queued", uuid: reservedUuid } },
         content: [],
         isError: false,
       },
@@ -95,6 +96,7 @@ test("first add_memory explicitly sends empty previous context and no saga prede
 
   const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
   const result = await client.addMemory({
+    uuid: reservedUuid,
     name: "6bc2a77c6957-1",
     jsonBody: '{"participants":{"user":"Вит","assistant":"Краб"},"messages":[]}',
     groupId: "main",
@@ -103,8 +105,9 @@ test("first add_memory explicitly sends empty previous context and no saga prede
     previousEpisodeUuids: [],
   });
 
-  assert.equal(result.uuid, "uuid-1", "nested FastMCP structuredContent.result is unwrapped");
+  assert.equal(result.uuid, reservedUuid, "nested FastMCP structuredContent.result is unwrapped");
   const args = calls[0];
+  assert.equal(args.uuid, reservedUuid);
   assert.equal(args.group_id, "main");
   assert.equal(args.source, "json");
   assert.equal(args.source_description, OPENCLAW_SOURCE_DESCRIPTION);
@@ -112,14 +115,14 @@ test("first add_memory explicitly sends empty previous context and no saga prede
   assert.equal(args.reference_time, "2026-08-14T00:00:00.000Z");
   assert.deepEqual(args.previous_episode_uuids, []);
   assert.equal("saga_previous_episode_uuid" in args, false);
-  assert.equal("uuid" in args, false, "backend reserves and returns the UUID");
   assert.equal(typeof args.custom_extraction_instructions, "string");
   assert.match(args.custom_extraction_instructions, /messages.*ARRAY/);
 });
 
-test("later add_memory sends exactly one semantic and saga predecessor", async (t) => {
+test("later add_memory sends caller UUID plus exactly one semantic and saga predecessor", async (t) => {
   const originalFetch = globalThis.fetch;
   let args;
+  const reservedUuid = "22222222-2222-4222-8222-222222222222";
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
@@ -134,12 +137,13 @@ test("later add_memory sends exactly one semantic and saga predecessor", async (
     return jsonResponse({
       jsonrpc: "2.0",
       id: payload.id,
-      result: { structuredContent: { result: { message: "queued", uuid: "uuid-2" } }, content: [], isError: false },
+      result: { structuredContent: { result: { message: "queued", uuid: reservedUuid } }, content: [], isError: false },
     });
   };
 
   const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
   const result = await client.addMemory({
+    uuid: reservedUuid,
     name: "session-2",
     jsonBody: "{}",
     groupId: "main",
@@ -149,9 +153,91 @@ test("later add_memory sends exactly one semantic and saga predecessor", async (
     sagaPreviousEpisodeUuid: "uuid-1",
   });
 
-  assert.equal(result.uuid, "uuid-2");
+  assert.equal(result.uuid, reservedUuid);
+  assert.equal(args.uuid, reservedUuid);
   assert.deepEqual(args.previous_episode_uuids, ["uuid-1"]);
   assert.equal(args.saga_previous_episode_uuid, "uuid-1");
+});
+
+test("getSaga maps persisted recovery state and scopes lookup to the agent group", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let args;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    if (payload.method === "initialize") {
+      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+    }
+    if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+    args = payload.params;
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: {
+        structuredContent: {
+          result: {
+            message: "retrieved",
+            uuid: "saga-uuid",
+            name: "session-1",
+            group_id: "main",
+            created_at: "2026-08-15T00:00:00+00:00",
+            summary: "",
+            first_episode_uuid: "ep-1",
+            last_episode_uuid: "ep-6",
+            episode_count: 6,
+          },
+        },
+        content: [],
+        isError: false,
+      },
+    });
+  };
+
+  const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
+  const saga = await client.getSaga("session-1", "main");
+
+  assert.equal(args.name, "get_saga");
+  assert.deepEqual(args.arguments, { saga_name: "session-1", group_id: "main" });
+  assert.deepEqual(saga, {
+    uuid: "saga-uuid",
+    name: "session-1",
+    groupId: "main",
+    createdAt: "2026-08-15T00:00:00+00:00",
+    summary: "",
+    firstEpisodeUuid: "ep-1",
+    lastEpisodeUuid: "ep-6",
+    episodeCount: 6,
+  });
+});
+
+test("getSaga returns undefined for a missing saga", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    if (payload.method === "initialize") {
+      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+    }
+    if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: {
+        structuredContent: { result: { error: "No saga named 'missing' found in group 'main'" } },
+        content: [],
+        isError: false,
+      },
+    });
+  };
+
+  const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
+  assert.equal(await client.getSaga("missing", "main"), undefined);
 });
 
 test("raw logger receives full request and response bodies", async (t) => {
@@ -169,7 +255,7 @@ test("raw logger receives full request and response bodies", async (t) => {
     return jsonResponse({
       jsonrpc: "2.0",
       id: payload.id,
-      result: { structuredContent: { result: { message: "queued", uuid: "u" } }, content: [], isError: false },
+      result: { structuredContent: { result: { message: "queued", uuid: "33333333-3333-4333-8333-333333333333" } }, content: [], isError: false },
     });
   };
 
@@ -177,6 +263,7 @@ test("raw logger receives full request and response bodies", async (t) => {
     raws.push({ kind, body }),
   );
   await client.addMemory({
+    uuid: "33333333-3333-4333-8333-333333333333",
     name: "test",
     jsonBody: "{}",
     groupId: "main",
@@ -187,5 +274,6 @@ test("raw logger receives full request and response bodies", async (t) => {
 
   assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("add_memory")));
   assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("previous_episode_uuids")));
+  assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("33333333-3333-4333-8333-333333333333")));
   assert.ok(raws.some((r) => r.kind === "response" && r.body.includes("uuid")));
 });

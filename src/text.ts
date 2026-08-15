@@ -1,4 +1,4 @@
-// (text.ts — утилиты санитизации и recall; UUID/JSON-логика буфера в buffer.ts)
+// (text.ts — утилиты санитизации conversation messages и recall)
 
 const GRAPHITI_CONTEXT_RE = /<graphiti-context\b[^>]*>[\s\S]*?<\/graphiti-context>/gi;
 const OPENVIKING_CONTEXT_RE = /<openviking-context\b[^>]*>[\s\S]*?<\/openviking-context>/gi;
@@ -77,37 +77,6 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
   return result;
 }
 
-export type CompletedTurn = {
-  user: string;
-  assistant: string;
-};
-
-export function extractCompletedTurn(messages: unknown[]): CompletedTurn | null {
-  const conversation = extractConversationMessages(messages);
-  let lastUserIndex = -1;
-  for (let i = conversation.length - 1; i >= 0; i -= 1) {
-    if (conversation[i]?.role === "user") {
-      lastUserIndex = i;
-      break;
-    }
-  }
-  if (lastUserIndex < 0) return null;
-
-  let finalAssistantIndex = -1;
-  for (let i = conversation.length - 1; i > lastUserIndex; i -= 1) {
-    if (conversation[i]?.role === "assistant") {
-      finalAssistantIndex = i;
-      break;
-    }
-  }
-  if (finalAssistantIndex < 0) return null;
-
-  return {
-    user: conversation[lastUserIndex]!.text,
-    assistant: conversation[finalAssistantIndex]!.text,
-  };
-}
-
 export function prepareRecallQuery(text: string, maxChars: number): string {
   const clean = sanitizeConversationText(text);
   if (clean.length <= maxChars) return clean;
@@ -140,8 +109,3 @@ export function buildRecallBlock(facts: readonly string[], maxChars: number): st
   if (lines.length === 0) return undefined;
   return `${prefix}${lines.join("\n")}${suffix}`;
 }
-
-// ---------------------------------------------------------------------------
-// JSON/aliases are owned by BufferEngine. Capture now consumes individual
-// sanitized user/assistant messages rather than synthetic user+assistant pairs.
-// ---------------------------------------------------------------------------

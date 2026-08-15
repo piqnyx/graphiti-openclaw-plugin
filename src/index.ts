@@ -1,8 +1,9 @@
 import { BufferEngine, type AgentSink, type EpisodeJson } from "./buffer.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
+import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
-import { GraphitiMcpClient } from "./mcp-client.js";
+import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION } from "./mcp-client.js";
 import {
   buildRecallBlock,
   extractCompletedTurn,
@@ -44,6 +45,14 @@ function requireSessionKey(value: unknown): string {
   return value;
 }
 
+function acceptedEpisodeUuid(result: Record<string, unknown>): string {
+  if (typeof result.error === "string") throw new Error(result.error);
+  if (typeof result.uuid !== "string" || result.uuid.trim() === "") {
+    throw new Error("Graphiti add_memory accepted response did not contain episode uuid");
+  }
+  return result.uuid;
+}
+
 export function register(api: OpenClawPluginApi): void {
   let cfg: GraphitiPluginConfig;
   try {
@@ -61,8 +70,11 @@ export function register(api: OpenClawPluginApi): void {
       { raw: body },
     );
   });
+  const sequences = new EpisodeSequenceTracker();
 
   const sink: AgentSink = async (agentId, entry, reason) => {
+    const sessionKey = entry.buffer.sessionKey;
+    const sequence = sequences.prepare(agentId, sessionKey);
     const episode: EpisodeJson = entry.buffer.episode;
     const jsonBody = JSON.stringify(episode);
     const referenceTime = new Date(entry.enqueuedAt).toISOString();
@@ -70,31 +82,45 @@ export function register(api: OpenClawPluginApi): void {
     logger.debug("capture_flush_start", {
       agentId,
       group_id: agentId,
-      saga: entry.buffer.sessionKey,
+      saga: sessionKey,
+      name: sequence.name,
+      batchNumber: sequence.batchNumber,
+      previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
       messages: entry.buffer.messages.length,
       reason,
       chars: jsonBody.length,
+      reference_time: referenceTime,
     });
     logger.debugContent(
       "capture_payload",
       {
         agentId,
         group_id: agentId,
-        saga: entry.buffer.sessionKey,
+        saga: sessionKey,
+        name: sequence.name,
+        batchNumber: sequence.batchNumber,
         messages: entry.buffer.messages.length,
         reason,
         chars: jsonBody.length,
       },
-      { episodeBody: jsonBody, source: "json", reference_time: referenceTime },
+      {
+        episodeBody: jsonBody,
+        source: "json",
+        source_description: OPENCLAW_SOURCE_DESCRIPTION,
+        reference_time: referenceTime,
+        previous_episode_uuids: sequence.previousEpisodeUuids,
+      },
     );
 
     const started = Date.now();
     const result = await client.addMemory({
-      name: `openclaw-${agentId}-${new Date().toISOString()}`,
+      name: sequence.name,
       jsonBody,
       groupId: agentId,
-      saga: entry.buffer.sessionKey,
+      saga: sessionKey,
       referenceTime,
+      previousEpisodeUuids: sequence.previousEpisodeUuids,
+      sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
     });
 
     logger.debugContent(
@@ -102,19 +128,26 @@ export function register(api: OpenClawPluginApi): void {
       {
         agentId,
         group_id: agentId,
-        saga: entry.buffer.sessionKey,
+        saga: sessionKey,
+        name: sequence.name,
+        batchNumber: sequence.batchNumber,
         messages: entry.buffer.messages.length,
         durationMs: Date.now() - started,
       },
       { mcpResult: JSON.stringify(result) },
     );
 
-    if (typeof result.error === "string") throw new Error(result.error);
+    const episodeUuid = acceptedEpisodeUuid(result);
+    sequences.accept(agentId, sessionKey, sequence.batchNumber, episodeUuid);
 
     logger.info("capture_queue_accepted", {
       agentId,
       group_id: agentId,
-      saga: entry.buffer.sessionKey,
+      saga: sessionKey,
+      name: sequence.name,
+      batchNumber: sequence.batchNumber,
+      uuid: episodeUuid,
+      previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
       messages: entry.buffer.messages.length,
       reason,
       durationMs: Date.now() - started,
@@ -141,6 +174,7 @@ export function register(api: OpenClawPluginApi): void {
     },
   );
 
+  // Recall remains intentionally unchanged while capture is being stabilized.
   if (cfg.autoRecall) {
     api.on(
       "before_prompt_build",
@@ -278,7 +312,9 @@ export function register(api: OpenClawPluginApi): void {
     autoRecall: cfg.autoRecall,
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
-    agents: Object.entries(cfg.agents).map(([id, a]) => `${id}:user=${a.user}:assistant=${a.assistant}`),
+    agents: Object.entries(cfg.agents).map(([agentId, actors]) =>
+      `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
+    ),
     requestTimeoutMs: cfg.requestTimeoutMs,
     recallLimit: cfg.recallLimit,
     logLevel: cfg.logLevel,

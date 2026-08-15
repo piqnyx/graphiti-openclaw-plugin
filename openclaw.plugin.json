@@ -20,8 +20,8 @@
       "logOperations": { "type": "boolean" },
       "logLevel": { "type": "string", "enum": ["error", "warn", "info", "debug"] },
       "logContent": { "type": "boolean" },
-      "bufferLimit": { "type": "integer", "minimum": 4, "maximum": 1000 },
-      "bufferTimeout": { "type": "integer", "minimum": 120, "maximum": 604800 },
+      "bufferLimit": { "type": "integer", "minimum": 4, "maximum": 1000, "multipleOf": 2 },
+      "bufferTimeout": { "type": "integer", "minimum": 30, "maximum": 604800 },
       "agents": {
         "type": "object",
         "additionalProperties": {

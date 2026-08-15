@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildRecallBlock,
-  extractCompletedTurn,
+  extractConversationMessages,
   prepareRecallQuery,
   stripInjectedContexts,
 } from "../dist/text.js";
@@ -34,18 +34,26 @@ test("wrapper stripping does not eat lookalike or malformed user XML", () => {
   assert.match(clean, /unclosed user text/);
 });
 
-test("completed turn sanitizes injected wrappers from both user and assistant", () => {
-  const turn = extractCompletedTurn([
+test("conversation extraction sanitizes injected wrappers from every captured message", () => {
+  const messages = extractConversationMessages([
     {
       role: "user",
       content: "user fact <openviking-context>hidden block</openviking-context>",
+    },
+    {
+      role: "user",
+      content: "second fact <relevant-memories>hidden memory</relevant-memories>",
     },
     {
       role: "assistant",
       content: "assistant reply <graphiti-context>hidden block</graphiti-context>",
     },
   ]);
-  assert.deepEqual(turn, { user: "user fact", assistant: "assistant reply" });
+  assert.deepEqual(messages, [
+    { role: "user", text: "user fact" },
+    { role: "user", text: "second fact" },
+    { role: "assistant", text: "assistant reply" },
+  ]);
 });
 
 test("recall query bound applies after context sanitization", () => {

@@ -164,4 +164,4 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
   assert.equal(status.pending, 3);
   assert.equal(status.episodeUuid, "episode-7");
   assert.match(status.error, /deepseek failed permanently/);
-}
+});

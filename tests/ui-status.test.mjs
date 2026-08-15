@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { register } from "../dist/index.js";
 
 function jsonResponse(body, init = {}) {
@@ -70,7 +73,11 @@ function installFailingGraphitiFetch(t) {
   };
 }
 
-function makeApi({ patchThrows = false } = {}) {
+function makeApi(t, { patchThrows = false } = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), "graphiti-ui-status-"));
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
   const hooks = new Map();
   const logs = [];
   const extensions = [];
@@ -128,7 +135,7 @@ function makeApi({ patchThrows = false } = {}) {
 
 test("capture failures publish error-only plugin session status", async (t) => {
   installFailingGraphitiFetch(t);
-  const { hooks, extensions, descriptors, patches, api } = makeApi();
+  const { hooks, extensions, descriptors, patches, api } = makeApi(t);
   register(api);
 
   assert.equal(extensions.length, 2);
@@ -156,7 +163,7 @@ test("capture failures publish error-only plugin session status", async (t) => {
 
 test("session status write failures never escape into capture control flow", async (t) => {
   installFailingGraphitiFetch(t);
-  const { hooks, logs, api } = makeApi({ patchThrows: true });
+  const { hooks, logs, api } = makeApi(t, { patchThrows: true });
   register(api);
 
   const ctx = { agentId: "main", sessionKey: "agent:main:web:status-failure", trigger: "user" };

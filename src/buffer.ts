@@ -1,5 +1,8 @@
 import type { AgentActors } from "./config.js";
 import { DEFAULT_ACTORS } from "./config.js";
+import { CHECK_INTERVAL_SEC, MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
+
+export { CHECK_INTERVAL_SEC, MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
 
 export type MessageRole = "user" | "assistant";
 
@@ -8,27 +11,22 @@ export type BufferMessage = {
   text: string;
 };
 
-/**
- * Пустой JSON-эпизод создаётся вместе с буфером:
- * `participants` (канонические имена акторов агента) присутствуют, `messages` = `[]`.
- * Completed turn добавляется атомарно как user+assistant. Текст не переписывается.
- */
 export type EpisodeJson = {
   participants: { user: string; assistant: string };
   messages: BufferMessage[];
 };
 
 export type Buffer = {
-  sessionKey: string; // ключ сессии = saga ID для Graphiti
-  messages: BufferMessage[]; // накопленные сообщения (== episode.messages)
-  episode: EpisodeJson; // JSON, созданный вместе с буфером
-  createdAt: number; // timestamp создания буфера (мс)
-  lastActivityAt: number; // timestamp последнего completed turn (мс)
+  sessionKey: string;
+  messages: BufferMessage[];
+  episode: EpisodeJson;
+  createdAt: number;
+  lastActivityAt: number;
 };
 
 export type QueueEntry = {
   buffer: Buffer;
-  enqueuedAt: number; // момент ухода буфера в очередь (мс)
+  enqueuedAt: number;
 };
 
 export type FlushReason = "limit" | "timeout";
@@ -46,24 +44,9 @@ export type AgentSink = (
   reason: FlushReason,
 ) => Promise<void>;
 
-/** Минимальный публичный bufferTimeout, в секундах. */
-export const MIN_BUFFER_TIMEOUT_SEC = 30;
-
 /**
- * Внутренняя константа интервала проверки буферов.
- * Равна минимальному валидному bufferTimeout. Не является публичным конфигом.
- */
-export const CHECK_INTERVAL_SEC = MIN_BUFFER_TIMEOUT_SEC;
-
-/**
- * Движок буферов и очередей.
- *
- * - Буфер на каждую сессию (sessionKey) внутри агента (agentId).
- * - Одна FIFO-очередь на агента.
- * - Completed turn (user+assistant) добавляется в буфер атомарно.
- * - bufferLimit считается в сообщениях и обязан быть чётным, чтобы не разрезать turn.
- * - Буфер отцепляется по лимиту или таймауту неактивности.
- * - Внутри агента очередь processится строго последовательно; между агентами независимо.
+ * Per-session buffers + one FIFO queue per agent.
+ * Completed user+assistant turns are atomic and can never be split by a batch limit.
  */
 export class BufferEngine {
   private readonly captureStates = new Map<string, AgentCaptureState>();
@@ -95,10 +78,6 @@ export class BufferEngine {
     this.timer.unref?.();
   }
 
-  /**
-   * Добавляет один полностью завершённый ход user+assistant.
-   * Частичный user никогда не существует внутри BufferEngine.
-   */
   addTurn(agentId: string, sessionKey: string, userText: string, assistantText: string): void {
     const agent = this.ensureAgent(agentId);
     let buffer = agent.activeBuffers.get(sessionKey);
@@ -110,10 +89,8 @@ export class BufferEngine {
 
     const now = Date.now();
 
-    // Если старый буфер уже протух, отцепляем его ДО добавления нового turn.
-    // Новый user+assistant целиком попадёт в свежий буфер.
-    const timeoutHit = now - buffer.lastActivityAt >= this.bufferTimeoutMs;
-    if (timeoutHit && this.eligibility(buffer)) {
+    // Flush an idle completed buffer before the new turn, so turns never straddle batches.
+    if (now - buffer.lastActivityAt >= this.bufferTimeoutMs && this.eligibility(buffer)) {
       agent.queue.push({ buffer, enqueuedAt: now });
       void this.pump(agent);
       buffer = this.createBuffer(sessionKey, agentId);
@@ -122,7 +99,6 @@ export class BufferEngine {
 
     this.pushCompletedTurn(buffer, userText, assistantText, now);
 
-    // Чётный лимит + атомарный turn гарантируют, что батч заканчивается assistant.
     if (buffer.messages.length >= this.bufferLimit) {
       agent.queue.push({ buffer, enqueuedAt: now });
       void this.pump(agent);
@@ -130,7 +106,6 @@ export class BufferEngine {
     }
   }
 
-  /** Канонические имена акторов для агента (fallback на User/Assistant). */
   private actorsFor(agentId: string): AgentActors {
     return this.agents[agentId] ?? DEFAULT_ACTORS;
   }
@@ -151,12 +126,7 @@ export class BufferEngine {
     };
   }
 
-  private pushCompletedTurn(
-    buffer: Buffer,
-    userText: string,
-    assistantText: string,
-    now: number,
-  ): void {
+  private pushCompletedTurn(buffer: Buffer, userText: string, assistantText: string, now: number): void {
     buffer.messages.push(
       { role: "user", text: userText },
       { role: "assistant", text: assistantText },
@@ -182,8 +152,7 @@ export class BufferEngine {
     for (const agent of this.captureStates.values()) {
       for (const [sessionKey, buffer] of agent.activeBuffers) {
         if (!this.eligibility(buffer)) continue;
-        const elapsed = now - buffer.lastActivityAt;
-        if (elapsed >= this.bufferTimeoutMs) {
+        if (now - buffer.lastActivityAt >= this.bufferTimeoutMs) {
           agent.activeBuffers.delete(sessionKey);
           agent.queue.push({ buffer, enqueuedAt: now });
         }

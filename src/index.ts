@@ -1,4 +1,4 @@
-import { BufferEngine, type AgentSink, type EpisodeJson } from "./buffer.js";
+import { BufferEngine, CHECK_INTERVAL_SEC, type AgentSink, type EpisodeJson } from "./buffer.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
@@ -221,7 +221,7 @@ export function register(api: OpenClawPluginApi): void {
           error: errorText(error),
           action: "retained_for_retry",
           automaticRetry: true,
-          retryIntervalSeconds: 30,
+          retryIntervalSeconds: CHECK_INTERVAL_SEC,
           uiNotification: "pending_host_integration",
         }),
       notifyRecovered: (agentId, sessionKey, reason) =>

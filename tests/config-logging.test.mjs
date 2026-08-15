@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
+import { DEFAULT_CONFIG, MIN_BUFFER_TIMEOUT_SEC, parseConfig } from "../dist/config.js";
 
-test("v0.2 defaults: buffer fields and per-agent canonical actors", () => {
+test("capture defaults: buffer fields and per-agent canonical actors", () => {
   const cfg = parseConfig({});
   assert.equal(cfg.bufferLimit, 4);
   assert.equal(cfg.bufferTimeout, 900);
@@ -19,21 +19,23 @@ test("diagnostic defaults stay non-content and info-level", () => {
   assert.equal(cfg.logOperations, true);
 });
 
-test("live diagnostic overrides are accepted", () => {
+test("explicit debug content diagnostics are accepted", () => {
   const cfg = parseConfig({ logLevel: "debug", logContent: true });
   assert.equal(cfg.logLevel, "debug");
   assert.equal(cfg.logContent, true);
 });
 
-test("bufferLimit must be >= 4", () => {
+test("bufferLimit must be even and >= 4", () => {
   assert.throws(() => parseConfig({ bufferLimit: 3 }), /bufferLimit/);
+  assert.throws(() => parseConfig({ bufferLimit: 5 }), /bufferLimit must be even/);
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 4 }));
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 1000 }));
 });
 
-test("bufferTimeout must be >= 120 seconds (2 min)", () => {
-  assert.throws(() => parseConfig({ bufferTimeout: 119 }), /bufferTimeout/);
-  assert.doesNotThrow(() => parseConfig({ bufferTimeout: 120 }));
+test("bufferTimeout minimum equals the internal 30-second ticker floor", () => {
+  assert.equal(MIN_BUFFER_TIMEOUT_SEC, 30);
+  assert.throws(() => parseConfig({ bufferTimeout: 29 }), /bufferTimeout/);
+  assert.doesNotThrow(() => parseConfig({ bufferTimeout: 30 }));
 });
 
 test("agents: each entry needs non-empty user and assistant names", () => {
@@ -61,20 +63,17 @@ test("agents: each entry needs non-empty user and assistant names", () => {
 });
 
 test("agents replaces obsolete participants; aliases are gone", () => {
-  // Старая схема participants (даже корректная) не принимается.
   assert.throws(
     () => parseConfig({ participants: [{ role: "user", name: "Вит" }] }),
     /unknown plugin config key/,
   );
-  // Ключ aliases больше не существует ни у кого — любой алиас упадёт как unknown.
   assert.throws(
     () => parseConfig({ agents: { main: { user: "Вит", assistant: "Краб", aliases: [] } } }),
     /aliases/,
   );
 });
 
-test("customExtractionInstructions is not a config key (hardcoded in code)", () => {
-  // Промпт зашит в код, из конфига не управляется — ключ должен отвергаться.
+test("customExtractionInstructions is not a config key because the prompt is internal", () => {
   assert.throws(
     () => parseConfig({ customExtractionInstructions: "Extract ALL entities." }),
     /unknown plugin config key/,

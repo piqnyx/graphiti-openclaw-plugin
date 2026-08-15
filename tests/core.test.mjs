@@ -5,7 +5,7 @@ import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 import { requireAgentId } from "../dist/identity.js";
 import {
   buildRecallBlock,
-  extractCompletedTurn,
+  extractConversationMessages,
   prepareRecallQuery,
   stripInjectedContexts,
 } from "../dist/text.js";
@@ -28,15 +28,20 @@ test("agent identity fails closed", () => {
   assert.throws(() => requireAgentId(" main"), /whitespace/);
 });
 
-test("completed turn compatibility helper uses trailing user and final assistant", () => {
-  const turn = extractCompletedTurn([
-    { role: "user", content: "old user" },
-    { role: "assistant", content: "old assistant" },
-    { role: "user", content: "new user" },
+test("conversation extraction preserves consecutive roles and ignores tool noise", () => {
+  const messages = extractConversationMessages([
+    { role: "user", content: "u1" },
+    { role: "user", content: "u2" },
     { role: "toolResult", content: "tool noise" },
-    { role: "assistant", content: [{ type: "text", text: "new assistant" }] },
+    { role: "assistant", content: [{ type: "text", text: "a1" }] },
+    { role: "assistant", content: [{ type: "output_text", text: "a2" }] },
   ]);
-  assert.deepEqual(turn, { user: "new user", assistant: "new assistant" });
+  assert.deepEqual(messages, [
+    { role: "user", text: "u1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a1" },
+    { role: "assistant", text: "a2" },
+  ]);
 });
 
 test("known memory context wrappers are stripped", () => {

@@ -49,12 +49,14 @@ function installFailingGraphitiFetch(t) {
     if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (payload.method !== "tools/call") throw new Error(`unexpected method ${payload.method}`);
     if (payload.params.name === "get_saga") {
+      const sagaName = payload.params.arguments.saga_name;
+      const groupId = payload.params.arguments.group_id;
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
         result: {
           structuredContent: {
-            result: { error: "No saga found" },
+            result: { error: `No saga named '${sagaName}' found in group '${groupId}'` },
           },
           content: [],
           isError: false,

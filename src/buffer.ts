@@ -36,6 +36,8 @@ export type AgentCaptureState = {
   activeBuffers: Map<string, Buffer>;
   queue: QueueEntry[];
   processing: boolean;
+  retryAfter: number;
+  failureActive: boolean;
 };
 
 export type AgentSink = (
@@ -47,6 +49,7 @@ export type AgentSink = (
 /**
  * Per-session buffers + one FIFO queue per agent.
  * Completed user+assistant turns are atomic and can never be split by a batch limit.
+ * A failed queue head is retained and retried; later entries can never overtake it.
  */
 export class BufferEngine {
   private readonly captureStates = new Map<string, AgentCaptureState>();
@@ -60,6 +63,7 @@ export class BufferEngine {
     private readonly sink: AgentSink,
     private readonly opts: {
       notifyError?: (agentId: string, sessionKey: string, reason: FlushReason, error: Error) => void;
+      notifyRecovered?: (agentId: string, sessionKey: string, reason: FlushReason) => void;
     } = {},
   ) {
     if (!Number.isInteger(bufferLimit) || bufferLimit < 2 || bufferLimit % 2 !== 0) {
@@ -141,7 +145,14 @@ export class BufferEngine {
   private ensureAgent(agentId: string): AgentCaptureState {
     let agent = this.captureStates.get(agentId);
     if (!agent) {
-      agent = { agentId, activeBuffers: new Map(), queue: [], processing: false };
+      agent = {
+        agentId,
+        activeBuffers: new Map(),
+        queue: [],
+        processing: false,
+        retryAfter: 0,
+        failureActive: false,
+      };
       this.captureStates.set(agentId, agent);
     }
     return agent;
@@ -162,7 +173,7 @@ export class BufferEngine {
   }
 
   private async pump(agent: AgentCaptureState): Promise<void> {
-    if (agent.processing) return;
+    if (agent.processing || Date.now() < agent.retryAfter) return;
     agent.processing = true;
     try {
       while (agent.queue.length > 0) {
@@ -171,9 +182,20 @@ export class BufferEngine {
         try {
           await this.sink(agent.agentId, entry, reason);
           agent.queue.shift();
+          if (agent.failureActive) {
+            this.opts.notifyRecovered?.(agent.agentId, entry.buffer.sessionKey, reason);
+          }
+          agent.failureActive = false;
+          agent.retryAfter = 0;
         } catch (error) {
-          agent.queue.shift();
-          this.opts.notifyError?.(agent.agentId, entry.buffer.sessionKey, reason, asError(error));
+          agent.retryAfter = Date.now() + CHECK_INTERVAL_SEC * 1000;
+          if (!agent.failureActive) {
+            this.opts.notifyError?.(agent.agentId, entry.buffer.sessionKey, reason, asError(error));
+          }
+          agent.failureActive = true;
+          // Keep the failed entry at queue[0]. The next ticker retries the same
+          // content, with the same saga sequence and caller-reserved UUID.
+          break;
         }
       }
     } finally {

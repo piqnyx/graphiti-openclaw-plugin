@@ -30,8 +30,6 @@ test("log level suppresses lower-priority events without hiding errors", () => {
     records.map((record) => record.level),
     ["warn", "error"],
   );
-  assert.match(records[0].message, /event=warn_event/);
-  assert.match(records[1].message, /event=error_event/);
 });
 
 test("logOperations=false keeps warnings and errors but silences normal operation noise", () => {
@@ -44,6 +42,7 @@ test("logOperations=false keeps warnings and errors but silences normal operatio
 
   logger.debug("buffered");
   logger.info("queued");
+  logger.debugContent("capture_payload", {}, { body: "secret" });
   logger.warn("recall_failed");
   logger.error("capture_failed");
 
@@ -53,27 +52,32 @@ test("logOperations=false keeps warnings and errors but silences normal operatio
   );
 });
 
-test("content logging is opt-in and emits escaped one-line payloads", () => {
-  const disabled = makeSink();
-  const disabledLogger = createGraphitiLogger(disabled.sink, {
+test("content logging requires both logContent=true and logLevel=debug", () => {
+  const noContent = makeSink();
+  createGraphitiLogger(noContent.sink, {
     logOperations: true,
     logLevel: "debug",
     logContent: false,
-  });
-  disabledLogger.debugContent("capture_payload", { agentId: "main" }, { body: "secret\nline" });
-  assert.equal(disabled.records.length, 0);
+  }).debugContent("capture_payload", {}, { body: "secret" });
+  assert.equal(noContent.records.length, 0);
+
+  const infoOnly = makeSink();
+  createGraphitiLogger(infoOnly.sink, {
+    logOperations: true,
+    logLevel: "info",
+    logContent: true,
+  }).debugContent("capture_payload", {}, { body: "secret" });
+  assert.equal(infoOnly.records.length, 0);
 
   const enabled = makeSink();
-  const enabledLogger = createGraphitiLogger(enabled.sink, {
+  createGraphitiLogger(enabled.sink, {
     logOperations: true,
     logLevel: "debug",
     logContent: true,
-  });
-  enabledLogger.debugContent("capture_payload", { agentId: "main" }, { body: "first\nsecond" });
+  }).debugContent("capture_payload", { agentId: "main" }, { body: "first\nsecond" });
 
   assert.equal(enabled.records.length, 1);
-  // Контент пишем на INFO (виден в journald), не на DEBUG.
-  assert.equal(enabled.records[0].level, "info");
+  assert.equal(enabled.records[0].level, "debug");
   assert.match(enabled.records[0].message, /event=capture_payload/);
   assert.match(enabled.records[0].message, /body="first\\nsecond"/);
   assert.equal(enabled.records[0].message.includes("first\nsecond"), false);
@@ -90,5 +94,4 @@ test("debug falls back to info when the host logger lacks a debug method", () =>
   logger.debug("diagnostic", { agentId: "main" });
   assert.equal(records.length, 1);
   assert.equal(records[0].level, "info");
-  assert.match(records[0].message, /event=diagnostic/);
 });

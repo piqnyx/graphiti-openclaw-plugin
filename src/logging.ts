@@ -67,10 +67,11 @@ export function createGraphitiLogger(
     info: (event, fields) => emit("info", event, fields),
     debug: (event, fields) => emit("debug", event, fields),
     debugContent: (event, fields, content) => {
-      // Полные payload/messages/raw HTTP считаются чувствительной диагностикой.
-      // Они появляются только при явных logLevel=debug + logContent=true.
+      // Content diagnostics are intentionally strict: all three operator switches
+      // must be enabled. We write the resulting line through INFO because OpenClaw's
+      // journald path does not reliably surface plugin DEBUG records.
       if (!cfg.logContent || !enabled("debug")) return;
-      emit("debug", event, { ...fields, ...content });
+      sink.info(renderMessage(event, { ...fields, ...content }));
     },
   };
 }

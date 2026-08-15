@@ -12,6 +12,37 @@ test("capture defaults: buffer fields and per-agent canonical actors", () => {
   assert.deepEqual(cfg, DEFAULT_CONFIG);
 });
 
+test("recall defaults are bounded and history-aware", () => {
+  const cfg = parseConfig({});
+  assert.equal(cfg.requestTimeoutMs, 45_000);
+  assert.equal(cfg.recallLimit, 8);
+  assert.equal(cfg.recallQueryMaxChars, 6_000);
+  assert.equal(cfg.recallMaxInjectedChars, 8_000);
+  assert.equal(cfg.recallUseHistory, true);
+  assert.equal(cfg.recallHistoryMaxMessages, 6);
+  assert.equal(cfg.recallHistoryMaxChars, 4_000);
+});
+
+test("recall limits and history controls validate their documented ranges", () => {
+  assert.throws(() => parseConfig({ recallLimit: 0 }), /recallLimit/);
+  assert.throws(() => parseConfig({ recallLimit: 101 }), /recallLimit/);
+  assert.throws(() => parseConfig({ recallQueryMaxChars: 31 }), /recallQueryMaxChars/);
+  assert.throws(() => parseConfig({ recallMaxInjectedChars: 127 }), /recallMaxInjectedChars/);
+  assert.throws(() => parseConfig({ recallHistoryMaxMessages: 0 }), /recallHistoryMaxMessages/);
+  assert.throws(() => parseConfig({ recallHistoryMaxMessages: 101 }), /recallHistoryMaxMessages/);
+  assert.throws(() => parseConfig({ recallHistoryMaxChars: 127 }), /recallHistoryMaxChars/);
+  assert.throws(() => parseConfig({ recallUseHistory: "yes" }), /recallUseHistory/);
+
+  assert.doesNotThrow(() => parseConfig({
+    recallLimit: 12,
+    recallQueryMaxChars: 12_000,
+    recallMaxInjectedChars: 16_000,
+    recallUseHistory: false,
+    recallHistoryMaxMessages: 10,
+    recallHistoryMaxChars: 8_000,
+  }));
+});
+
 test("diagnostic defaults stay non-content and info-level", () => {
   const cfg = parseConfig({});
   assert.equal(cfg.logLevel, "info");

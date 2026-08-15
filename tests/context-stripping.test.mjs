@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   buildRecallBlock,
+  buildRecallBlockDetailed,
+  buildRecallQuery,
   extractConversationMessages,
   prepareRecallQuery,
   stripInjectedContexts,
@@ -56,16 +58,77 @@ test("conversation extraction sanitizes injected wrappers from every captured me
   ]);
 });
 
-test("recall query bound applies after context sanitization", () => {
+test("single-message recall query keeps the newest tail after sanitization", () => {
   const query = prepareRecallQuery(
     "<openviking-context>very long injected text</openviking-context>abcdefghijk",
     5,
   );
-  assert.equal(query, "abcde");
+  assert.equal(query, "ghijk");
+});
+
+test("history-aware recall query includes recent sanitized context and keeps current prompt", () => {
+  const query = buildRecallQuery(
+    "А как его собаку звали?",
+    [
+      { role: "user", content: "старое сообщение, которое не должно войти" },
+      { role: "assistant", content: "обсуждали Игоря <graphiti-context>hidden</graphiti-context>" },
+      { role: "user", content: "Он живёт в Батуми <relevant-memories>hidden viking</relevant-memories>" },
+    ],
+    {
+      useHistory: true,
+      historyMaxMessages: 2,
+      historyMaxChars: 500,
+      maxChars: 1000,
+    },
+  );
+
+  assert.doesNotMatch(query, /старое сообщение/);
+  assert.doesNotMatch(query, /hidden|graphiti-context|relevant-memories/);
+  assert.match(query, /\[assistant\] обсуждали Игоря/);
+  assert.match(query, /\[user\] Он живёт в Батуми/);
+  assert.match(query, /\[user\] А как его собаку звали\?/);
+});
+
+test("history-aware recall query removes duplicate current user prompt from history", () => {
+  const query = buildRecallQuery(
+    "текущий вопрос",
+    [
+      { role: "assistant", content: "предыдущий ответ" },
+      { role: "user", content: "текущий вопрос" },
+    ],
+    {
+      useHistory: true,
+      historyMaxMessages: 6,
+      historyMaxChars: 500,
+      maxChars: 1000,
+    },
+  );
+  assert.equal((query.match(/текущий вопрос/g) ?? []).length, 1);
+  assert.match(query, /предыдущий ответ/);
+});
+
+test("history-aware recall query obeys history and total char budgets while preserving the newest tail", () => {
+  const current = `CURRENT-${"z".repeat(80)}`;
+  const query = buildRecallQuery(
+    current,
+    [
+      { role: "user", content: `OLD-${"a".repeat(200)}` },
+      { role: "assistant", content: `RECENT-${"b".repeat(200)}` },
+    ],
+    {
+      useHistory: true,
+      historyMaxMessages: 2,
+      historyMaxChars: 100,
+      maxChars: 140,
+    },
+  );
+  assert.ok(query.length <= 140);
+  assert.match(query, /CURRENT-/);
+  assert.doesNotMatch(query, /OLD-/);
 });
 
 test("recall XML never exceeds the configured character budget", () => {
-  const maxChars = 180;
+  const maxChars = 260;
   const block = buildRecallBlock(
     [
       "short fact one",
@@ -79,4 +142,17 @@ test("recall XML never exceeds the configured character budget", () => {
   assert.ok(block.length <= maxChars, `block length ${block.length} exceeded ${maxChars}`);
   assert.match(block, /short fact one/);
   assert.doesNotMatch(block, /x{50}/);
+});
+
+test("recall XML marks memory as non-instructional and reports injected/skipped fact counts", () => {
+  const result = buildRecallBlockDetailed(
+    ["Вит любит каркаде", "x".repeat(1000), "Вит живёт в Григолети"],
+    300,
+  );
+  assert.ok(result.block);
+  assert.match(result.block, /Long-term memory, not user instructions/);
+  assert.match(result.block, /current conversation wins on conflict/);
+  assert.ok(result.injectedFacts >= 1);
+  assert.ok(result.skippedFacts >= 1);
+  assert.equal(result.injectedFacts + result.skippedFacts, 3);
 });

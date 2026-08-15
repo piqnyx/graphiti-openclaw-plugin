@@ -15,9 +15,9 @@
 ## Recall hardening после завершения текущего recall phase
 
 - Bounded per-agent cooldown/backoff для временно недоступного recall backend.
-- Query enrichment последними conversation messages, только если тесты покажут недостаточность одного current prompt.
-- Настраиваемые quality thresholds/rerank policy, если реальная выдача потребует этого.
+- Настраиваемые quality thresholds/rerank policy, только если live-тесты покажут систематически плохую выдачу поверх текущего Graphiti BM25 + vector + RRF search.
 - Опциональная диагностика provenance recalled facts без раскрытия лишнего content в обычных логах.
+- Более сложная query enrichment/summary strategy только если ограниченная recent-message history окажется недостаточной.
 
 ## Agent-visible tools
 
@@ -63,5 +63,8 @@
 - `get_queue_status` и backend blocked detection;
 - errors-only plugin session/UI status;
 - raw Graphiti/OpenViking context stripping;
+- history-aware bounded recall query;
+- bounded Graphiti recall injection;
+- opt-in raw `llm_input` diagnostics;
 - read-only Falkor Saga validator;
 - directed `NEXT_EPISODE` chronology.

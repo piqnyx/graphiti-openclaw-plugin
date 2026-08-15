@@ -18,6 +18,9 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Error-only OpenClaw plugin session/UI status for capture/backend failures.
 - Streamable HTTP MCP client for capture and recall.
 - Automatic bounded `<graphiti-context>` recall injection.
+- Optional history-aware recall queries with separate limits for recent messages, history characters, total query characters, retrieved facts and injected characters.
+- Raw `llm_input` diagnostics showing the assembled system prompt, prompt and history that OpenClaw exposes immediately before model submission.
+- Recall diagnostics that distinguish retrieved, injected and budget-skipped facts.
 - Defense-in-depth stripping of Graphiti/OpenViking injected context before capture/recall queries.
 - Structured logging with opt-in raw content diagnostics.
 - Regression tests for identity/session isolation, arbitrary role sequences, timeout/limit batching, abort capture, FIFO/retry, UUID continuity, Saga recovery, backend status, MCP shapes, logging and context stripping.
@@ -33,9 +36,14 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Capture batching is isolated by session while processing remains FIFO per agent.
 - Failed capture submissions retain the queue head rather than dropping it.
 - Graphiti queue acceptance is no longer treated as proof of persistence; terminal backend processing failure is monitored separately.
+- Content diagnostics still require `logOperations=true`, `logLevel=debug`, and `logContent=true`, but are emitted through the INFO sink so they remain visible in OpenClaw journald.
+- Recall query truncation preserves the newest tail rather than the oldest prefix.
+- Recall memory wrapper now labels retrieved memory as non-instructional and gives current conversation priority on conflict.
+- Recall defaults are now `recallLimit=8`, `recallQueryMaxChars=6000`, `recallMaxInjectedChars=8000`, with six recent history messages and a 4000-character history budget enabled by default.
 
 ### Known limitations
 
 - Active buffers, transcript-delta snapshots and unsent plugin FIFO state are in-memory and are lost on Gateway/plugin process restart. Persisted Saga continuity itself is recovered from Graphiti.
 - No explicit byte-size cap exists for capture requests yet.
-- Recall tuning/cooldown and agent-visible `graphiti_*` tools remain deferred until capture live acceptance is complete.
+- Recall cooldown and agent-visible `graphiti_*` tools remain deferred until recall live acceptance is complete.
+- Raw content diagnostics may contain sensitive conversation and memory data and should be disabled after controlled testing.

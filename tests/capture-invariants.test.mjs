@@ -30,18 +30,44 @@ test("QueueEntry.enqueuedAt is the detach time, not buffer creation time", async
   });
   t.after(() => engine.stop());
 
-  engine.addTurn("main", "session", "u1", "a1");
+  engine.addMessage("main", "session", "user", "u1");
   now += 12_345;
-  engine.addTurn("main", "session", "u2", "a2");
+  engine.addMessages("main", "session", [
+    { role: "assistant", text: "a1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a2" },
+  ]);
 
   await waitFor(() => entries.length === 1);
   assert.equal(entries[0].enqueuedAt, 1_700_000_012_345);
   assert.equal(entries[0].buffer.createdAt, 1_700_000_000_000);
 });
 
-test("ticker floor and OpenClaw manifest use the same public timeout minimum", () => {
+test("ticker floor and manifest use the same public timeout minimum", () => {
   const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
   assert.equal(CHECK_INTERVAL_SEC, MIN_BUFFER_TIMEOUT_SEC);
   assert.equal(manifest.configSchema.properties.bufferTimeout.minimum, MIN_BUFFER_TIMEOUT_SEC);
-  assert.equal(manifest.configSchema.properties.bufferLimit.multipleOf, 2);
+  assert.equal(manifest.configSchema.properties.bufferLimit.minimum, 1);
+  assert.equal("multipleOf" in manifest.configSchema.properties.bufferLimit, false);
+});
+
+test("odd message limits are valid and flush exact message order", async (t) => {
+  const entries = [];
+  const engine = new BufferEngine(agents, 3, 3600, async (_agentId, entry) => {
+    entries.push(entry);
+  });
+  t.after(() => engine.stop());
+
+  engine.addMessages("main", "session", [
+    { role: "user", text: "u1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a1" },
+  ]);
+
+  await waitFor(() => entries.length === 1);
+  assert.deepEqual(entries[0].buffer.messages, [
+    { role: "user", text: "u1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a1" },
+  ]);
 });

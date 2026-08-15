@@ -153,8 +153,9 @@ export class GraphitiMcpClient {
       if (/^No saga named /.test(result.error)) return undefined;
       throw new Error(result.error);
     }
-    const episodeCount = result.episode_count;
-    if (!Number.isInteger(episodeCount) || Number(episodeCount) < 0) {
+    const episodeCount =
+      typeof result.episode_count === "number" ? result.episode_count : Number.NaN;
+    if (!Number.isInteger(episodeCount) || episodeCount < 0) {
       throw new Error("Graphiti get_saga returned invalid episode_count");
     }
     return {
@@ -165,7 +166,7 @@ export class GraphitiMcpClient {
       summary: typeof result.summary === "string" ? result.summary : "",
       firstEpisodeUuid: optionalString(result.first_episode_uuid),
       lastEpisodeUuid: optionalString(result.last_episode_uuid),
-      episodeCount: Number(episodeCount),
+      episodeCount,
     };
   }
 

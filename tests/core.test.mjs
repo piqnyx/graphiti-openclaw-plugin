@@ -18,7 +18,7 @@ test("config defaults and v0.2 buffer fields", () => {
 
 test("config rejects invalid values", () => {
   assert.throws(() => parseConfig({ surprise: true }), /unknown plugin config key/);
-  assert.throws(() => parseConfig({ bufferLimit: 3 }), /bufferLimit/);
+  assert.throws(() => parseConfig({ bufferLimit: 0 }), /bufferLimit/);
   assert.throws(() => parseConfig({ captureBatchTurns: 1 }), /unknown plugin config key/);
 });
 
@@ -28,7 +28,7 @@ test("agent identity fails closed", () => {
   assert.throws(() => requireAgentId(" main"), /whitespace/);
 });
 
-test("completed turn uses trailing user and final assistant", () => {
+test("completed turn compatibility helper uses trailing user and final assistant", () => {
   const turn = extractCompletedTurn([
     { role: "user", content: "old user" },
     { role: "assistant", content: "old assistant" },

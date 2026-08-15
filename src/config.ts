@@ -1,11 +1,9 @@
+import { MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
+
+export { MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
+
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
-/**
- * Канонические имена акторов одного агента.
- * `user` — человек, `assistant` — его бот. Без алиасов-регулярок:
- * имена служат только для participants в JSON-эпизоде Graphiti, текст
- * сообщений НЕ переписывается.
- */
 export type AgentActors = {
   user: string;
   assistant: string;
@@ -26,8 +24,6 @@ export type GraphitiPluginConfig = {
   bufferTimeout: number;
   agents: Record<string, AgentActors>;
 };
-
-export const MIN_BUFFER_TIMEOUT_SEC = 30;
 
 export const DEFAULT_ACTORS: AgentActors = { user: "User", assistant: "Assistant" };
 
@@ -63,13 +59,7 @@ function booleanValue(raw: unknown, fallback: boolean, name: string): boolean {
   return raw;
 }
 
-function integerValue(
-  raw: unknown,
-  fallback: number,
-  name: string,
-  min: number,
-  max: number,
-): number {
+function integerValue(raw: unknown, fallback: number, name: string, min: number, max: number): number {
   if (raw === undefined) return fallback;
   if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
     throw new Error(`${name} must be an integer in [${min}, ${max}]`);
@@ -77,13 +67,7 @@ function integerValue(
   return raw;
 }
 
-function evenIntegerValue(
-  raw: unknown,
-  fallback: number,
-  name: string,
-  min: number,
-  max: number,
-): number {
+function evenIntegerValue(raw: unknown, fallback: number, name: string, min: number, max: number): number {
   const value = integerValue(raw, fallback, name, min, max);
   if (value % 2 !== 0) {
     throw new Error(`${name} must be even because capture buffers contain user+assistant pairs`);
@@ -122,15 +106,11 @@ function agentsValue(raw: unknown): Record<string, AgentActors> {
   const result: Record<string, AgentActors> = {};
 
   for (const [agentId, value] of Object.entries(obj)) {
-    if (agentId.trim() === "") {
-      throw new Error("agents key (agentId) must be a non-empty string");
-    }
+    if (agentId.trim() === "") throw new Error("agents key (agentId) must be a non-empty string");
     const entry = asObject(value);
     const allowedEntry = new Set(["user", "assistant"]);
     for (const key of Object.keys(entry)) {
-      if (!allowedEntry.has(key)) {
-        throw new Error(`agents[${agentId}] contains unknown key: ${key}`);
-      }
+      if (!allowedEntry.has(key)) throw new Error(`agents[${agentId}] contains unknown key: ${key}`);
     }
     result[agentId] = {
       user: nonEmptyName(entry.user, `agents[${agentId}].user`),
@@ -144,19 +124,9 @@ function agentsValue(raw: unknown): Record<string, AgentActors> {
 export function parseConfig(input: unknown): GraphitiPluginConfig {
   const raw = asObject(input);
   const allowed = new Set<keyof GraphitiPluginConfig>([
-    "baseUrl",
-    "autoCapture",
-    "autoRecall",
-    "requestTimeoutMs",
-    "recallLimit",
-    "recallQueryMaxChars",
-    "recallMaxInjectedChars",
-    "logOperations",
-    "logLevel",
-    "logContent",
-    "bufferLimit",
-    "bufferTimeout",
-    "agents",
+    "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
+    "recallQueryMaxChars", "recallMaxInjectedChars", "logOperations", "logLevel",
+    "logContent", "bufferLimit", "bufferTimeout", "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -169,45 +139,15 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     baseUrl: baseUrlValue(raw.baseUrl),
     autoCapture: booleanValue(raw.autoCapture, DEFAULT_CONFIG.autoCapture, "autoCapture"),
     autoRecall: booleanValue(raw.autoRecall, DEFAULT_CONFIG.autoRecall, "autoRecall"),
-    requestTimeoutMs: integerValue(
-      raw.requestTimeoutMs,
-      DEFAULT_CONFIG.requestTimeoutMs,
-      "requestTimeoutMs",
-      1_000,
-      300_000,
-    ),
+    requestTimeoutMs: integerValue(raw.requestTimeoutMs, DEFAULT_CONFIG.requestTimeoutMs, "requestTimeoutMs", 1_000, 300_000),
     recallLimit: integerValue(raw.recallLimit, DEFAULT_CONFIG.recallLimit, "recallLimit", 1, 100),
-    recallQueryMaxChars: integerValue(
-      raw.recallQueryMaxChars,
-      DEFAULT_CONFIG.recallQueryMaxChars,
-      "recallQueryMaxChars",
-      32,
-      32_000,
-    ),
-    recallMaxInjectedChars: integerValue(
-      raw.recallMaxInjectedChars,
-      DEFAULT_CONFIG.recallMaxInjectedChars,
-      "recallMaxInjectedChars",
-      128,
-      64_000,
-    ),
+    recallQueryMaxChars: integerValue(raw.recallQueryMaxChars, DEFAULT_CONFIG.recallQueryMaxChars, "recallQueryMaxChars", 32, 32_000),
+    recallMaxInjectedChars: integerValue(raw.recallMaxInjectedChars, DEFAULT_CONFIG.recallMaxInjectedChars, "recallMaxInjectedChars", 128, 64_000),
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
     logLevel: logLevelValue(raw.logLevel),
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
-    bufferLimit: evenIntegerValue(
-      raw.bufferLimit,
-      DEFAULT_CONFIG.bufferLimit,
-      "bufferLimit",
-      4,
-      1_000,
-    ),
-    bufferTimeout: integerValue(
-      raw.bufferTimeout,
-      DEFAULT_CONFIG.bufferTimeout,
-      "bufferTimeout",
-      MIN_BUFFER_TIMEOUT_SEC,
-      7 * 24 * 60 * 60,
-    ),
+    bufferLimit: evenIntegerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 4, 1_000),
+    bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
     agents: agentsValue(raw.agents),
   };
 }

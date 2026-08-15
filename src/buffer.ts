@@ -9,10 +9,9 @@ export type BufferMessage = {
 };
 
 /**
- * Пустой JSON-эпизод создаётся вместе с буфером (Lifecycle JSON, json-format.md):
+ * Пустой JSON-эпизод создаётся вместе с буфером:
  * `participants` (канонические имена акторов агента) присутствуют, `messages` = `[]`.
- * Сообщения наталкиваются в `messages` по мере добавления. Текст НЕ переписывается
- * (никаких алиасов-регулярок) — Graphiti получает реальные сообщения как есть.
+ * Completed turn добавляется атомарно как user+assistant. Текст не переписывается.
  */
 export type EpisodeJson = {
   participants: { user: string; assistant: string };
@@ -24,7 +23,7 @@ export type Buffer = {
   messages: BufferMessage[]; // накопленные сообщения (== episode.messages)
   episode: EpisodeJson; // JSON, созданный вместе с буфером
   createdAt: number; // timestamp создания буфера (мс)
-  lastActivityAt: number; // timestamp последнего сообщения (мс)
+  lastActivityAt: number; // timestamp последнего completed turn (мс)
 };
 
 export type QueueEntry = {
@@ -47,51 +46,60 @@ export type AgentSink = (
   reason: FlushReason,
 ) => Promise<void>;
 
-/**
- * Внутренняя константа интервала проверки буферов.
- * Равна минимальному валидному bufferTimeout = 30 секунд. НЕ публичный конфиг.
- */
-export const CHECK_INTERVAL_SEC = 30;
+/** Минимальный публичный bufferTimeout, в секундах. */
+export const MIN_BUFFER_TIMEOUT_SEC = 30;
 
 /**
- * Движок буферов и очередей v0.2 (BUFFER_SPEC.md).
+ * Внутренняя константа интервала проверки буферов.
+ * Равна минимальному валидному bufferTimeout. Не является публичным конфигом.
+ */
+export const CHECK_INTERVAL_SEC = MIN_BUFFER_TIMEOUT_SEC;
+
+/**
+ * Движок буферов и очередей.
  *
  * - Буфер на каждую сессию (sessionKey) внутри агента (agentId).
- * - Очередь FIFO на агента.
- * - Буфер отцепляется в очередь по лимиту (bufferLimit) или таймауту
- *   неактивности (bufferTimeout, в секундах). Eligibility: минимум 2 сообщения.
- * - Пустой JSON (акторы агента + messages=[]) создаётся вместе с буфером;
- *   сообщения наталкиваются в него при добавлении (без переписывания текста).
- * - Внутри агента очередь processится строго последовательно (FIFO),
- *   между агентами — параллельно.
- * - При ошибке отправки буфер удаляется и НЕ возвращается в очередь (нет retry).
+ * - Одна FIFO-очередь на агента.
+ * - Completed turn (user+assistant) добавляется в буфер атомарно.
+ * - bufferLimit считается в сообщениях и обязан быть чётным, чтобы не разрезать turn.
+ * - Буфер отцепляется по лимиту или таймауту неактивности.
+ * - Внутри агента очередь processится строго последовательно; между агентами независимо.
  */
 export class BufferEngine {
   private readonly captureStates = new Map<string, AgentCaptureState>();
-  private readonly timer: ReturnType<typeof setInterval> | null = null;
+  private readonly timer: ReturnType<typeof setInterval>;
   private readonly bufferTimeoutMs: number;
 
   constructor(
-    // Канонические имена акторов ПО АГЕНТАМ (мультиагент).
     private readonly agents: Record<string, AgentActors>,
     private readonly bufferLimit: number,
-    bufferTimeoutSec: number, // в секундах (конфиг); внутри конвертируем в мс
+    bufferTimeoutSec: number,
     private readonly sink: AgentSink,
     private readonly opts: {
       notifyError?: (agentId: string, sessionKey: string, reason: FlushReason, error: Error) => void;
     } = {},
   ) {
+    if (!Number.isInteger(bufferLimit) || bufferLimit < 2 || bufferLimit % 2 !== 0) {
+      throw new Error("bufferLimit must be an even integer >= 2 messages");
+    }
+    if (!Number.isInteger(bufferTimeoutSec) || bufferTimeoutSec < MIN_BUFFER_TIMEOUT_SEC) {
+      throw new Error(`bufferTimeout must be an integer >= ${MIN_BUFFER_TIMEOUT_SEC} seconds`);
+    }
+
     this.bufferTimeoutMs = bufferTimeoutSec * 1000;
     this.timer = setInterval(() => {
       this.tick().catch((error: unknown) => {
-        // Tick-обработка не должна ронять процесс из-за одной ошибки.
         this.opts.notifyError?.("__tick__", "", "timeout", asError(error));
       });
     }, CHECK_INTERVAL_SEC * 1000);
     this.timer.unref?.();
   }
 
-  addMessage(agentId: string, sessionKey: string, role: MessageRole, text: string): void {
+  /**
+   * Добавляет один полностью завершённый ход user+assistant.
+   * Частичный user никогда не существует внутри BufferEngine.
+   */
+  addTurn(agentId: string, sessionKey: string, userText: string, assistantText: string): void {
     const agent = this.ensureAgent(agentId);
     let buffer = agent.activeBuffers.get(sessionKey);
 
@@ -102,8 +110,8 @@ export class BufferEngine {
 
     const now = Date.now();
 
-    // Таймаут: если буфер давно простаивал И в нём уже есть пара — отцепляем
-    // его до добавления нового сообщения (это «застрявший» буфер, страховка).
+    // Если старый буфер уже протух, отцепляем его ДО добавления нового turn.
+    // Новый user+assistant целиком попадёт в свежий буфер.
     const timeoutHit = now - buffer.lastActivityAt >= this.bufferTimeoutMs;
     if (timeoutHit && this.eligibility(buffer)) {
       agent.queue.push({ buffer, enqueuedAt: now });
@@ -112,16 +120,13 @@ export class BufferEngine {
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
-    // Добавляем сообщение.
-    this.pushMessage(buffer, role, text, now);
+    this.pushCompletedTurn(buffer, userText, assistantText, now);
 
-    // Лимит: если ПОСЛЕ добавления буфер достиг bufferLimit и элиджибл —
-    // отцепляем его (ровно bufferLimit сообщений) и отдаём свежий буфер.
-    if (buffer.messages.length >= this.bufferLimit && this.eligibility(buffer)) {
+    // Чётный лимит + атомарный turn гарантируют, что батч заканчивается assistant.
+    if (buffer.messages.length >= this.bufferLimit) {
       agent.queue.push({ buffer, enqueuedAt: now });
       void this.pump(agent);
-      const next = this.createBuffer(sessionKey, agentId);
-      agent.activeBuffers.set(sessionKey, next);
+      agent.activeBuffers.set(sessionKey, this.createBuffer(sessionKey, agentId));
     }
   }
 
@@ -130,7 +135,6 @@ export class BufferEngine {
     return this.agents[agentId] ?? DEFAULT_ACTORS;
   }
 
-  /** Создаёт буфер с пустым JSON-эпизодом (акторы агента есть, messages=[]). */
   private createBuffer(sessionKey: string, agentId: string): Buffer {
     const now = Date.now();
     const actors = this.actorsFor(agentId);
@@ -147,23 +151,21 @@ export class BufferEngine {
     };
   }
 
-  /** Наталкивает сообщение в JSON буфера без переписывания текста. */
-  private pushMessage(
+  private pushCompletedTurn(
     buffer: Buffer,
-    role: MessageRole,
-    text: string,
+    userText: string,
+    assistantText: string,
     now: number,
   ): void {
-    const message: BufferMessage = { role, text };
-    // buffer.messages === buffer.episode.messages (одна ссылка, см. createBuffer),
-    // поэтому достаточно одного push — JSON обновится автоматически.
-    buffer.messages.push(message);
+    buffer.messages.push(
+      { role: "user", text: userText },
+      { role: "assistant", text: assistantText },
+    );
     buffer.lastActivityAt = now;
   }
 
-  /** Буфер — эпизод только если в нём минимум 2 сообщения (BUFFER_SPEC eligibility). */
   private eligibility(buffer: Buffer): boolean {
-    return buffer.messages.length >= 2;
+    return buffer.messages.length >= 2 && buffer.messages.length % 2 === 0;
   }
 
   private ensureAgent(agentId: string): AgentCaptureState {
@@ -179,16 +181,11 @@ export class BufferEngine {
     const now = Date.now();
     for (const agent of this.captureStates.values()) {
       for (const [sessionKey, buffer] of agent.activeBuffers) {
-        if (buffer.messages.length === 0) continue;
+        if (!this.eligibility(buffer)) continue;
         const elapsed = now - buffer.lastActivityAt;
         if (elapsed >= this.bufferTimeoutMs) {
-          if (this.eligibility(buffer)) {
-            // Буфер с >= 2 сообщениями отцепляем в очередь.
-            agent.activeBuffers.delete(sessionKey);
-            agent.queue.push({ buffer, enqueuedAt: now });
-          }
-          // Буфер с 0/1 сообщением НЕ отцепляется по таймауту (BUFFER_SPEC):
-          // он продолжает ждать второго сообщения, activeBuffers не трогаем.
+          agent.activeBuffers.delete(sessionKey);
+          agent.queue.push({ buffer, enqueuedAt: now });
         }
       }
       void this.pump(agent);
@@ -199,7 +196,6 @@ export class BufferEngine {
     if (agent.processing) return;
     agent.processing = true;
     try {
-      // Процессим до опустошения (BUFFER_SPEC: за один тик вся очередь агента).
       while (agent.queue.length > 0) {
         const entry = agent.queue[0];
         const reason = this.detectReason(entry);
@@ -207,7 +203,6 @@ export class BufferEngine {
           await this.sink(agent.agentId, entry, reason);
           agent.queue.shift();
         } catch (error) {
-          // Ошибка: буфер удаляется, НЕ возвращается в очередь (нет retry/carousel).
           agent.queue.shift();
           this.opts.notifyError?.(agent.agentId, entry.buffer.sessionKey, reason, asError(error));
         }
@@ -218,25 +213,21 @@ export class BufferEngine {
   }
 
   private detectReason(entry: QueueEntry): FlushReason {
-    // Причина отцепления: лимит — если буфер заполнен до предела (>= bufferLimit),
-    // иначе таймаут.
     return entry.buffer.messages.length >= this.bufferLimit ? "limit" : "timeout";
   }
 
-  /** Активная (живая) очередь всех агентов — для диагностики. */
   queueLength(): number {
     let total = 0;
     for (const state of this.captureStates.values()) total += state.queue.length;
     return total;
   }
 
-  /** Количество живых буферов по агенту. */
   activeBufferCount(agentId: string): number {
     return this.captureStates.get(agentId)?.activeBuffers.size ?? 0;
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
+    clearInterval(this.timer);
   }
 }
 

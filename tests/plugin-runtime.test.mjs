@@ -19,9 +19,8 @@ async function waitFor(predicate, timeoutMs = 2000) {
   assert.fail("condition was not met before timeout");
 }
 
-function makeFetchRecorder(t) {
+function makeFetchRecorder(t, options = {}) {
   const toolCalls = [];
-  let acceptedCounter = 0;
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -42,14 +41,41 @@ function makeFetchRecorder(t) {
     if (payload.method !== "tools/call") throw new Error(`unexpected method ${payload.method}`);
 
     toolCalls.push(payload.params);
+    if (payload.params.name === "get_saga") {
+      const saga = options.sagaState;
+      const result = saga
+        ? {
+            message: "retrieved",
+            uuid: saga.uuid ?? "saga-uuid",
+            name: payload.params.arguments.saga_name,
+            group_id: payload.params.arguments.group_id,
+            created_at: "2026-08-15T00:00:00+00:00",
+            summary: "",
+            first_episode_uuid: saga.firstEpisodeUuid ?? "ep-1",
+            last_episode_uuid: saga.lastEpisodeUuid,
+            episode_count: saga.episodeCount,
+          }
+        : {
+            error: `No saga named '${payload.params.arguments.saga_name}' found in group '${payload.params.arguments.group_id}'`,
+          };
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: { structuredContent: { result }, content: [], isError: false },
+      });
+    }
     if (payload.params.name === "add_memory") {
-      acceptedCounter += 1;
+      if (options.failAddMemoryOnce && !options.__failed) {
+        options.__failed = true;
+        throw new Error("simulated transport failure");
+      }
+      const uuid = payload.params.arguments.uuid;
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
         result: {
           structuredContent: {
-            result: { message: "queued", uuid: `accepted-uuid-${acceptedCounter}` },
+            result: { message: "queued", uuid },
           },
           content: [],
           isError: false,
@@ -138,7 +164,7 @@ test("runtime registers capture and recall; recall remains agent-scoped", async 
   assert.match(recallResult.prependContext, /^<graphiti-context>/);
 });
 
-test("two flushed batches of one dialog use deterministic names and previous UUID chaining", async (t) => {
+test("two flushed batches of one dialog use caller UUIDs and previous UUID chaining", async (t) => {
   const toolCalls = makeFetchRecorder(t);
   const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug", logContent: true }));
   register(api);
@@ -146,32 +172,54 @@ test("two flushed batches of one dialog use deterministic names and previous UUI
   const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
 
-  // Two completed turns -> four messages -> batch 1 flush.
   hooks.get("agent_end")(completedTurn(1), ctx);
   hooks.get("agent_end")(completedTurn(2), ctx);
   await waitFor(() => toolCalls.filter((c) => c.name === "add_memory").length === 1);
 
-  // Two more completed turns -> batch 2 flush, after batch 1 acceptance updated saga state.
   hooks.get("agent_end")(completedTurn(3), ctx);
   hooks.get("agent_end")(completedTurn(4), ctx);
   await waitFor(() => toolCalls.filter((c) => c.name === "add_memory").length === 2);
+
+  const sagaReads = toolCalls.filter((c) => c.name === "get_saga");
+  assert.equal(sagaReads.length, 1, "sequence is lazily hydrated once per session");
 
   const adds = toolCalls.filter((c) => c.name === "add_memory").map((c) => c.arguments);
   assert.equal(adds[0].group_id, "main");
   assert.equal(adds[0].saga, sessionKey);
   assert.equal(adds[0].name, "6bc2a77c6957-1");
+  assert.equal(typeof adds[0].uuid, "string");
   assert.deepEqual(adds[0].previous_episode_uuids, []);
   assert.equal("saga_previous_episode_uuid" in adds[0], false);
   assert.equal(adds[0].source_description, "OpenClaw conversation batch");
 
   assert.equal(adds[1].name, "6bc2a77c6957-2");
-  assert.deepEqual(adds[1].previous_episode_uuids, ["accepted-uuid-1"]);
-  assert.equal(adds[1].saga_previous_episode_uuid, "accepted-uuid-1");
+  assert.notEqual(adds[1].uuid, adds[0].uuid);
+  assert.deepEqual(adds[1].previous_episode_uuids, [adds[0].uuid]);
+  assert.equal(adds[1].saga_previous_episode_uuid, adds[0].uuid);
 
   const accepted = logs.filter((line) => line.includes("event=capture_queue_accepted"));
   assert.equal(accepted.length, 2);
-  assert.match(accepted[0], /uuid="accepted-uuid-1"/);
-  assert.match(accepted[1], /previousEpisodeUuid="accepted-uuid-1"/);
+  assert.match(accepted[0], new RegExp(`uuid=${JSON.stringify(adds[0].uuid)}`));
+  assert.match(accepted[1], new RegExp(`previousEpisodeUuid=${JSON.stringify(adds[0].uuid)}`));
+});
+
+test("restart recovery continues persisted saga at episode 7", async (t) => {
+  const toolCalls = makeFetchRecorder(t, {
+    sagaState: { episodeCount: 6, lastEpisodeUuid: "persisted-uuid-6" },
+  });
+  const { hooks, api } = makeApi(validConfig({ autoRecall: false }));
+  register(api);
+
+  const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
+  const ctx = { agentId: "main", sessionKey, trigger: "user" };
+  hooks.get("agent_end")(completedTurn(1), ctx);
+  hooks.get("agent_end")(completedTurn(2), ctx);
+  await waitFor(() => toolCalls.some((c) => c.name === "add_memory"));
+
+  const add = toolCalls.find((c) => c.name === "add_memory").arguments;
+  assert.equal(add.name, "6bc2a77c6957-7");
+  assert.deepEqual(add.previous_episode_uuids, ["persisted-uuid-6"]);
+  assert.equal(add.saga_previous_episode_uuid, "persisted-uuid-6");
 });
 
 test("capture strips Graphiti and OpenViking injections from completed turns", () => {
@@ -195,27 +243,22 @@ test("capture strips Graphiti and OpenViking injections from completed turns", (
   assert.doesNotMatch(turnLog, /graphiti injection/);
 });
 
-test("heartbeat and subagent sessions are rejected before buffering", () => {
+test("heartbeat, cron and subagent sessions are rejected before buffering", () => {
   const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug" }));
   register(api);
 
-  hooks.get("agent_end")(completedTurn(1), {
-    agentId: "main",
-    sessionKey: "agent:main:heartbeat:hidden",
-    trigger: "user",
-  });
-  hooks.get("agent_end")(completedTurn(2), {
-    agentId: "main",
-    sessionKey: "agent:main:subagent:worker",
-    trigger: "user",
-  });
-  hooks.get("agent_end")(completedTurn(3), {
-    agentId: "main",
-    sessionKey: "agent:main:web:normal",
-    trigger: "heartbeat",
+  const blocked = [
+    { sessionKey: "agent:main:heartbeat:hidden", trigger: "user" },
+    { sessionKey: "agent:main:subagent:worker", trigger: "user" },
+    { sessionKey: "agent:main:cron:job", trigger: "user" },
+    { sessionKey: "agent:main:web:normal", trigger: "heartbeat" },
+    { sessionKey: "agent:main:web:normal", trigger: "cron" },
+  ];
+  blocked.forEach((ctx, index) => {
+    hooks.get("agent_end")(completedTurn(index + 1), { agentId: "main", ...ctx });
   });
 
-  assert.equal(logs.filter((line) => line.includes('reason="background_run"')).length, 3);
+  assert.equal(logs.filter((line) => line.includes('reason="background_run"')).length, blocked.length);
   assert.equal(logs.some((line) => line.includes("event=capture_turn")), false);
 });
 

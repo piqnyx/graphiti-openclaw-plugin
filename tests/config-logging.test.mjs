@@ -25,10 +25,12 @@ test("explicit debug content diagnostics are accepted", () => {
   assert.equal(cfg.logContent, true);
 });
 
-test("bufferLimit must be even and >= 4", () => {
-  assert.throws(() => parseConfig({ bufferLimit: 3 }), /bufferLimit/);
-  assert.throws(() => parseConfig({ bufferLimit: 5 }), /bufferLimit must be even/);
-  assert.doesNotThrow(() => parseConfig({ bufferLimit: 4 }));
+test("bufferLimit counts individual messages and accepts any integer in range", () => {
+  assert.throws(() => parseConfig({ bufferLimit: 0 }), /bufferLimit/);
+  assert.throws(() => parseConfig({ bufferLimit: 1.5 }), /bufferLimit/);
+  assert.throws(() => parseConfig({ bufferLimit: 1001 }), /bufferLimit/);
+  assert.doesNotThrow(() => parseConfig({ bufferLimit: 1 }));
+  assert.doesNotThrow(() => parseConfig({ bufferLimit: 5 }));
   assert.doesNotThrow(() => parseConfig({ bufferLimit: 1000 }));
 });
 

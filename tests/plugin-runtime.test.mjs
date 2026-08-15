@@ -131,7 +131,9 @@ const validConfig = (overrides = {}) => ({
   ...overrides,
 });
 
+let apiInstance = 0;
 function makeApi(pluginConfig) {
+  process.env.OPENCLAW_STATE_DIR = `/tmp/graphiti-openclaw-plugin-runtime-${process.pid}-${apiInstance++}`;
   const hooks = new Map();
   const logs = [];
   return {

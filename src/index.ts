@@ -1,4 +1,11 @@
-import { BufferEngine, CHECK_INTERVAL_SEC, type AgentSink, type EpisodeJson } from "./buffer.js";
+import {
+  BufferEngine,
+  CHECK_INTERVAL_SEC,
+  type AgentSink,
+  type BufferEngineSnapshot,
+  type EpisodeJson,
+} from "./buffer.js";
+import { CaptureSpool } from "./capture-spool.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
@@ -32,6 +39,8 @@ const CAPTURE_STATUS_NAMESPACE = "capture-status";
 const CAPTURE_STATUS_DESCRIPTOR_ID = "capture-error";
 const BACKEND_STATUS_NAMESPACE = "backend-queue-status";
 const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
+const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
+const GATEWAY_STOP_HOOK_TIMEOUT_MS = 4_500;
 
 function isBackgroundRun(ctx: HookContext): boolean {
   if (ctx.trigger === "cron" || ctx.trigger === "heartbeat") return true;
@@ -66,6 +75,25 @@ function sequenceKey(agentId: string, sessionKey: string): string {
   return JSON.stringify([agentId, sessionKey]);
 }
 
+function captureSnapshotStats(snapshot: BufferEngineSnapshot | undefined): {
+  agents: number;
+  activeBuffers: number;
+  queuedEntries: number;
+  messages: number;
+} {
+  if (!snapshot) return { agents: 0, activeBuffers: 0, queuedEntries: 0, messages: 0 };
+  let activeBuffers = 0;
+  let queuedEntries = 0;
+  let messages = 0;
+  for (const agent of snapshot.agents) {
+    activeBuffers += agent.activeBuffers.length;
+    queuedEntries += agent.queue.length;
+    messages += agent.activeBuffers.reduce((sum, buffer) => sum + buffer.messages.length, 0);
+    messages += agent.queue.reduce((sum, entry) => sum + entry.buffer.messages.length, 0);
+  }
+  return { agents: snapshot.agents.length, activeBuffers, queuedEntries, messages };
+}
+
 export function register(api: OpenClawPluginApi): void {
   let cfg: GraphitiPluginConfig;
   try {
@@ -89,6 +117,28 @@ export function register(api: OpenClawPluginApi): void {
   const lastSessionByAgent = new Map<string, string>();
   const backendReportedSessionByAgent = new Map<string, string>();
   const backendFingerprintByAgent = new Map<string, string>();
+
+  const captureSpool = cfg.autoCapture ? new CaptureSpool() : undefined;
+  let restoredCaptureState: BufferEngineSnapshot | undefined;
+  if (captureSpool) {
+    try {
+      restoredCaptureState = captureSpool.load();
+    } catch (error) {
+      logger.error("capture_spool_load_failed", {
+        path: captureSpool.path,
+        error: errorText(error),
+        action: "startup_aborted_to_preserve_spool",
+      });
+      throw error;
+    }
+    const restored = captureSnapshotStats(restoredCaptureState);
+    if (restored.messages > 0) {
+      logger.info("capture_spool_restored", {
+        path: captureSpool.path,
+        ...restored,
+      });
+    }
+  }
 
   api.session?.state?.registerSessionExtension({
     namespace: CAPTURE_STATUS_NAMESPACE,
@@ -476,6 +526,8 @@ export function register(api: OpenClawPluginApi): void {
     cfg.bufferTimeout,
     sink,
     {
+      initialState: restoredCaptureState,
+      onStateChange: captureSpool ? (snapshot) => captureSpool.save(snapshot) : undefined,
       notifyError: (agentId, sessionKey, reason, error) => {
         logger.error("capture_flush_failed", {
           agentId,
@@ -504,15 +556,33 @@ export function register(api: OpenClawPluginApi): void {
 
   let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
   if (cfg.autoCapture) {
+    engine.resumeRestored();
+
     queueHealthTimer = setInterval(() => {
       void pollBackendQueueStatus();
     }, CHECK_INTERVAL_SEC * 1000);
     queueHealthTimer.unref?.();
 
-    api.on("gateway_stop", () => {
-      if (queueHealthTimer) clearInterval(queueHealthTimer);
-      engine.stop();
-    });
+    api.on(
+      "gateway_stop",
+      async () => {
+        if (queueHealthTimer) clearInterval(queueHealthTimer);
+        const before = captureSnapshotStats(engine.snapshot());
+        logger.info("capture_shutdown_checkpoint", {
+          path: captureSpool?.path,
+          ...before,
+          graceMs: CAPTURE_SHUTDOWN_GRACE_MS,
+        });
+        await engine.shutdown(CAPTURE_SHUTDOWN_GRACE_MS);
+        const after = captureSnapshotStats(engine.snapshot());
+        logger.info("capture_shutdown_complete", {
+          path: captureSpool?.path,
+          ...after,
+          durableReplayRequired: after.messages > 0,
+        });
+      },
+      { timeoutMs: GATEWAY_STOP_HOOK_TIMEOUT_MS },
+    );
   }
 
   if (cfg.autoRecall) {
@@ -708,6 +778,9 @@ export function register(api: OpenClawPluginApi): void {
     captureMode: "message_delta",
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
+    captureDurableSpool: Boolean(captureSpool),
+    captureSpoolPath: captureSpool?.path,
+    restoredCaptureMessages: captureSnapshotStats(restoredCaptureState).messages,
     agents: Object.entries(cfg.agents).map(([agentId, actors]) =>
       `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
     ),

@@ -28,8 +28,7 @@ agent
 
 ## 2. Что поступает из OpenClaw
 
-Hook `agent_end` получает полный `messagesSnapshot`, а не только новую пару сообщений.
-Поэтому plugin не может просто добавлять весь массив на каждом вызове: это создало бы дубликаты.
+Hook `agent_end` получает полный `messagesSnapshot`, а не только новую пару сообщений. Поэтому plugin не может просто добавлять весь массив на каждом вызове: это создало бы дубликаты.
 
 Capture pipeline:
 
@@ -55,17 +54,7 @@ BufferEngine.addMessages(...)
 
 ## 3. Сообщение — атомарная единица capture
 
-Буфер хранит сообщения ровно в наблюдаемом порядке:
-
-```json
-[
-  { "role": "user", "text": "..." },
-  { "role": "user", "text": "..." },
-  { "role": "assistant", "text": "..." }
-]
-```
-
-Никакого требования чередования ролей нет.
+Буфер хранит сообщения ровно в наблюдаемом порядке. Никакого требования чередования ролей нет.
 
 Нормальны все варианты:
 
@@ -77,8 +66,6 @@ U U U U U U U A
 A
 U
 ```
-
-Это намеренно. Реальный OpenClaw dialog может содержать несколько user-сообщений подряд из-за stop/abort/retry или поведения канала.
 
 `event.success=false` сам по себе **не отбрасывает snapshot**. Если после остановки агента появился новый user message, он всё равно попадёт в capture delta.
 
@@ -98,31 +85,15 @@ U U U U U U U A
  batch 1=6    buffer 2=[U,A]
 ```
 
-То есть первые шесть сообщений немедленно detach в queue, остальные продолжают новый buffer той же session.
-
-Сообщения не пропадают и не требуют наличия соответствующего assistant.
+Первые шесть сообщений detach немедленно, остаток продолжает новый buffer той же session. Наличие assistant не является условием flush.
 
 ## 5. bufferTimeout
 
-`bufferTimeout` задаётся в секундах. Минимум 30 секунд.
-
-Внутренний ticker равен 30 секундам.
+`bufferTimeout` задаётся в секундах. Минимум 30 секунд. Внутренний ticker равен 30 секундам.
 
 Любой **непустой** active buffer eligible для timeout flush, включая одинокий user message.
 
-Пример:
-
-```text
-session A -> [U,U,U,U]
-switch to session B
-
-через bufferTimeout без активности A:
-A detach -> agent FIFO queue
-```
-
-Активность другой session не сбрасывает timeout первой.
-
-Если при приходе нового сообщения старый buffer этой же session уже просрочен, старый buffer сначала detach, после чего новое сообщение идёт в новый buffer.
+Активность другой session не сбрасывает timeout первой. Если при приходе нового сообщения старый buffer этой же session уже просрочен, старый buffer сначала detach, после чего новое сообщение идёт в новый buffer.
 
 ## 6. QueueEntry
 
@@ -130,10 +101,13 @@ A detach -> agent FIFO queue
 interface QueueEntry {
   buffer: Buffer;
   enqueuedAt: number;
+  reason: "limit" | "timeout";
 }
 ```
 
-`enqueuedAt` фиксируется в момент detach и используется как `reference_time` для Graphiti episode.
+`enqueuedAt` и `reason` фиксируются **в момент detach**. Причина больше не вычисляется задним числом из размера batch. Поэтому retry повторяет ровно тот же operational event.
+
+`enqueuedAt` используется как `reference_time` для Graphiti episode.
 
 ## 7. FIFO и ошибки transport/MCP
 
@@ -149,7 +123,7 @@ retry через CHECK_INTERVAL_SEC
 success -> EP8 -> EP9
 ```
 
-Для prepared episode caller UUID резервируется заранее и сохраняется до acceptance. Повтор transport-вызова использует тот же UUID.
+Для prepared episode caller UUID резервируется заранее и сохраняется до acceptance. Повтор transport-вызова использует тот же UUID. Через retry сохраняется и исходный `QueueEntry.reason`.
 
 Другие agents при этом не блокируются.
 
@@ -161,16 +135,7 @@ success -> EP8 -> EP9
 
 Graphiti fork предоставляет `get_queue_status(group_id)`. Plugin проверяет его каждые 30 секунд.
 
-Если backend исчерпал retries и заблокировал agent group, plugin публикует error-only session status с безопасной диагностикой:
-
-- `episode_uuid`;
-- `episode_name`;
-- `saga`;
-- attempts;
-- pending;
-- error.
-
-Conversation body в status не хранится.
+Если backend исчерпал retries и заблокировал agent group, plugin публикует error-only session status с безопасной диагностикой: episode UUID/name, saga, attempts, pending и error. Conversation body в status не хранится.
 
 Если health-check самого backend не отвечает, plugin сообщает, что persistence не может быть подтверждён.
 
@@ -189,36 +154,13 @@ previous_episode_uuids = [lastEpisodeUuid]
 saga_previous_episode_uuid = lastEpisodeUuid
 ```
 
-Перед первым batch конкретной `agent/session` после запуска plugin вызывается:
-
-```text
-get_saga(saga_name=sessionKey, group_id=agentId)
-```
-
-Из Graphiti восстанавливаются:
-
-- `episode_count`;
-- `last_episode_uuid`.
-
-Поэтому restart plugin не сбрасывает существующую Saga обратно в batch `-1`.
+Перед первым batch конкретной `agent/session` после запуска plugin вызывается `get_saga(saga_name=sessionKey, group_id=agentId)`, откуда восстанавливаются `episode_count` и `last_episode_uuid`.
 
 ## 10. JSON episode
 
-Буфер сразу содержит canonical participants для agent:
+Буфер сразу содержит canonical participants для agent и массив `messages`. Каждое новое сообщение добавляется после sanitization.
 
-```json
-{
-  "participants": {
-    "user": "Вит",
-    "assistant": "Краб"
-  },
-  "messages": []
-}
-```
-
-Каждое новое сообщение добавляется в `messages` после sanitization.
-
-Перед capture удаляются memory injection blocks:
+Перед capture удаляются:
 
 - `<graphiti-context>...</graphiti-context>`;
 - `<openviking-context>...</openviking-context>`;
@@ -248,4 +190,4 @@ interface BufferConfig {
 
 Active buffers, transcript delta snapshots и plugin-side FIFO queue находятся в памяти процесса OpenClaw.
 
-Persisted Saga continuity после restart восстанавливается через Graphiti `get_saga`, но **ещё не отправленные active buffers** при аварийном restart процесса не являются durable storage. Это отдельная будущая задача, если понадобится crash-durable pre-MCP capture.
+Persisted Saga continuity после restart восстанавливается через Graphiti `get_saga`, но **ещё не отправленные active buffers** при аварийном restart процесса не являются durable storage.

@@ -120,6 +120,14 @@ export class BufferEngine {
     }
   }
 
+  /** Compatibility helper for older tests/callers; capture runtime uses addMessages(). */
+  addTurn(agentId: string, sessionKey: string, userText: string, assistantText: string): void {
+    this.addMessages(agentId, sessionKey, [
+      { role: "user", text: userText },
+      { role: "assistant", text: assistantText },
+    ]);
+  }
+
   private actorsFor(agentId: string): AgentActors {
     return this.agents[agentId] ?? DEFAULT_ACTORS;
   }

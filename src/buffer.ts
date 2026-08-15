@@ -47,9 +47,9 @@ export type AgentSink = (
 ) => Promise<void>;
 
 /**
- * Per-session buffers + one FIFO queue per agent.
- * Completed user+assistant turns are atomic and can never be split by a batch limit.
- * A failed queue head is retained and retried; later entries can never overtake it.
+ * Per-session message buffers + one FIFO queue per agent.
+ * User and assistant messages are buffered exactly in observed order. A failed
+ * queue head is retained and retried; later entries can never overtake it.
  */
 export class BufferEngine {
   private readonly captureStates = new Map<string, AgentCaptureState>();
@@ -66,8 +66,8 @@ export class BufferEngine {
       notifyRecovered?: (agentId: string, sessionKey: string, reason: FlushReason) => void;
     } = {},
   ) {
-    if (!Number.isInteger(bufferLimit) || bufferLimit < 2 || bufferLimit % 2 !== 0) {
-      throw new Error("bufferLimit must be an even integer >= 2 messages");
+    if (!Number.isInteger(bufferLimit) || bufferLimit < 1) {
+      throw new Error("bufferLimit must be an integer >= 1 message");
     }
     if (!Number.isInteger(bufferTimeoutSec) || bufferTimeoutSec < MIN_BUFFER_TIMEOUT_SEC) {
       throw new Error(`bufferTimeout must be an integer >= ${MIN_BUFFER_TIMEOUT_SEC} seconds`);
@@ -82,10 +82,12 @@ export class BufferEngine {
     this.timer.unref?.();
   }
 
-  addTurn(agentId: string, sessionKey: string, userText: string, assistantText: string): void {
+  addMessage(agentId: string, sessionKey: string, role: MessageRole, text: string): void {
+    const clean = text.trim();
+    if (!clean) return;
+
     const agent = this.ensureAgent(agentId);
     let buffer = agent.activeBuffers.get(sessionKey);
-
     if (!buffer) {
       buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
@@ -93,7 +95,8 @@ export class BufferEngine {
 
     const now = Date.now();
 
-    // Flush an idle completed buffer before the new turn, so turns never straddle batches.
+    // Flush an idle non-empty buffer before accepting fresh activity for the
+    // same session. This keeps the timeout boundary deterministic.
     if (now - buffer.lastActivityAt >= this.bufferTimeoutMs && this.eligibility(buffer)) {
       agent.queue.push({ buffer, enqueuedAt: now });
       void this.pump(agent);
@@ -101,12 +104,19 @@ export class BufferEngine {
       agent.activeBuffers.set(sessionKey, buffer);
     }
 
-    this.pushCompletedTurn(buffer, userText, assistantText, now);
+    buffer.messages.push({ role, text: clean });
+    buffer.lastActivityAt = now;
 
     if (buffer.messages.length >= this.bufferLimit) {
       agent.queue.push({ buffer, enqueuedAt: now });
       void this.pump(agent);
       agent.activeBuffers.set(sessionKey, this.createBuffer(sessionKey, agentId));
+    }
+  }
+
+  addMessages(agentId: string, sessionKey: string, messages: readonly BufferMessage[]): void {
+    for (const message of messages) {
+      this.addMessage(agentId, sessionKey, message.role, message.text);
     }
   }
 
@@ -130,16 +140,8 @@ export class BufferEngine {
     };
   }
 
-  private pushCompletedTurn(buffer: Buffer, userText: string, assistantText: string, now: number): void {
-    buffer.messages.push(
-      { role: "user", text: userText },
-      { role: "assistant", text: assistantText },
-    );
-    buffer.lastActivityAt = now;
-  }
-
   private eligibility(buffer: Buffer): boolean {
-    return buffer.messages.length >= 2 && buffer.messages.length % 2 === 0;
+    return buffer.messages.length > 0;
   }
 
   private ensureAgent(agentId: string): AgentCaptureState {

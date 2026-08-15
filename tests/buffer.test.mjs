@@ -118,7 +118,7 @@ test("agents are isolated: one agent processing slot does not affect another", a
   assert.ok(flushes.some((f) => f.agentId === "main"));
 });
 
-test("failed sink drops only that detached buffer and reports the error", async (t) => {
+test("failed sink retains the detached FIFO head and reports the error", async (t) => {
   const errors = [];
   const engine = new BufferEngine(
     agents,
@@ -136,7 +136,7 @@ test("failed sink drops only that detached buffer and reports the error", async 
 
   addTurn(engine, "main", "s1", 1);
   await waitFor(() => errors.length === 1, 2000);
-  assert.equal(engine.queueLength(), 0);
+  assert.equal(engine.queueLength(), 1, "failed head must remain queued for retry");
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
 });
 

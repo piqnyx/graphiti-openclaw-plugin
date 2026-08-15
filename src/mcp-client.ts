@@ -1,11 +1,8 @@
 type JsonObject = Record<string, unknown>;
 
-/**
- * Надстройка над дефолтным extract_json промптом Graphiti (вставляется в
- * custom_extraction_instructions). Объясняет модели структуру нашего JSON и
- * что сущности живут в messages[].text. Зашита в код — из конфига не управляется.
- */
 export const CUSTOM_EXTRACTION_PROMPT = `This JSON is a conversation between the two participants whose canonical names are in "participants.user" and "participants.assistant". "messages" is an ARRAY of message objects, each with a "text" field. Extract ALL entities from the "text" field of each message in the "messages" array. The participants often refer to each other and to people by name; a name may appear in slightly different forms (case, nicknames). When a mentioned name clearly refers to one of the participants, treat it as the same entity. Do not merge different people into one unless it is clearly the same person. Respect all other extraction rules.`;
+
+export const OPENCLAW_SOURCE_DESCRIPTION = "OpenClaw conversation batch";
 
 type JsonRpcResponse = {
   jsonrpc?: unknown;
@@ -34,10 +31,9 @@ function parseSseBody(body: string, requestId: number): JsonRpcResponse {
       .join("\n");
     if (!data) continue;
     try {
-      const parsed = JSON.parse(data) as JsonRpcResponse;
-      payloads.push(parsed);
+      payloads.push(JSON.parse(data) as JsonRpcResponse);
     } catch {
-      // Ignore non-JSON SSE events; MCP JSON-RPC payloads are the only relevant events here.
+      // Only JSON-RPC SSE payloads matter here.
     }
   }
 
@@ -45,6 +41,11 @@ function parseSseBody(body: string, requestId: number): JsonRpcResponse {
   if (matching) return matching;
   if (payloads.length > 0) return payloads[payloads.length - 1];
   throw new Error("MCP SSE response contained no JSON-RPC payload");
+}
+
+/** Normalize FastMCP structuredContent, including the {result:{...}} wrapper used by Graphiti. */
+function normalizeStructuredResult(value: JsonObject): JsonObject {
+  return isObject(value.result) ? value.result : value;
 }
 
 function decodeToolResult(result: unknown): JsonObject {
@@ -59,16 +60,18 @@ function decodeToolResult(result: unknown): JsonObject {
     throw new Error(text || "Graphiti MCP tool returned isError=true");
   }
 
-  if (isObject(result.structuredContent)) return result.structuredContent;
+  if (isObject(result.structuredContent)) {
+    return normalizeStructuredResult(result.structuredContent);
+  }
 
   if (Array.isArray(result.content)) {
     for (const item of result.content) {
       if (!isObject(item) || typeof item.text !== "string") continue;
       try {
         const parsed = JSON.parse(item.text) as unknown;
-        if (isObject(parsed)) return parsed;
+        if (isObject(parsed)) return normalizeStructuredResult(parsed);
       } catch {
-        // A plain text tool result is not useful for the structured Graphiti calls used here.
+        // Plain text is not useful for the structured Graphiti tools used here.
       }
     }
   }
@@ -97,16 +100,24 @@ export class GraphitiMcpClient {
     groupId: string;
     saga: string;
     referenceTime: string;
+    previousEpisodeUuids: string[];
+    sagaPreviousEpisodeUuid?: string;
   }): Promise<JsonObject> {
-    return this.callTool("add_memory", {
+    const args: JsonObject = {
       name: params.name,
       episode_body: params.jsonBody,
       group_id: params.groupId,
       source: "json",
+      source_description: OPENCLAW_SOURCE_DESCRIPTION,
       saga: params.saga,
       reference_time: params.referenceTime,
+      previous_episode_uuids: params.previousEpisodeUuids,
       custom_extraction_instructions: CUSTOM_EXTRACTION_PROMPT,
-    });
+    };
+    if (params.sagaPreviousEpisodeUuid) {
+      args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
+    }
+    return this.callTool("add_memory", args);
   }
 
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
@@ -203,7 +214,6 @@ export class GraphitiMcpClient {
       if (this.sessionId) headers.set("Mcp-Session-Id", this.sessionId);
       if (includeProtocolHeader) headers.set("MCP-Protocol-Version", this.protocolVersion);
 
-      // Сырой HTTP-запрос: метод + URL + полные аргументы (как уходит на сервер).
       this.rawLogger?.(
         "request",
         `POST ${this.baseUrl}\n${[...headers.entries()]
@@ -223,7 +233,6 @@ export class GraphitiMcpClient {
 
       if (!response.ok) {
         const detail = (await response.text()).slice(0, 300);
-        // Сырой ответ при ошибке тоже фиксируем.
         this.rawLogger?.("response", `HTTP ${response.status}\n${detail}`);
         throw new Error(`Graphiti MCP HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
       }
@@ -231,12 +240,14 @@ export class GraphitiMcpClient {
       if (notification || response.status === 202 || response.status === 204) return {};
 
       const body = await response.text();
-      // Сырое тело ответа (что реально отдал сервер).
-      this.rawLogger?.("response", `HTTP ${response.status} ${response.headers.get("content-type") ?? ""}\n${body}`);
+      this.rawLogger?.(
+        "response",
+        `HTTP ${response.status} ${response.headers.get("content-type") ?? ""}\n${body}`,
+      );
       if (!body.trim()) throw new Error("Graphiti MCP returned an empty response");
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) {
-        const id = isObject(payload) && typeof payload.id === "number" ? payload.id : -1;
+        const id = typeof payload.id === "number" ? payload.id : -1;
         return parseSseBody(body, id);
       }
       return JSON.parse(body) as JsonRpcResponse;

@@ -52,7 +52,7 @@ test("logOperations=false keeps warnings and errors but silences normal operatio
   );
 });
 
-test("content logging requires both logContent=true and logLevel=debug", () => {
+test("content logging requires logOperations + debug level + logContent and is journald-visible", () => {
   const noContent = makeSink();
   createGraphitiLogger(noContent.sink, {
     logOperations: true,
@@ -69,6 +69,14 @@ test("content logging requires both logContent=true and logLevel=debug", () => {
   }).debugContent("capture_payload", {}, { body: "secret" });
   assert.equal(infoOnly.records.length, 0);
 
+  const operationsOff = makeSink();
+  createGraphitiLogger(operationsOff.sink, {
+    logOperations: false,
+    logLevel: "debug",
+    logContent: true,
+  }).debugContent("capture_payload", {}, { body: "secret" });
+  assert.equal(operationsOff.records.length, 0);
+
   const enabled = makeSink();
   createGraphitiLogger(enabled.sink, {
     logOperations: true,
@@ -77,7 +85,7 @@ test("content logging requires both logContent=true and logLevel=debug", () => {
   }).debugContent("capture_payload", { agentId: "main" }, { body: "first\nsecond" });
 
   assert.equal(enabled.records.length, 1);
-  assert.equal(enabled.records[0].level, "debug");
+  assert.equal(enabled.records[0].level, "info");
   assert.match(enabled.records[0].message, /event=capture_payload/);
   assert.match(enabled.records[0].message, /body="first\\nsecond"/);
   assert.equal(enabled.records[0].message.includes("first\nsecond"), false);

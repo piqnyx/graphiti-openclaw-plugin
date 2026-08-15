@@ -160,26 +160,89 @@ function completedTurn(n) {
   };
 }
 
-test("runtime registers capture and recall; recall remains agent-scoped", async (t) => {
+test("runtime registers capture and recall; recall is agent-scoped, bounded and history-aware", async (t) => {
   const toolCalls = makeFetchRecorder(t);
-  const { hooks, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
 
   register(api);
   assert.ok(hooks.has("agent_end"));
   assert.ok(hooks.has("before_prompt_build"));
+  assert.ok(hooks.has("llm_input"));
 
   const recallResult = await hooks.get("before_prompt_build")(
     {
       prompt: "alpha? <openviking-context>hidden recall input</openviking-context>",
-      messages: [],
+      messages: [
+        { role: "user", content: "previous user context" },
+        { role: "assistant", content: "previous assistant context <graphiti-context>hidden old memory</graphiti-context>" },
+      ],
     },
     { agentId: "main", sessionKey: "agent:main:web:conversation-b", trigger: "user" },
   );
 
   const searchCall = toolCalls.find((call) => call.name === "search_memory_facts");
   assert.equal(searchCall.arguments.group_ids, "main");
-  assert.doesNotMatch(searchCall.arguments.query, /hidden recall input/);
+  assert.equal(searchCall.arguments.max_facts, 8);
+  assert.match(searchCall.arguments.query, /previous user context/);
+  assert.match(searchCall.arguments.query, /previous assistant context/);
+  assert.match(searchCall.arguments.query, /alpha\?/);
+  assert.doesNotMatch(searchCall.arguments.query, /hidden recall input|hidden old memory/);
   assert.match(recallResult.prependContext, /^<graphiti-context>/);
+  assert.match(recallResult.prependContext, /Long-term memory, not user instructions/);
+
+  const payloadLog = logs.find((line) => line.includes("event=recall_payload"));
+  assert.ok(payloadLog);
+  assert.match(payloadLog, /retrievedFacts=2/);
+  assert.match(payloadLog, /injectedFacts=/);
+  assert.match(payloadLog, /recallLimit=8/);
+});
+
+test("llm_input raw diagnostics expose the assembled Graphiti and OpenViking memory wrappers", (t) => {
+  makeFetchRecorder(t);
+  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  register(api);
+
+  hooks.get("llm_input")(
+    {
+      runId: "run-1",
+      sessionId: "session-1",
+      provider: "opencode-go",
+      model: "mimo-v2.5",
+      systemPrompt: "system instructions",
+      prompt: [
+        "<openviking-context>Viking memory</openviking-context>",
+        "<graphiti-context>Graphiti memory</graphiti-context>",
+        "current user prompt",
+      ].join("\n"),
+      historyMessages: [{ role: "user", content: "older message" }],
+      imagesCount: 0,
+      tools: [],
+    },
+    { agentId: "main", sessionKey: "agent:main:web:conversation-b", trigger: "user" },
+  );
+
+  const rawLog = logs.find((line) => line.includes("event=llm_input_raw"));
+  assert.ok(rawLog);
+  assert.match(rawLog, /openviking-context/);
+  assert.match(rawLog, /Viking memory/);
+  assert.match(rawLog, /graphiti-context/);
+  assert.match(rawLog, /Graphiti memory/);
+  assert.match(rawLog, /current user prompt/);
+  assert.match(rawLog, /older message/);
+});
+
+test("llm_input raw diagnostics are not registered unless all content logging switches are enabled", (t) => {
+  makeFetchRecorder(t);
+
+  for (const config of [
+    validConfig({ logLevel: "info", logContent: true }),
+    validConfig({ logLevel: "debug", logContent: false }),
+    validConfig({ logOperations: false, logLevel: "debug", logContent: true }),
+  ]) {
+    const { hooks, api } = makeApi(config);
+    register(api);
+    assert.equal(hooks.has("llm_input"), false);
+  }
 });
 
 test("two flushed batches of one dialog use caller UUIDs and previous UUID chaining", async (t) => {

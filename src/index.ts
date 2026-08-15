@@ -5,9 +5,10 @@ import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION } from "./mcp-client.js";
 import {
-  buildRecallBlock,
+  buildRecallBlockDetailed,
+  buildRecallQuery,
   extractConversationMessages,
-  prepareRecallQuery,
+  sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
   SLUG_GENERATOR_SESSION_KEY,
 } from "./text.js";
@@ -17,6 +18,7 @@ import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
   HookContext,
+  LlmInputEvent,
   OpenClawPluginApi,
   PluginJsonValue,
 } from "./types.js";
@@ -513,7 +515,6 @@ export function register(api: OpenClawPluginApi): void {
     });
   }
 
-  // Recall remains intentionally unchanged while capture is being stabilized.
   if (cfg.autoRecall) {
     api.on(
       "before_prompt_build",
@@ -527,19 +528,42 @@ export function register(api: OpenClawPluginApi): void {
           return;
         }
 
-        const query = prepareRecallQuery(event.prompt ?? "", cfg.recallQueryMaxChars);
-        if (!query) {
+        const currentPrompt = sanitizeConversationText(event.prompt ?? "");
+        if (!currentPrompt) {
           logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "empty_query" });
           return;
         }
-        if (query.startsWith(SESSION_RESET_PROMPT_PREFIX)) {
+        if (currentPrompt.startsWith(SESSION_RESET_PROMPT_PREFIX)) {
           logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "session_reset" });
+          return;
+        }
+
+        const query = buildRecallQuery(
+          currentPrompt,
+          Array.isArray(event.messages) ? event.messages : [],
+          {
+            useHistory: cfg.recallUseHistory,
+            historyMaxMessages: cfg.recallHistoryMaxMessages,
+            historyMaxChars: cfg.recallHistoryMaxChars,
+            maxChars: cfg.recallQueryMaxChars,
+          },
+        );
+        if (!query) {
+          logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "empty_query" });
           return;
         }
 
         logger.debugContent(
           "recall_query",
-          { agentId, group_id: agentId, chars: query.length },
+          {
+            agentId,
+            group_id: agentId,
+            chars: query.length,
+            useHistory: cfg.recallUseHistory,
+            historyMaxMessages: cfg.recallHistoryMaxMessages,
+            historyMaxChars: cfg.recallHistoryMaxChars,
+            queryMaxChars: cfg.recallQueryMaxChars,
+          },
           { query },
         );
 
@@ -549,14 +573,19 @@ export function register(api: OpenClawPluginApi): void {
           const factTexts = facts
             .map((fact) => (typeof fact.fact === "string" ? fact.fact : ""))
             .filter(Boolean);
-          const block = buildRecallBlock(factTexts, cfg.recallMaxInjectedChars);
+          const recallBlock = buildRecallBlockDetailed(factTexts, cfg.recallMaxInjectedChars);
+          const block = recallBlock.block;
 
           logger.debugContent(
             "recall_payload",
             {
               agentId,
               group_id: agentId,
-              results: factTexts.length,
+              retrievedFacts: factTexts.length,
+              injectedFacts: recallBlock.injectedFacts,
+              skippedFacts: recallBlock.skippedFacts,
+              recallLimit: cfg.recallLimit,
+              maxInjectedChars: cfg.recallMaxInjectedChars,
               injectedChars: block?.length ?? 0,
             },
             { facts: factTexts, injectedBlock: block ?? "" },
@@ -565,6 +594,8 @@ export function register(api: OpenClawPluginApi): void {
             agentId,
             group_id: agentId,
             results: factTexts.length,
+            injectedFacts: recallBlock.injectedFacts,
+            skippedFacts: recallBlock.skippedFacts,
             injectedChars: block?.length ?? 0,
             durationMs: Date.now() - started,
           });
@@ -581,6 +612,30 @@ export function register(api: OpenClawPluginApi): void {
       },
       { timeoutMs: cfg.requestTimeoutMs },
     );
+  }
+
+  if (cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent) {
+    api.on("llm_input", (rawEvent: unknown, ctx?: HookContext): void => {
+      const event = rawEvent as LlmInputEvent;
+      logger.debugContent(
+        "llm_input_raw",
+        {
+          agentId: ctx?.agentId,
+          sessionKey: ctx?.sessionKey,
+          runId: event.runId,
+          provider: event.provider,
+          model: event.model,
+          systemPromptChars: event.systemPrompt?.length ?? 0,
+          promptChars: event.prompt?.length ?? 0,
+          historyMessages: Array.isArray(event.historyMessages) ? event.historyMessages.length : 0,
+        },
+        {
+          systemPrompt: event.systemPrompt ?? "",
+          prompt: event.prompt ?? "",
+          historyMessages: Array.isArray(event.historyMessages) ? event.historyMessages : [],
+        },
+      );
+    });
   }
 
   if (cfg.autoCapture) {
@@ -658,8 +713,14 @@ export function register(api: OpenClawPluginApi): void {
     ),
     requestTimeoutMs: cfg.requestTimeoutMs,
     recallLimit: cfg.recallLimit,
+    recallQueryMaxChars: cfg.recallQueryMaxChars,
+    recallMaxInjectedChars: cfg.recallMaxInjectedChars,
+    recallUseHistory: cfg.recallUseHistory,
+    recallHistoryMaxMessages: cfg.recallHistoryMaxMessages,
+    recallHistoryMaxChars: cfg.recallHistoryMaxChars,
     logLevel: cfg.logLevel,
     logContent: cfg.logContent,
+    rawModelInputLogging: cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent,
     captureErrorUiStatus: Boolean(
       api.session?.state?.registerSessionExtension &&
         api.session?.controls?.registerControlUiDescriptor &&

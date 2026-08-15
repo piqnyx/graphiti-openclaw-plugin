@@ -29,6 +29,18 @@ export type BeforePromptBuildResult = {
   prependContext?: string;
 };
 
+export type LlmInputEvent = {
+  runId: string;
+  sessionId: string;
+  provider: string;
+  model: string;
+  systemPrompt?: string;
+  prompt: string;
+  historyMessages: unknown[];
+  imagesCount?: number;
+  tools?: unknown[];
+};
+
 export type PluginJsonValue =
   | null
   | boolean

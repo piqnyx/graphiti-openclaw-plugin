@@ -17,6 +17,9 @@ export type GraphitiPluginConfig = {
   recallLimit: number;
   recallQueryMaxChars: number;
   recallMaxInjectedChars: number;
+  recallUseHistory: boolean;
+  recallHistoryMaxMessages: number;
+  recallHistoryMaxChars: number;
   logOperations: boolean;
   logLevel: LogLevel;
   logContent: boolean;
@@ -32,9 +35,12 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   autoCapture: true,
   autoRecall: true,
   requestTimeoutMs: 45_000,
-  recallLimit: 6,
-  recallQueryMaxChars: 2_000,
-  recallMaxInjectedChars: 4_000,
+  recallLimit: 8,
+  recallQueryMaxChars: 6_000,
+  recallMaxInjectedChars: 8_000,
+  recallUseHistory: true,
+  recallHistoryMaxMessages: 6,
+  recallHistoryMaxChars: 4_000,
   logOperations: true,
   logLevel: "info",
   logContent: false,
@@ -117,7 +123,8 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
   const raw = asObject(input);
   const allowed = new Set<keyof GraphitiPluginConfig>([
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
-    "recallQueryMaxChars", "recallMaxInjectedChars", "logOperations", "logLevel",
+    "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
+    "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
     "logContent", "bufferLimit", "bufferTimeout", "agents",
   ]);
 
@@ -135,6 +142,9 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     recallLimit: integerValue(raw.recallLimit, DEFAULT_CONFIG.recallLimit, "recallLimit", 1, 100),
     recallQueryMaxChars: integerValue(raw.recallQueryMaxChars, DEFAULT_CONFIG.recallQueryMaxChars, "recallQueryMaxChars", 32, 32_000),
     recallMaxInjectedChars: integerValue(raw.recallMaxInjectedChars, DEFAULT_CONFIG.recallMaxInjectedChars, "recallMaxInjectedChars", 128, 64_000),
+    recallUseHistory: booleanValue(raw.recallUseHistory, DEFAULT_CONFIG.recallUseHistory, "recallUseHistory"),
+    recallHistoryMaxMessages: integerValue(raw.recallHistoryMaxMessages, DEFAULT_CONFIG.recallHistoryMaxMessages, "recallHistoryMaxMessages", 1, 100),
+    recallHistoryMaxChars: integerValue(raw.recallHistoryMaxChars, DEFAULT_CONFIG.recallHistoryMaxChars, "recallHistoryMaxChars", 128, 32_000),
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
     logLevel: logLevelValue(raw.logLevel),
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),

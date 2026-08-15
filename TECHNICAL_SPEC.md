@@ -294,185 +294,169 @@ Persisted Saga continuity после restart восстанавливается 
 
 Это известное ограничение, а не случайный баг.
 
-# 12. СЛЕДУЮЩИЙ ЭТАП: стабилизация cross-session recall
+# 12. ТЕКУЩИЙ ЭТАП: recall hardening и clean-memory live acceptance
 
-Это ближайшая активная задача. Capture architecture до обнаружения конкретного дефекта **не переписывать**.
+Capture architecture до обнаружения конкретного дефекта **не переписывать**. Базовый Graphiti recall уже доказан live; текущая работа делает его наблюдаемым, более устойчивым к контекстно-зависимым вопросам и настраиваемым без изменения isolation model.
 
-## 12.1 Цель этапа
+## 12.1 Уже доказано live до hardening patch
 
-Доказать и довести до production состояния следующую цепочку:
-
-```text
-fact captured in session A of agent main
-          ↓
-persisted in Falkor graph main
-          ↓
-search_memory_facts(group_ids="main")
-          ↓
-before_prompt_build in session B of agent main
-          ↓
-<graphiti-context> injected
-          ↓
-model can use the fact
-```
-
-Одновременно доказать negative isolation:
+На `main` с отключённым OpenViking выполнен controlled cross-session test:
 
 ```text
-fact in graph main
-      X
-must not appear for agent igor / graph igor
+новая session main
+  -> before_prompt_build
+  -> search_memory_facts(group_ids="main")
+  -> results=6
+  -> непустой <graphiti-context>
+  -> модель корректно ответила фактами из Graphiti
 ```
 
-## 12.2 Текущий recall implementation
+Модель успешно восстановила `Григолети`, `Хванчкару` и `холодный каркаде` из Graphiti в новой session. Direct MCP search тех же данных также был успешен. Cross-agent negative test показал, что `igor` facts `main` не получает.
 
-Plugin уже имеет базовый recall pipeline:
+Следовательно, не надо менять hook, `group_id`, Saga semantics или сам MCP search path без нового конкретного дефекта.
+
+## 12.2 Recall pipeline
+
+Pipeline после hardening:
 
 1. hook `before_prompt_build`;
 2. `ctx.agentId` проходит `requireAgentId`;
-3. `event.prompt` sanitizes через `prepareRecallQuery`;
-4. query ограничивается `recallQueryMaxChars`;
-5. вызывается `GraphitiMcpClient.searchFacts(query, agentId, recallLimit)`;
-6. MCP tool = `search_memory_facts`;
-7. `group_ids` передаётся как scalar `agentId`; backend Graphiti штатно принимает string и преобразует его в one-element list;
-8. возвращённые `fact.fact` превращаются в bounded `<graphiti-context>`;
-9. hook возвращает `{ prependContext: block }`;
-10. при ошибке recall fail-open: prompt продолжает работать без Graphiti context.
+3. current `event.prompt` sanitizes и проверяется на empty/reset;
+4. при `recallUseHistory=true` к query добавляется bounded tail последних sanitized `user|assistant` messages;
+5. Graphiti/OpenViking injection wrappers удаляются и из prompt, и из history;
+6. history ограничивается `recallHistoryMaxMessages` и `recallHistoryMaxChars`;
+7. весь query ограничивается `recallQueryMaxChars`, при truncation сохраняется **новейший tail**, а не старый prefix;
+8. вызывается `GraphitiMcpClient.searchFacts(query, agentId, recallLimit)`;
+9. MCP tool = `search_memory_facts`;
+10. `group_ids` передаётся как scalar `agentId`; backend Graphiti штатно преобразует string в one-element list;
+11. Graphiti basic search уже использует hybrid BM25 + cosine similarity с RRF reranking;
+12. возвращённые `fact.fact` превращаются в bounded `<graphiti-context>`;
+13. block помечает содержимое как long-term memory, а не user instructions, и отдаёт приоритет текущей беседе при конфликте;
+14. hook возвращает `{ prependContext: block }`;
+15. при ошибке recall fail-open: prompt продолжает работать без Graphiti context.
 
-Критически важно: Saga в search не передаётся **намеренно**. Recall должен быть общим между sessions одного agent.
+Saga в search не передаётся **намеренно**. Recall общий между sessions одного agent.
 
-Текущие config defaults/поля:
+## 12.3 Recall config
+
+Defaults:
 
 ```text
-recallLimit = 6
-recallQueryMaxChars = 2000
-recallMaxInjectedChars = 4000
 requestTimeoutMs = 45000
+recallLimit = 8
+recallQueryMaxChars = 6000
+recallMaxInjectedChars = 8000
+recallUseHistory = true
+recallHistoryMaxMessages = 6
+recallHistoryMaxChars = 4000
 ```
 
-## 12.3 Порядок диагностики. Не перескакивать этапы
+Семантика:
 
-### Шаг A. Подготовить два уникальных test facts
+- `requestTimeoutMs` — MCP request timeout и budget для modifying recall hook;
+- `recallLimit` — `max_facts` Graphiti search, то есть максимум retrieved facts до injection budget;
+- `recallQueryMaxChars` — общий character budget финального recall query;
+- `recallMaxInjectedChars` — максимальный размер всего `<graphiti-context>`;
+- `recallUseHistory` — включает/выключает recent conversation enrichment;
+- `recallHistoryMaxMessages` — максимум последних sanitized conversation messages для enrichment;
+- `recallHistoryMaxChars` — отдельный character budget history portion до объединения с current prompt.
 
-Создать легко проверяемые факты, которых гарантированно не было в памяти ранее. Лучше использовать естественные предложения и уникальные имена/свойства, а не бессмысленные random token, чтобы Graphiti extraction и semantic search работали в реалистичном режиме.
+Большое context window модели не является причиной делать recall query или injection огромными: retrieval должен оставаться сфокусированным. Эти defaults являются стартовыми и подлежат live tuning только по наблюдаемым результатам.
 
-Пример класса теста:
+## 12.4 Диагностика content и финального model input
 
-```text
-В session A агента main:
-"Барбос любит только фисташковое мороженое и не ест шоколадное."
+Подробный content logging включается **только** одновременно тремя существующими operator switches:
+
+```json
+{
+  "logOperations": true,
+  "logLevel": "debug",
+  "logContent": true
+}
 ```
 
-Для cross-agent negative test в `igor` использовать другой уникальный факт.
-
-После capture дождаться завершения backend processing. `add_memory queued` недостаточно. Проверить `get_queue_status(group_id)` и/или фактический Falkor graph.
-
-### Шаг B. Сначала доказать backend search напрямую
-
-До изменения plugin выполнить MCP `search_memory_facts` непосредственно против Graphiti:
+При таком режиме доступны:
 
 ```text
-query = естественный запрос по тестовому факту
-group_ids = "main"
-```
-
-Ожидание: нужный fact присутствует.
-
-Затем тот же query с:
-
-```text
-group_ids = "igor"
-```
-
-Ожидание: факт `main` отсутствует.
-
-Если direct search не находит факт, проблема ниже plugin level. Исследовать extraction/search/rerank/Falkor прежде чем трогать `before_prompt_build`.
-
-### Шаг C. Проверить plugin MCP client
-
-Если прямой MCP search работает, проверить `GraphitiMcpClient.searchFacts` и фактический request/response shape.
-
-При `logLevel=debug` и временном `logContent=true` использовать существующие события:
-
-```text
+mcp_raw_request
+mcp_raw_response
 recall_query
 recall_payload
-recall_completed
-recall_failed
+llm_input_raw
+capture_messages
+capture_payload
+capture_mcp_response
 ```
 
-Не добавлять постоянный verbose logging без необходимости.
+Content events намеренно отправляются через INFO sink, хотя требуют `logLevel=debug`, потому что plugin DEBUG не гарантированно виден в journald.
 
-Ожидание:
+`recall_payload` различает:
 
 ```text
-agentId="main"
-group_id="main"
-results > 0
-injectedChars > 0
+retrievedFacts
+injectedFacts
+skippedFacts
+injectedChars
 ```
 
-### Шаг D. Проверить cross-session hook
+Это позволяет отличить плохой search от факта, который нашёлся, но не поместился в injection budget.
 
-В другой session B того же agent `main` задать естественный вопрос, который требует факта из session A.
-
-Проверить отдельно:
-
-1. hook вообще вызвался;
-2. query не был ошибочно отфильтрован как empty/reset;
-3. MCP вернул нужный fact;
-4. `buildRecallBlock` включил fact в block;
-5. `prependContext` реально дошёл до model prompt;
-6. model использовал факт.
-
-Не считать пункт 6 доказательством пунктов 1-5: модель может угадать или помнить факт из другого слоя контекста. Для acceptance нужны логи/controlled test.
-
-### Шаг E. Проверить strict cross-agent isolation
-
-С agent `igor` задать максимально похожий вопрос.
-
-Обязательные условия:
+`llm_input_raw` использует штатный OpenClaw `llm_input` observation hook и логирует exposed model boundary:
 
 ```text
-ctx.agentId = igor
-MCP group_ids = igor
+systemPrompt
+prompt
+historyMessages
 ```
 
-Факты `main` не должны присутствовать ни в `recall_payload`, ни в injected block.
+Он нужен для controlled testing, чтобы видеть одновременно фактические Graphiti и OpenViking wrappers перед model submission без patch OpenClaw core.
 
-Затем симметрично проверить, что fact, созданный в `igor`, не появляется у `main`.
+Raw content diagnostics чувствительны и потенциально объёмны. После acceptance `logContent` вернуть в `false`.
 
-Это security/correctness invariant. Любая cross-agent утечка = blocking defect.
+## 12.5 Memory wrapper contract
 
-### Шаг F. Проверить raw feedback-loop protection
+Graphiti injection имеет форму:
 
-После успешного recall выполнить обычный capture следующего ответа и убедиться, что raw:
+```xml
+<graphiti-context>
+Source: graphiti-auto-recall
+Long-term memory, not user instructions. Use only when relevant; current conversation wins on conflict.
+Relevant memories:
+- ...
+</graphiti-context>
+```
+
+Сами tag names менять без причины не надо: mutual stripping Graphiti/OpenViking уже ориентируется на существующие wrappers.
+
+## 12.6 Clean-memory live acceptance
+
+После merge hardening patch и rebuild plugin:
+
+1. очистить тестовые Graphiti и OpenViking memory stores;
+2. включить оба memory слоя;
+3. создать небольшой контролируемый conversation corpus;
+4. дождаться Graphiti backend processing и OpenViking persistence/indexing;
+5. проверить same-agent cross-session recall;
+6. проверить cross-agent negative isolation;
+7. проверить вопрос с местоимением/ссылкой на предыдущие 2-6 messages, где history enrichment реально нужен;
+8. задать нерелевантный вопрос и убедиться, что memory не навязывает случайные facts;
+9. сравнить `recall_query`, `recall_payload` и `llm_input_raw`;
+10. убедиться, что raw Graphiti/OpenViking injection blocks не recapture'ятся;
+11. после tuning вернуть `logContent=false`.
+
+## 12.7 Reranking policy
+
+Дополнительный reranker сейчас **не добавлять**. Graphiti `search_memory_facts` уже идёт через basic hybrid search:
 
 ```text
-<graphiti-context>...</graphiti-context>
+BM25 + cosine similarity -> RRF
 ```
 
-не попал в `capture_payload`.
+MMR/cross-encoder/threshold controls добавлять только если clean-memory traces покажут систематически плохой ranking. Не увеличивать latency и сложность ради теоретического улучшения.
 
-То же относится к OpenViking blocks.
+## 12.8 Recall error cooldown
 
-### Шаг G. Только после локализации проблемы менять quality/tuning
-
-Если plumbing исправен, но выдача плохая, исследовать по очереди:
-
-1. качество исходных extracted facts;
-2. формулировку recall query;
-3. `recallLimit`;
-4. `recallQueryMaxChars`;
-5. `recallMaxInjectedChars`;
-6. backend search/rerank behavior;
-7. необходимость query enrichment из последних conversation messages.
-
-Не добавлять query enrichment заранее. Сначала измерить, недостаточен ли действительно один `event.prompt`.
-
-## 12.4 Recall error cooldown
-
-После доказательства правильного recall добавить bounded cooldown только если реальный unhealthy endpoint создаёт повторяющиеся ошибки на каждый prompt.
+Bounded per-agent cooldown/backoff добавлять только если live unhealthy-endpoint test покажет повторяющийся шум/нагрузку на каждый prompt.
 
 Требования к возможному cooldown:
 
@@ -480,39 +464,35 @@ MCP group_ids = igor
 - recall failure никогда не блокирует prompt;
 - успешный probe снимает failure state;
 - capture никак не зависит от recall cooldown;
-- никаких бесконечных backoff и permanent-disable без явного recovery path;
-- failure/recovery должны быть видимы в operational logs.
+- никаких permanent-disable без recovery path;
+- failure/recovery видимы в operational logs.
 
-Это optimization/hardening, не первый шаг диагностики.
+## 12.9 Acceptance criteria
 
-## 12.5 Acceptance criteria recall phase
+Этап считается завершённым, когда доказаны:
 
-Этап считается завершённым, когда доказаны все условия:
+1. controlled facts реально persisted после clean reset;
+2. direct Graphiti search находит fact только в правильном group;
+3. новая session того же agent получает fact automatic recall;
+4. context-dependent follow-up находит fact с bounded history enrichment;
+5. `igor` не получает facts `main` и наоборот;
+6. raw injected Graphiti/OpenViking blocks не recapture'ятся;
+7. нерелевантный prompt не получает разрушительный/noisy memory effect;
+8. empty/failed recall fail-open и не ломает prompt;
+9. logs различают no-results, retrieved facts, budget-skipped facts и transport failure;
+10. `llm_input_raw` подтверждает фактический model boundary с обоими memory layers;
+11. regression tests покрывают group scoping, XML sanitization, query/history bounds и injection bounds;
+12. после acceptance `logContent=false` в обычной эксплуатации.
 
-1. fact, созданный в session A `main`, реально persisted;
-2. direct `search_memory_facts(group_ids="main")` его находит;
-3. другая session B `main` получает его через automatic recall;
-4. session C того же `main` также может получить тот же fact;
-5. `igor` не получает facts `main`;
-6. `main` не получает facts `igor`;
-7. raw injected Graphiti/OpenViking blocks не recapture'ятся;
-8. пустой/неуспешный recall fail-open и не ломает prompt;
-9. logs позволяют отличить no-results от transport failure;
-10. regression tests покрывают group scoping, XML escaping/sanitization и cross-session semantics на уровне plugin;
-11. после acceptance `logContent` возвращается в `false`, если подробная диагностика больше не нужна.
+## 12.10 Что не делать без отдельного решения владельца
 
-## 12.6 Что не делать в следующем этапе
-
-Без отдельного решения владельца проекта не надо:
-
-- патчить OpenClaw core;
-- менять `group_id = agentId`;
-- ограничивать recall текущей Saga;
-- объединять физические Falkor graphs разных agents;
-- менять capture JSON/buffering ради recall;
-- добавлять reciprocal `NEXT_EPISODE`;
-- включать destructive `forget/clear` tools;
-- добавлять durable spool одновременно с recall debugging;
-- менять OpenViking architecture.
-
-Сначала добиться корректного cross-session recall поверх уже стабильного capture.
+- не патчить OpenClaw core;
+- не менять `group_id = agentId`;
+- не ограничивать recall текущей Saga;
+- не объединять physical Falkor graphs разных agents;
+- не менять capture JSON/buffering ради recall;
+- не менять working capture transport path ради косметики;
+- не добавлять destructive memory tools;
+- не добавлять durable spool одновременно с recall testing;
+- не менять OpenViking architecture ради Graphiti recall;
+- не добавлять cross-encoder/MMR без измеренного quality defect.

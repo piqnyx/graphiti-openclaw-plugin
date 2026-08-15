@@ -25,8 +25,8 @@ const agents = {
   main: { user: "Вит", assistant: "Краб" },
 };
 
-function addTurn(engine, agentId, sessionKey, n) {
-  engine.addTurn(agentId, sessionKey, `user-${n}`, `assistant-${n}`);
+function addMessages(engine, agentId, sessionKey, ...messages) {
+  engine.addMessages(agentId, sessionKey, messages);
 }
 
 test("odd bufferLimit is valid because the limit counts individual messages", () => {
@@ -49,11 +49,11 @@ test("limit trigger flushes exactly at the configured message limit", async (t) 
   });
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "s1", 1);
+  addMessages(engine, "main", "s1", { role: "user", text: "u1" }, { role: "assistant", text: "a1" });
   await sleep(20);
   assert.equal(flushes.length, 0);
 
-  addTurn(engine, "main", "s1", 2);
+  addMessages(engine, "main", "s1", { role: "user", text: "u2" }, { role: "assistant", text: "a2" });
   await waitFor(() => flushes.length === 1, 2000);
   assert.deepEqual(flushes[0], {
     agentId: "main",
@@ -72,8 +72,8 @@ test("buffers are isolated per session within an agent", () => {
     flushes.push(entry.buffer.sessionKey);
   });
   try {
-    addTurn(engine, "main", "sA", 1);
-    addTurn(engine, "main", "sB", 2);
+    engine.addMessage("main", "sA", "user", "a-only");
+    engine.addMessage("main", "sB", "assistant", "b-only");
     assert.equal(engine.activeBufferCount("main"), 2);
     assert.equal(flushes.length, 0);
   } finally {
@@ -84,14 +84,14 @@ test("buffers are isolated per session within an agent", () => {
 test("FIFO queue per agent preserves chronological order", async (t) => {
   const flushes = [];
   const gate = deferred();
-  const engine = new BufferEngine(agents, 2, 3600, async (_agentId, entry) => {
+  const engine = new BufferEngine(agents, 1, 3600, async (_agentId, entry) => {
     flushes.push(entry.buffer.sessionKey);
     if (flushes.length === 1) await gate.promise;
   });
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "first", 1);
-  addTurn(engine, "main", "second", 2);
+  engine.addMessage("main", "first", "user", "first-message");
+  engine.addMessage("main", "second", "assistant", "second-message");
 
   await waitFor(() => flushes.length === 1, 2000);
   gate.resolve();
@@ -102,16 +102,16 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
 test("agents are isolated: one agent processing slot does not affect another", async (t) => {
   const flushes = [];
   const gate = deferred();
-  const engine = new BufferEngine(agents, 2, 3600, async (agentId, entry) => {
+  const engine = new BufferEngine(agents, 1, 3600, async (agentId, entry) => {
     flushes.push({ agentId, sessionKey: entry.buffer.sessionKey });
     if (agentId === "igor") await gate.promise;
   });
   t.after(() => engine.stop());
 
-  addTurn(engine, "igor", "i1", 1);
+  engine.addMessage("igor", "i1", "user", "igor-message");
   await waitFor(() => flushes.some((f) => f.agentId === "igor"), 2000);
 
-  addTurn(engine, "main", "m1", 1);
+  engine.addMessage("main", "m1", "assistant", "main-message");
   await waitFor(() => flushes.some((f) => f.agentId === "main"), 2000);
 
   gate.resolve();
@@ -122,7 +122,7 @@ test("failed sink retains the detached FIFO head and reports the error", async (
   const errors = [];
   const engine = new BufferEngine(
     agents,
-    2,
+    1,
     3600,
     async () => {
       throw new Error("backend down");
@@ -134,7 +134,7 @@ test("failed sink retains the detached FIFO head and reports the error", async (
   );
   t.after(() => engine.stop());
 
-  addTurn(engine, "main", "s1", 1);
+  engine.addMessage("main", "s1", "user", "retained");
   await waitFor(() => errors.length === 1, 2000);
   assert.equal(engine.queueLength(), 1, "failed head must remain queued for retry");
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
@@ -167,6 +167,7 @@ test("timeout ticker flushes a non-empty message buffer exactly after inactivity
       sessionKey: entry.buffer.sessionKey,
       count: entry.buffer.messages.length,
       reason,
+      storedReason: entry.reason,
       enqueuedAt: entry.enqueuedAt,
     });
   });
@@ -186,6 +187,7 @@ test("timeout ticker flushes a non-empty message buffer exactly after inactivity
     sessionKey: "session-a",
     count: 1,
     reason: "timeout",
+    storedReason: "timeout",
     enqueuedAt: now,
   });
   assert.equal(engine.activeBufferCount("main"), 0);

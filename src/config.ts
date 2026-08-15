@@ -4,7 +4,7 @@ export type LogLevel = "error" | "warn" | "info" | "debug";
  * Канонические имена акторов одного агента.
  * `user` — человек, `assistant` — его бот. Без алиасов-регулярок:
  * имена служат только для participants в JSON-эпизоде Graphiti, текст
- * сообщений НЕ переписывается (никакого поедания слогов/мусора).
+ * сообщений НЕ переписывается.
  */
 export type AgentActors = {
   user: string;
@@ -22,13 +22,12 @@ export type GraphitiPluginConfig = {
   logOperations: boolean;
   logLevel: LogLevel;
   logContent: boolean;
-  // v0.2: buffer / queue  (bufferTimeout — в секундах)
   bufferLimit: number;
   bufferTimeout: number;
-  // v0.2: канонические имена акторов ПО АГЕНТАМ (мультиагент).
-  // Ключ — agentId (main, igor, red, orange...), значение — имена человека и бота.
   agents: Record<string, AgentActors>;
 };
+
+export const MIN_BUFFER_TIMEOUT_SEC = 30;
 
 export const DEFAULT_ACTORS: AgentActors = { user: "User", assistant: "Assistant" };
 
@@ -43,7 +42,6 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logOperations: true,
   logLevel: "info",
   logContent: false,
-  // v0.2: buffer / queue  (bufferTimeout — в секундах)
   bufferLimit: 4,
   bufferTimeout: 900,
   agents: {
@@ -79,6 +77,20 @@ function integerValue(
   return raw;
 }
 
+function evenIntegerValue(
+  raw: unknown,
+  fallback: number,
+  name: string,
+  min: number,
+  max: number,
+): number {
+  const value = integerValue(raw, fallback, name, min, max);
+  if (value % 2 !== 0) {
+    throw new Error(`${name} must be even because capture buffers contain user+assistant pairs`);
+  }
+  return value;
+}
+
 function logLevelValue(raw: unknown): LogLevel {
   if (raw === undefined) return DEFAULT_CONFIG.logLevel;
   if (raw === "error" || raw === "warn" || raw === "info" || raw === "debug") return raw;
@@ -104,10 +116,6 @@ function nonEmptyName(value: unknown, what: string): string {
   return value.trim();
 }
 
-/**
- * Агенты: объект { agentId: { user: string, assistant: string } }.
- * Алиасов-регулярок нет — только канонические имена человека и бота.
- */
 function agentsValue(raw: unknown): Record<string, AgentActors> {
   if (raw === undefined) return DEFAULT_CONFIG.agents;
   const obj = asObject(raw);
@@ -186,7 +194,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
     logLevel: logLevelValue(raw.logLevel),
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
-    bufferLimit: integerValue(
+    bufferLimit: evenIntegerValue(
       raw.bufferLimit,
       DEFAULT_CONFIG.bufferLimit,
       "bufferLimit",
@@ -197,7 +205,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       raw.bufferTimeout,
       DEFAULT_CONFIG.bufferTimeout,
       "bufferTimeout",
-      120,
+      MIN_BUFFER_TIMEOUT_SEC,
       7 * 24 * 60 * 60,
     ),
     agents: agentsValue(raw.agents),

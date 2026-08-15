@@ -9,7 +9,7 @@ const LEVEL_RANK: Record<LogLevel, number> = {
 };
 
 type LogFields = Record<string, unknown>;
-type ContentFields = Record<string, string | readonly string[]>;
+type ContentFields = Record<string, unknown>;
 
 function renderValue(value: unknown): string {
   if (value === undefined) return "undefined";

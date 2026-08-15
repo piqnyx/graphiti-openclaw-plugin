@@ -67,14 +67,6 @@ function integerValue(raw: unknown, fallback: number, name: string, min: number,
   return raw;
 }
 
-function evenIntegerValue(raw: unknown, fallback: number, name: string, min: number, max: number): number {
-  const value = integerValue(raw, fallback, name, min, max);
-  if (value % 2 !== 0) {
-    throw new Error(`${name} must be even because capture buffers contain user+assistant pairs`);
-  }
-  return value;
-}
-
 function logLevelValue(raw: unknown): LogLevel {
   if (raw === undefined) return DEFAULT_CONFIG.logLevel;
   if (raw === "error" || raw === "warn" || raw === "info" || raw === "debug") return raw;
@@ -146,7 +138,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
     logLevel: logLevelValue(raw.logLevel),
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
-    bufferLimit: evenIntegerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 4, 1_000),
+    bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
     agents: agentsValue(raw.agents),
   };

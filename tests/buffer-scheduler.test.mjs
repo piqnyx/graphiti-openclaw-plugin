@@ -119,15 +119,12 @@ test("failed head retries before later entries and recovery resumes FIFO", async
   assert.deepEqual(errors, ["b1"]);
   assert.equal(engine.queueLength(), 1);
 
-  // Queue a later item while retry backoff is active. It must not overtake b1.
   addTurn(engine, "main", "b2", 2);
   await sleep(0);
   assert.deepEqual(attempts, ["b1"]);
   assert.equal(engine.queueLength(), 2);
 
   now += CHECK_INTERVAL_SEC * 1000;
-  // A new enqueue is enough to kick pump after retryAfter; the real ticker does
-  // the same in production.
   addTurn(engine, "main", "b3", 3);
   await sleep(0);
   await sleep(0);
@@ -137,27 +134,27 @@ test("failed head retries before later entries and recovery resumes FIFO", async
   assert.equal(engine.queueLength(), 0);
 });
 
-test("BufferEngine accepts only complete turns, so half-turn buffers are unrepresentable", async (t) => {
+test("individual user and assistant messages are representable and preserve order", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(
     agents,
     4,
     3600,
     async (_agentId, entry) => {
-      flushes.push(entry.buffer.messages.map((m) => m.role));
+      flushes.push(entry.buffer.messages.map((m) => `${m.role}:${m.text}`));
     },
   );
   t.after(() => engine.stop());
 
-  assert.equal(typeof engine.addMessage, "undefined");
-
-  addTurn(engine, "main", "s1", 1);
-  await sleep(100);
+  engine.addMessage("main", "s1", "user", "u1");
+  engine.addMessage("main", "s1", "user", "u2");
+  engine.addMessage("main", "s1", "user", "u3");
+  await sleep(50);
   assert.equal(flushes.length, 0);
 
-  addTurn(engine, "main", "s1", 2);
+  engine.addMessage("main", "s1", "assistant", "a1");
   await waitFor(() => flushes.length === 1, 2000);
-  assert.deepEqual(flushes[0], ["user", "assistant", "user", "assistant"]);
+  assert.deepEqual(flushes[0], ["user:u1", "user:u2", "user:u3", "assistant:a1"]);
 });
 
 function deferred() {

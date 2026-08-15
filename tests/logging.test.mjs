@@ -91,6 +91,24 @@ test("content logging requires logOperations + debug level + logContent and is j
   assert.equal(enabled.records[0].message.includes("first\nsecond"), false);
 });
 
+test("raw MCP transport content is permanently suppressed even in full debug mode", () => {
+  const { sink, records } = makeSink();
+  const logger = createGraphitiLogger(sink, {
+    logOperations: true,
+    logLevel: "debug",
+    logContent: true,
+  });
+
+  logger.debugContent("mcp_raw_request", { baseUrl: "http://127.0.0.1:8000/mcp/" }, {
+    raw: "POST /mcp {\"method\":\"tools/call\"}",
+  });
+  logger.debugContent("mcp_raw_response", { baseUrl: "http://127.0.0.1:8000/mcp/" }, {
+    raw: "HTTP 200 text/event-stream data: {...}",
+  });
+
+  assert.equal(records.length, 0);
+});
+
 test("debug falls back to info when the host logger lacks a debug method", () => {
   const { sink, records } = makeSink(false);
   const logger = createGraphitiLogger(sink, {

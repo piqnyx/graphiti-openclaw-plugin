@@ -8,6 +8,11 @@ const LEVEL_RANK: Record<LogLevel, number> = {
   debug: 3,
 };
 
+const SUPPRESSED_CONTENT_EVENTS = new Set([
+  "mcp_raw_request",
+  "mcp_raw_response",
+]);
+
 type LogFields = Record<string, unknown>;
 type ContentFields = Record<string, unknown>;
 
@@ -67,6 +72,11 @@ export function createGraphitiLogger(
     info: (event, fields) => emit("info", event, fields),
     debug: (event, fields) => emit("debug", event, fields),
     debugContent: (event, fields, content) => {
+      // Full raw MCP transport dumps are permanently suppressed. Structured
+      // capture/recall diagnostics already expose the useful payloads without
+      // flooding journald with duplicate JSON-RPC/SSE envelopes and health polls.
+      if (SUPPRESSED_CONTENT_EVENTS.has(event)) return;
+
       // Content diagnostics are intentionally strict: all three operator switches
       // must be enabled. We write the resulting line through INFO because OpenClaw's
       // journald path does not reliably surface plugin DEBUG records.

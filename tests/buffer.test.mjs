@@ -8,19 +8,17 @@ async function waitFor(predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
-    await sleep(100);
+    await sleep(10);
   }
   assert.fail("condition was not met before timeout");
 }
 
 function deferred() {
   let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
+  const promise = new Promise((res) => {
     resolve = res;
-    reject = rej;
   });
-  return { promise, resolve, reject };
+  return { promise, resolve };
 }
 
 const agents = {
@@ -30,8 +28,6 @@ const agents = {
 function addTurn(engine, agentId, sessionKey, n) {
   engine.addTurn(agentId, sessionKey, `user-${n}`, `assistant-${n}`);
 }
-
-const TIMEOUT_TEST_WINDOW_MS = (CHECK_INTERVAL_SEC * 2 + 10) * 1000;
 
 test("odd bufferLimit is rejected so a completed turn cannot be split", () => {
   assert.throws(
@@ -54,7 +50,7 @@ test("limit trigger flushes exactly at an even message limit", async (t) => {
   t.after(() => engine.stop());
 
   addTurn(engine, "main", "s1", 1);
-  await sleep(50);
+  await sleep(20);
   assert.equal(flushes.length, 0);
 
   addTurn(engine, "main", "s1", 2);
@@ -70,18 +66,19 @@ test("limit trigger flushes exactly at an even message limit", async (t) => {
   assert.equal(engine.queueLength(), 0);
 });
 
-test("buffers are isolated per session within an agent", async (t) => {
+test("buffers are isolated per session within an agent", () => {
   const flushes = [];
   const engine = new BufferEngine(agents, 4, 3600, async (_agentId, entry) => {
     flushes.push(entry.buffer.sessionKey);
   });
-  t.after(() => engine.stop());
-
-  addTurn(engine, "main", "sA", 1);
-  addTurn(engine, "main", "sB", 2);
-
-  assert.equal(engine.activeBufferCount("main"), 2);
-  assert.equal(flushes.length, 0);
+  try {
+    addTurn(engine, "main", "sA", 1);
+    addTurn(engine, "main", "sB", 2);
+    assert.equal(engine.activeBufferCount("main"), 2);
+    assert.equal(flushes.length, 0);
+  } finally {
+    engine.stop();
+  }
 });
 
 test("FIFO queue per agent preserves chronological order", async (t) => {
@@ -143,17 +140,53 @@ test("failed sink drops only that detached buffer and reports the error", async 
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
 });
 
-test("timeout detection flushes a complete turn on the real ticker", async (t) => {
+test("timeout ticker flushes a complete turn exactly after the configured inactivity", async (t) => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const originalNow = Date.now;
+  let scheduled;
+  let scheduledMs;
+  let now = 1_700_000_000_000;
+
+  globalThis.setInterval = (callback, ms) => {
+    scheduled = callback;
+    scheduledMs = ms;
+    return { unref() {} };
+  };
+  globalThis.clearInterval = () => {};
+  Date.now = () => now;
+  t.after(() => {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    Date.now = originalNow;
+  });
+
   const flushes = [];
   const engine = new BufferEngine(agents, 50, 30, async (_agentId, entry, reason) => {
-    flushes.push({ sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, reason });
+    flushes.push({
+      sessionKey: entry.buffer.sessionKey,
+      count: entry.buffer.messages.length,
+      reason,
+      enqueuedAt: entry.enqueuedAt,
+    });
   });
-  t.after(() => engine.stop());
 
+  assert.equal(scheduledMs, CHECK_INTERVAL_SEC * 1000);
   addTurn(engine, "main", "session-a", 1);
 
-  await waitFor(() => flushes.some((f) => f.sessionKey === "session-a"), TIMEOUT_TEST_WINDOW_MS);
-  const dispatched = flushes.find((f) => f.sessionKey === "session-a");
-  assert.deepEqual(dispatched, { sessionKey: "session-a", count: 2, reason: "timeout" });
+  now += 29_999;
+  scheduled();
+  await sleep(0);
+  assert.equal(flushes.length, 0);
+
+  now += 1;
+  scheduled();
+  await waitFor(() => flushes.length === 1, 500);
+  assert.deepEqual(flushes[0], {
+    sessionKey: "session-a",
+    count: 2,
+    reason: "timeout",
+    enqueuedAt: now,
+  });
   assert.equal(engine.activeBufferCount("main"), 0);
 });

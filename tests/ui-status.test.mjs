@@ -131,11 +131,14 @@ test("capture failures publish error-only plugin session status", async (t) => {
   const { hooks, extensions, descriptors, patches, api } = makeApi();
   register(api);
 
-  assert.equal(extensions.length, 1);
+  assert.equal(extensions.length, 2);
   assert.equal(extensions[0].namespace, "capture-status");
-  assert.equal(descriptors.length, 1);
+  assert.equal(extensions[1].namespace, "backend-queue-status");
+  assert.equal(descriptors.length, 2);
   assert.equal(descriptors[0].id, "capture-error");
   assert.equal(descriptors[0].surface, "session");
+  assert.equal(descriptors[1].id, "backend-queue-error");
+  assert.equal(descriptors[1].surface, "session");
 
   const sessionKey = "agent:main:web:status-test";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };

@@ -6,11 +6,12 @@ import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION } from "./mcp-client.js";
 import {
   buildRecallBlock,
-  extractCompletedTurn,
+  extractConversationMessages,
   prepareRecallQuery,
   SESSION_RESET_PROMPT_PREFIX,
   SLUG_GENERATOR_SESSION_KEY,
 } from "./text.js";
+import { TranscriptDeltaTracker } from "./transcript-delta.js";
 import type {
   AgentEndEvent,
   BeforePromptBuildEvent,
@@ -81,6 +82,7 @@ export function register(api: OpenClawPluginApi): void {
     );
   });
   const sequences = new EpisodeSequenceTracker();
+  const transcriptDeltas = new TranscriptDeltaTracker();
   const hydratedSequences = new Set<string>();
   const lastSessionByAgent = new Map<string, string>();
   const backendReportedSessionByAgent = new Map<string, string>();
@@ -584,14 +586,6 @@ export function register(api: OpenClawPluginApi): void {
   if (cfg.autoCapture) {
     api.on("agent_end", (rawEvent: unknown, ctx?: HookContext): void => {
       const event = rawEvent as AgentEndEvent;
-      if (!event.success) {
-        logger.debug("capture_skipped", {
-          agentId: ctx?.agentId,
-          reason: "agent_run_failed",
-          durationMs: event.durationMs,
-        });
-        return;
-      }
       if (isBackgroundRun(ctx ?? {})) {
         logger.debug("capture_skipped", {
           agentId: ctx?.agentId,
@@ -618,37 +612,45 @@ export function register(api: OpenClawPluginApi): void {
 
       lastSessionByAgent.set(agentId, sessionKey);
 
-      const turn = extractCompletedTurn(Array.isArray(event.messages) ? event.messages : []);
-      if (!turn) {
+      const snapshot = extractConversationMessages(Array.isArray(event.messages) ? event.messages : []);
+      const delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
+      if (delta.length === 0) {
         logger.debug("capture_skipped", {
           agentId,
           group_id: agentId,
           sessionKey,
-          reason: "no_completed_turn",
-          messageCount: Array.isArray(event.messages) ? event.messages.length : 0,
+          reason: "no_new_conversation_messages",
+          eventSuccess: event.success,
+          snapshotMessages: snapshot.length,
         });
         return;
       }
 
+      const userMessages = delta.filter((message) => message.role === "user").length;
+      const assistantMessages = delta.length - userMessages;
       logger.debugContent(
-        "capture_turn",
+        "capture_messages",
         {
           agentId,
           group_id: agentId,
           sessionKey,
-          userChars: turn.user.length,
-          assistantChars: turn.assistant.length,
+          messages: delta.length,
+          userMessages,
+          assistantMessages,
+          eventSuccess: event.success,
+          durationMs: event.durationMs,
         },
-        { user: turn.user, assistant: turn.assistant },
+        { messages: delta },
       );
 
-      engine.addTurn(agentId, sessionKey, turn.user, turn.assistant);
+      engine.addMessages(agentId, sessionKey, delta);
     });
   }
 
   logger.info("plugin_loaded", {
     autoCapture: cfg.autoCapture,
     autoRecall: cfg.autoRecall,
+    captureMode: "message_delta",
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
     agents: Object.entries(cfg.agents).map(([agentId, actors]) =>

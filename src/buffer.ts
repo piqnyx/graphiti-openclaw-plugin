@@ -24,12 +24,13 @@ export type Buffer = {
   lastActivityAt: number;
 };
 
+export type FlushReason = "limit" | "timeout";
+
 export type QueueEntry = {
   buffer: Buffer;
   enqueuedAt: number;
+  reason: FlushReason;
 };
-
-export type FlushReason = "limit" | "timeout";
 
 export type AgentCaptureState = {
   agentId: string;
@@ -97,8 +98,8 @@ export class BufferEngine {
 
     // Flush an idle non-empty buffer before accepting fresh activity for the
     // same session. This keeps the timeout boundary deterministic.
-    if (now - buffer.lastActivityAt >= this.bufferTimeoutMs && this.eligibility(buffer)) {
-      agent.queue.push({ buffer, enqueuedAt: now });
+    if (now - buffer.lastActivityAt >= this.bufferTimeoutMs && this.isNonEmpty(buffer)) {
+      agent.queue.push({ buffer, enqueuedAt: now, reason: "timeout" });
       void this.pump(agent);
       buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
@@ -108,7 +109,7 @@ export class BufferEngine {
     buffer.lastActivityAt = now;
 
     if (buffer.messages.length >= this.bufferLimit) {
-      agent.queue.push({ buffer, enqueuedAt: now });
+      agent.queue.push({ buffer, enqueuedAt: now, reason: "limit" });
       void this.pump(agent);
       agent.activeBuffers.set(sessionKey, this.createBuffer(sessionKey, agentId));
     }
@@ -118,14 +119,6 @@ export class BufferEngine {
     for (const message of messages) {
       this.addMessage(agentId, sessionKey, message.role, message.text);
     }
-  }
-
-  /** Compatibility helper for older tests/callers; capture runtime uses addMessages(). */
-  addTurn(agentId: string, sessionKey: string, userText: string, assistantText: string): void {
-    this.addMessages(agentId, sessionKey, [
-      { role: "user", text: userText },
-      { role: "assistant", text: assistantText },
-    ]);
   }
 
   private actorsFor(agentId: string): AgentActors {
@@ -148,7 +141,7 @@ export class BufferEngine {
     };
   }
 
-  private eligibility(buffer: Buffer): boolean {
+  private isNonEmpty(buffer: Buffer): boolean {
     return buffer.messages.length > 0;
   }
 
@@ -172,10 +165,10 @@ export class BufferEngine {
     const now = Date.now();
     for (const agent of this.captureStates.values()) {
       for (const [sessionKey, buffer] of agent.activeBuffers) {
-        if (!this.eligibility(buffer)) continue;
+        if (!this.isNonEmpty(buffer)) continue;
         if (now - buffer.lastActivityAt >= this.bufferTimeoutMs) {
           agent.activeBuffers.delete(sessionKey);
-          agent.queue.push({ buffer, enqueuedAt: now });
+          agent.queue.push({ buffer, enqueuedAt: now, reason: "timeout" });
         }
       }
       void this.pump(agent);
@@ -188,7 +181,7 @@ export class BufferEngine {
     try {
       while (agent.queue.length > 0) {
         const entry = agent.queue[0];
-        const reason = this.detectReason(entry);
+        const reason = entry.reason;
         try {
           await this.sink(agent.agentId, entry, reason);
           agent.queue.shift();
@@ -204,17 +197,13 @@ export class BufferEngine {
           }
           agent.failureActive = true;
           // Keep the failed entry at queue[0]. The next ticker retries the same
-          // content, with the same saga sequence and caller-reserved UUID.
+          // content, reason, saga sequence and caller-reserved UUID.
           break;
         }
       }
     } finally {
       agent.processing = false;
     }
-  }
-
-  private detectReason(entry: QueueEntry): FlushReason {
-    return entry.buffer.messages.length >= this.bufferLimit ? "limit" : "timeout";
   }
 
   queueLength(): number {

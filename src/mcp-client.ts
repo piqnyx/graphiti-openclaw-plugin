@@ -22,6 +22,17 @@ export type SagaState = {
   episodeCount: number;
 };
 
+export type QueueStatus = {
+  groupId: string;
+  blocked: boolean;
+  attempts: number;
+  pending: number;
+  lastError?: string;
+  episodeUuid?: string;
+  episodeName?: string;
+  saga?: string;
+};
+
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -92,13 +103,20 @@ function decodeToolResult(result: unknown): JsonObject {
 
 function requiredString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`Graphiti get_saga returned invalid ${field}`);
+    throw new Error(`Graphiti returned invalid ${field}`);
   }
   return value;
 }
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function requiredNonnegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Graphiti returned invalid ${field}`);
+  }
+  return value;
 }
 
 export class GraphitiMcpClient {
@@ -153,11 +171,7 @@ export class GraphitiMcpClient {
       if (/^No saga named /.test(result.error)) return undefined;
       throw new Error(result.error);
     }
-    const episodeCount =
-      typeof result.episode_count === "number" ? result.episode_count : Number.NaN;
-    if (!Number.isInteger(episodeCount) || episodeCount < 0) {
-      throw new Error("Graphiti get_saga returned invalid episode_count");
-    }
+    const episodeCount = requiredNonnegativeInteger(result.episode_count, "episode_count");
     return {
       uuid: requiredString(result.uuid, "uuid"),
       name: requiredString(result.name, "name"),
@@ -167,6 +181,24 @@ export class GraphitiMcpClient {
       firstEpisodeUuid: optionalString(result.first_episode_uuid),
       lastEpisodeUuid: optionalString(result.last_episode_uuid),
       episodeCount,
+    };
+  }
+
+  async getQueueStatus(groupId: string): Promise<QueueStatus> {
+    const result = await this.callTool("get_queue_status", { group_id: groupId });
+    if (typeof result.error === "string") throw new Error(result.error);
+    if (typeof result.blocked !== "boolean") {
+      throw new Error("Graphiti get_queue_status returned invalid blocked");
+    }
+    return {
+      groupId: requiredString(result.group_id, "group_id"),
+      blocked: result.blocked,
+      attempts: requiredNonnegativeInteger(result.attempts, "attempts"),
+      pending: requiredNonnegativeInteger(result.pending, "pending"),
+      lastError: optionalString(result.last_error),
+      episodeUuid: optionalString(result.episode_uuid),
+      episodeName: optionalString(result.episode_name),
+      saga: optionalString(result.saga),
     };
   }
 

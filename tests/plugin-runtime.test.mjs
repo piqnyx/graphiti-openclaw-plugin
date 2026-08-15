@@ -64,6 +64,24 @@ function makeFetchRecorder(t, options = {}) {
         result: { structuredContent: { result }, content: [], isError: false },
       });
     }
+    if (payload.params.name === "get_queue_status") {
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: {
+          structuredContent: {
+            result: {
+              group_id: payload.params.arguments.group_id,
+              blocked: false,
+              attempts: 0,
+              pending: 0,
+            },
+          },
+          content: [],
+          isError: false,
+        },
+      });
+    }
     if (payload.params.name === "add_memory") {
       if (options.failAddMemoryOnce && !options.__failed) {
         options.__failed = true;
@@ -222,7 +240,7 @@ test("restart recovery continues persisted saga at episode 7", async (t) => {
   assert.equal(add.saga_previous_episode_uuid, "persisted-uuid-6");
 });
 
-test("capture strips Graphiti and OpenViking injections from completed turns", () => {
+test("capture strips Graphiti and OpenViking injections from message deltas", () => {
   const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug", logContent: true }));
   register(api);
 
@@ -237,10 +255,12 @@ test("capture strips Graphiti and OpenViking injections from completed turns", (
     { agentId: "main", sessionKey: "agent:main:web:conversation-a", trigger: "user" },
   );
 
-  const turnLog = logs.find((record) => record.includes("event=capture_turn"));
-  assert.ok(turnLog);
-  assert.doesNotMatch(turnLog, /viking injection/);
-  assert.doesNotMatch(turnLog, /graphiti injection/);
+  const captureLog = logs.find((record) => record.includes("event=capture_messages"));
+  assert.ok(captureLog);
+  assert.match(captureLog, /alpha/);
+  assert.match(captureLog, /beta/);
+  assert.doesNotMatch(captureLog, /viking injection/);
+  assert.doesNotMatch(captureLog, /graphiti injection/);
 });
 
 test("heartbeat, cron and subagent sessions are rejected before buffering", () => {
@@ -259,11 +279,11 @@ test("heartbeat, cron and subagent sessions are rejected before buffering", () =
   });
 
   assert.equal(logs.filter((line) => line.includes('reason="background_run"')).length, blocked.length);
-  assert.equal(logs.some((line) => line.includes("event=capture_turn")), false);
+  assert.equal(logs.some((line) => line.includes("event=capture_messages")), false);
 });
 
-test("agent_end with no assistant reply publishes nothing", () => {
-  const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug" }));
+test("agent_end with no assistant reply keeps the user message in capture", () => {
+  const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug", logContent: true }));
   register(api);
 
   hooks.get("agent_end")(
@@ -271,8 +291,34 @@ test("agent_end with no assistant reply publishes nothing", () => {
     { agentId: "main", sessionKey: "agent:main:web:conversation-a", trigger: "user" },
   );
 
-  assert.ok(logs.find((record) => record.includes("no_completed_turn")));
-  assert.equal(logs.find((record) => record.includes("event=capture_turn")), undefined);
+  const captureLog = logs.find((record) => record.includes("event=capture_messages"));
+  assert.ok(captureLog);
+  assert.match(captureLog, /hello без ответа/);
+  assert.match(captureLog, /userMessages=1/);
+  assert.match(captureLog, /assistantMessages=0/);
+});
+
+test("aborted agent_end still captures a new user message", async (t) => {
+  const toolCalls = makeFetchRecorder(t);
+  const { hooks, logs, api } = makeApi(
+    validConfig({ autoRecall: false, bufferLimit: 1, logLevel: "debug", logContent: true }),
+  );
+  register(api);
+
+  hooks.get("agent_end")(
+    {
+      success: false,
+      error: "AbortError",
+      messages: [{ role: "user", content: "сообщение после остановки" }],
+    },
+    { agentId: "main", sessionKey: "agent:main:web:aborted", trigger: "user" },
+  );
+
+  await waitFor(() => toolCalls.some((call) => call.name === "add_memory"));
+  const add = toolCalls.find((call) => call.name === "add_memory").arguments;
+  const body = JSON.parse(add.episode_body);
+  assert.deepEqual(body.messages, [{ role: "user", text: "сообщение после остановки" }]);
+  assert.ok(logs.some((record) => record.includes("event=capture_messages") && record.includes("eventSuccess=false")));
 });
 
 test("invalid agents config is rejected at plugin load", (t) => {

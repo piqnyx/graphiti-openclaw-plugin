@@ -7,7 +7,7 @@ import {
   type PersistedAgentCaptureState,
 } from "./buffer.js";
 import { CaptureSpool, type CaptureSpoolState } from "./capture-spool.js";
-import { parseConfig, type GraphitiPluginConfig } from "./config.js";
+import { DEFAULT_ACTORS, parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
@@ -62,10 +62,6 @@ function acceptedEpisodeUuid(result: Record<string, unknown>): string {
   return result.uuid;
 }
 
-function sequenceKey(agentId: string, sessionKey: string): string {
-  return JSON.stringify([agentId, sessionKey]);
-}
-
 function captureSnapshotStats(snapshot: { agents: PersistedAgentCaptureState[] } | undefined): {
   agents: number;
   activeBuffers: number;
@@ -105,8 +101,8 @@ export function register(api: OpenClawPluginApi): void {
   });
   const sequences = new EpisodeSequenceTracker();
   const transcriptDeltas = new TranscriptDeltaTracker();
-  const hydratedSequences = new Set<string>();
   const lastSessionByAgent = new Map<string, string>();
+  const unconfiguredAgentsReported = new Set<string>();
   const backendReportedSessionByAgent = new Map<string, string>();
   const backendFingerprintByAgent = new Map<string, string>();
 
@@ -406,12 +402,10 @@ export function register(api: OpenClawPluginApi): void {
   };
 
   const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
-    const key = sequenceKey(agentId, sessionKey);
-    if (hydratedSequences.has(key)) return;
+    if (sequences.isHydrated(agentId, sessionKey)) return;
 
     const saga = await fetchSagaState(agentId, sessionKey);
     sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
-    hydratedSequences.add(key);
     logger.debug("capture_sequence_hydrated", {
       agentId,
       group_id: agentId,
@@ -434,14 +428,32 @@ export function register(api: OpenClawPluginApi): void {
     sessionKey: string,
     identity: EpisodeIdentity,
   ): Promise<boolean> => {
-    const key = sequenceKey(agentId, sessionKey);
+    if (sequences.isHydrated(agentId, sessionKey)) {
+      // This process already established the sequence for the session, so its
+      // in-memory state is newer than anything get_saga can tell us.
+      const state = sequences.snapshot(agentId, sessionKey);
+      if (state.lastEpisodeUuid === identity.uuid) {
+        logger.info("capture_replay_already_persisted", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          name: identity.name,
+          batchNumber: identity.batchNumber,
+          uuid: identity.uuid,
+          action: "dropped_confirmed_batch",
+          source: "in_memory_sequence",
+        });
+        return true;
+      }
+      return false;
+    }
+
     const saga = await fetchSagaState(agentId, sessionKey);
 
     if (saga?.lastEpisodeUuid === identity.uuid) {
       // Graphiti holds this exact episode. Continue the chain from it instead of
       // creating a second episode with the same content.
       sequences.hydrate(agentId, sessionKey, identity.batchNumber, identity.uuid);
-      hydratedSequences.add(key);
       logger.info("capture_replay_already_persisted", {
         agentId,
         group_id: agentId,
@@ -455,9 +467,8 @@ export function register(api: OpenClawPluginApi): void {
     }
 
     sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
-    hydratedSequences.add(key);
 
-    const adopted = sequences.adoptPending(agentId, sessionKey, {
+    const reserved = {
       batchNumber: identity.batchNumber,
       episodeUuid: identity.uuid,
       name: identity.name,
@@ -465,7 +476,10 @@ export function register(api: OpenClawPluginApi): void {
       ...(identity.previousEpisodeUuid === undefined
         ? {}
         : { sagaPreviousEpisodeUuid: identity.previousEpisodeUuid }),
-    });
+    };
+    const adopted =
+      sequences.snapshot(agentId, sessionKey).pending === undefined &&
+      sequences.adoptPending(agentId, sessionKey, reserved);
 
     if (adopted) {
       logger.info("capture_replay_reserved_identity", {
@@ -854,11 +868,26 @@ export function register(api: OpenClawPluginApi): void {
 
       lastSessionByAgent.set(agentId, sessionKey);
 
+      // An agent missing from the config still gets captured, but under the
+      // default actor names and without backend queue monitoring. Say so once
+      // instead of letting a config typo change participant names silently.
+      if (!cfg.agents[agentId] && !unconfiguredAgentsReported.has(agentId)) {
+        unconfiguredAgentsReported.add(agentId);
+        logger.warn("capture_agent_unconfigured", {
+          agentId,
+          group_id: agentId,
+          configuredAgents: Object.keys(cfg.agents),
+          participants: DEFAULT_ACTORS,
+          backendQueueMonitoring: false,
+        });
+      }
+
       const snapshot = extractConversationMessages(Array.isArray(event.messages) ? event.messages : []);
       const delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
       if (delta.length === 0) {
-        // The watermark moved even though nothing new was captured; persist it so
-        // a restart resumes from the observed tail instead of guessing.
+        // Nothing new to capture, but the session was observed this far. Commit
+        // the watermark so a restart resumes here instead of guessing.
+        transcriptDeltas.commit(agentId, sessionKey);
         engine.checkpoint();
         logger.debug("capture_skipped", {
           agentId,
@@ -888,7 +917,28 @@ export function register(api: OpenClawPluginApi): void {
         { messages: delta },
       );
 
-      engine.addMessages(agentId, sessionKey, delta);
+      try {
+        engine.addMessages(agentId, sessionKey, delta);
+      } catch (error) {
+        // Buffering can only refuse after shutdown. Leaving the watermark where
+        // it was means the next process observes these messages again rather
+        // than treating them as captured.
+        logger.warn("capture_skipped", {
+          agentId,
+          group_id: agentId,
+          sessionKey,
+          reason: "engine_rejected_messages",
+          messages: delta.length,
+          error: errorText(error),
+          action: "watermark_not_advanced",
+        });
+        return;
+      }
+
+      // Observing is not capturing: the watermark only advances once the delta
+      // is in the buffer, and the checkpoint that follows makes both durable.
+      transcriptDeltas.commit(agentId, sessionKey);
+      engine.checkpoint();
     });
   }
 

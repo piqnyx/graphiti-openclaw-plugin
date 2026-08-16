@@ -86,6 +86,7 @@ test("a durable watermark resumes an aborted user-only tail without replaying it
   const before = new TranscriptDeltaTracker();
   // Run ended on a user message with no assistant reply, then the gateway stopped.
   assert.deepEqual(before.take("main", "s1", [u("old-u"), a("old-a"), u("u1")]), [u("u1")]);
+  before.commit("main", "s1");
   const carried = before.export();
   assert.equal(carried.length, 1);
   assert.equal(carried[0].sessionKey, "s1");
@@ -102,6 +103,7 @@ test("a durable watermark resumes an aborted user-only tail without replaying it
 test("a durable watermark recovers a turn that was never observed before the restart", () => {
   const before = new TranscriptDeltaTracker();
   before.take("main", "s1", [u("u1"), a("a1")]);
+  before.commit("main", "s1");
   const carried = before.export();
 
   const after = new TranscriptDeltaTracker();
@@ -116,6 +118,7 @@ test("watermarks are content free, bounded and expire", () => {
   const tracker = new TranscriptDeltaTracker();
   const long = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? u(`u${i}`) : a(`a${i}`)));
   tracker.take("main", "s1", long);
+  tracker.commit("main", "s1");
 
   const [watermark] = tracker.export();
   assert.equal(watermark.tailHashes.length, 12, "only a bounded tail is persisted");
@@ -146,4 +149,32 @@ test("a rewritten transcript with no watermark match falls back to tail detectio
     tracker.take("main", "s1", [u("old-u"), a("old-a"), u("u1"), a("a1")]),
     [u("u1"), a("a1")],
   );
+});
+
+test("an uncommitted observation leaves the watermark behind", () => {
+  const tracker = new TranscriptDeltaTracker();
+  tracker.take("main", "s1", [u("u1"), a("a1")]);
+  tracker.commit("main", "s1");
+  const committed = tracker.export();
+
+  // Observed but never buffered: the watermark must not move.
+  tracker.take("main", "s1", [u("u1"), a("a1"), u("u2")]);
+  assert.deepEqual(tracker.export(), committed);
+
+  const after = new TranscriptDeltaTracker();
+  after.restore(committed);
+  assert.deepEqual(
+    after.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
+    [u("u2"), a("a2")],
+    "the unbuffered message is observed again by the next process",
+  );
+});
+
+test("tracked sessions are bounded", () => {
+  const tracker = new TranscriptDeltaTracker();
+  for (let i = 0; i < 80; i += 1) {
+    tracker.take("main", `s${i}`, [u(`u${i}`), a(`a${i}`)]);
+    tracker.commit("main", `s${i}`);
+  }
+  assert.equal(tracker.export().length, 64);
 });

@@ -2,11 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  buildRecallBlock,
   buildRecallBlockDetailed,
   buildRecallQuery,
   extractConversationMessages,
-  prepareRecallQuery,
   stripInjectedContexts,
 } from "../dist/text.js";
 
@@ -59,9 +57,10 @@ test("conversation extraction sanitizes injected wrappers from every captured me
 });
 
 test("single-message recall query keeps the newest tail after sanitization", () => {
-  const query = prepareRecallQuery(
+  const query = buildRecallQuery(
     "<openviking-context>very long injected text</openviking-context>abcdefghijk",
-    5,
+    [],
+    { useHistory: false, historyMaxMessages: 1, historyMaxChars: 100, maxChars: 5 },
   );
   assert.equal(query, "ghijk");
 });
@@ -129,7 +128,7 @@ test("history-aware recall query obeys history and total char budgets while pres
 
 test("recall XML never exceeds the configured character budget", () => {
   const maxChars = 260;
-  const block = buildRecallBlock(
+  const { block } = buildRecallBlockDetailed(
     [
       "short fact one",
       "x".repeat(500),

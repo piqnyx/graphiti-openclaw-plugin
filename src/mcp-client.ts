@@ -123,6 +123,7 @@ export class GraphitiMcpClient {
   private sessionId?: string;
   private protocolVersion = "2025-06-18";
   private initialized = false;
+  private initializing?: Promise<void>;
   private nextId = 1;
   private readonly rawLogger?: (kind: "request" | "response", body: string) => void;
 
@@ -216,23 +217,35 @@ export class GraphitiMcpClient {
 
   private async callTool(name: string, args: JsonObject): Promise<JsonObject> {
     await this.ensureInitialized();
+
+    let response: JsonRpcResponse;
     try {
-      const response = await this.rpc("tools/call", { name, arguments: args });
-      return decodeToolResult(response.result);
+      response = await this.rpc("tools/call", { name, arguments: args });
     } catch (error) {
+      // Only a transport-level session loss may be retried. A tool that ran and
+      // answered with an error must never be re-sent: for add_memory that would
+      // submit the same episode twice.
       if (!this.initialized) throw error;
       if (!/404|session/i.test(errorMessage(error))) throw error;
 
       this.resetSession();
       await this.ensureInitialized();
-      const response = await this.rpc("tools/call", { name, arguments: args });
-      return decodeToolResult(response.result);
+      response = await this.rpc("tools/call", { name, arguments: args });
     }
+    return decodeToolResult(response.result);
   }
 
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
+    // Concurrent callers (capture flush plus the backend health poll) must share
+    // one handshake instead of racing two sessions onto the same client.
+    this.initializing ??= this.initialize().finally(() => {
+      this.initializing = undefined;
+    });
+    await this.initializing;
+  }
 
+  private async initialize(): Promise<void> {
     const response = await this.rpc(
       "initialize",
       {

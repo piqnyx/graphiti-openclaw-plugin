@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { DEFAULT_CONFIG, MIN_BUFFER_TIMEOUT_SEC, parseConfig } from "../dist/config.js";
 
 test("capture defaults: buffer fields and per-agent canonical actors", () => {
@@ -124,4 +125,13 @@ test("obsolete v0.1 buffer flags are rejected", () => {
 
 test("unknown keys still fail closed", () => {
   assert.throws(() => parseConfig({ oldOption: true }), /unknown plugin config key/);
+});
+
+test("the manifest config schema and the parser accept exactly the same keys", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+  const schemaKeys = Object.keys(manifest.configSchema.properties).sort();
+  const parsedKeys = Object.keys(parseConfig({})).sort();
+
+  assert.deepEqual(parsedKeys, schemaKeys, "a key in one place and not the other silently breaks config");
+  assert.equal(manifest.configSchema.additionalProperties, false);
 });

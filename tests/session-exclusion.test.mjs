@@ -168,3 +168,27 @@ test("background runs never receive capture or recall by default", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("capturing for an agent missing from the config is reported once", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("offline");
+  };
+
+  try {
+    const { hooks, logs } = makeRuntime(baseConfig());
+    const ctx = { agentId: "purple", sessionKey: "agent:purple:web:1", trigger: "user" };
+
+    hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "hi" }] }, ctx);
+    hooks.get("agent_end")(
+      { success: true, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] },
+      ctx,
+    );
+
+    const warnings = logs.filter((line) => line.includes("event=capture_agent_unconfigured"));
+    assert.equal(warnings.length, 1, "reported once per agent, not per turn");
+    assert.match(warnings[0], /agentId="purple"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -277,3 +277,74 @@ test("raw logger receives full request and response bodies", async (t) => {
   assert.ok(raws.some((r) => r.kind === "request" && r.body.includes("33333333-3333-4333-8333-333333333333")));
   assert.ok(raws.some((r) => r.kind === "response" && r.body.includes("uuid")));
 });
+
+test("a tool that answered with an error is never re-sent", async (t) => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    if (payload.method === "initialize") {
+      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+    }
+    if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+    calls.push(payload.params.name);
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: {
+        // A tool-level failure whose text happens to mention a session must not
+        // look like a transport session loss.
+        isError: true,
+        content: [{ type: "text", text: "saga 'agent:main:web:session-1' is invalid" }],
+      },
+    });
+  };
+
+  const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
+  await assert.rejects(
+    client.addMemory({
+      uuid: "u-1",
+      name: "s-1",
+      jsonBody: "{}",
+      groupId: "main",
+      saga: "agent:main:web:session-1",
+      referenceTime: "2026-08-16T00:00:00.000Z",
+      previousEpisodeUuids: [],
+    }),
+    /is invalid/,
+  );
+  assert.deepEqual(calls, ["add_memory"], "exactly one submission");
+});
+
+test("concurrent first calls share a single MCP handshake", async (t) => {
+  const methods = [];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    methods.push(payload.method);
+    if (payload.method === "initialize") {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+    }
+    if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: {
+        structuredContent: {
+          result: { group_id: payload.params.arguments.group_id, blocked: false, attempts: 0, pending: 0 },
+        },
+      },
+    });
+  };
+
+  const client = new GraphitiMcpClient("http://127.0.0.1:8000/mcp/", 1000);
+  await Promise.all([client.getQueueStatus("main"), client.getQueueStatus("igor")]);
+  assert.equal(methods.filter((method) => method === "initialize").length, 1);
+});

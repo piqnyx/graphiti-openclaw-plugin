@@ -93,10 +93,6 @@ function keepTail(text: string, maxChars: number): string {
   return text.slice(-maxChars).trimStart();
 }
 
-export function prepareRecallQuery(text: string, maxChars: number): string {
-  return keepTail(sanitizeConversationText(text), maxChars).trim();
-}
-
 function formatRecallMessage(message: ConversationMessage): string {
   return `[${message.role}] ${message.text}`;
 }
@@ -186,8 +182,4 @@ export function buildRecallBlockDetailed(
     injectedFacts: lines.length,
     skippedFacts,
   };
-}
-
-export function buildRecallBlock(facts: readonly string[], maxChars: number): string | undefined {
-  return buildRecallBlockDetailed(facts, maxChars).block;
 }

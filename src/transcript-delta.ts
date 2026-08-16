@@ -4,6 +4,8 @@ import type { ConversationMessage } from "./text.js";
 export const WATERMARK_TAIL_MESSAGES = 12;
 /** Most recent sessions kept in the durable watermark set. */
 export const WATERMARK_MAX_SESSIONS = 64;
+/** Most recent sessions whose full transcript is held in memory for delta computation. */
+export const MAX_TRACKED_SESSIONS = 64;
 /** Watermarks older than this are dropped; an older session falls back to tail detection. */
 export const WATERMARK_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -112,19 +114,53 @@ function commonPrefixLength(
   return i;
 }
 
+type PendingObservation = {
+  agentId: string;
+  sessionKey: string;
+  messages: ConversationMessage[];
+};
+
 export class TranscriptDeltaTracker {
   private readonly snapshots = new Map<string, ConversationMessage[]>();
   private readonly watermarks = new Map<string, SessionWatermark>();
+  private readonly pendingObservations = new Map<string, PendingObservation>();
 
   take(agentId: string, sessionKey: string, snapshot: readonly ConversationMessage[]): ConversationMessage[] {
     const key = JSON.stringify([agentId, sessionKey]);
     const current = snapshot.map((message) => ({ ...message }));
     const previous = this.snapshots.get(key);
-    this.snapshots.set(key, current);
 
-    const delta = this.computeDelta(key, previous, current);
-    this.recordWatermark(key, agentId, sessionKey, current);
-    return delta;
+    // Re-insert so Map iteration order stays least-recently-used first.
+    this.snapshots.delete(key);
+    this.snapshots.set(key, current);
+    this.pendingObservations.set(key, { agentId, sessionKey, messages: current });
+    this.pruneSessions();
+
+    return this.computeDelta(key, previous, current);
+  }
+
+  /**
+   * Advance the durable watermark for a session.
+   *
+   * Called only once the delta returned by take() is safely buffered. Observing
+   * a message is not the same as capturing it: if buffering failed, the
+   * watermark must stay behind so the next process re-observes those messages
+   * instead of treating them as already captured.
+   */
+  commit(agentId: string, sessionKey: string): void {
+    const key = JSON.stringify([agentId, sessionKey]);
+    const observation = this.pendingObservations.get(key);
+    if (!observation || observation.messages.length === 0) return;
+
+    this.watermarks.delete(key);
+    this.watermarks.set(key, {
+      agentId,
+      sessionKey,
+      tailHashes: observation.messages.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
+      observedMessages: observation.messages.length,
+      updatedAt: Date.now(),
+    });
+    this.pendingObservations.delete(key);
   }
 
   private computeDelta(
@@ -169,20 +205,24 @@ export class TranscriptDeltaTracker {
     return current.slice(end + 1).map((message) => ({ ...message }));
   }
 
-  private recordWatermark(
-    key: string,
-    agentId: string,
-    sessionKey: string,
-    current: readonly ConversationMessage[],
-  ): void {
-    if (current.length === 0) return;
-    this.watermarks.set(key, {
-      agentId,
-      sessionKey,
-      tailHashes: current.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
-      observedMessages: current.length,
-      updatedAt: Date.now(),
-    });
+  /**
+   * Full transcripts are held per session to compute deltas. Without a bound a
+   * long-lived gateway would keep every transcript it has ever seen, so the
+   * least recently used sessions are dropped; they fall back to the durable
+   * watermark, or to boundary detection, on their next observation.
+   */
+  private pruneSessions(): void {
+    while (this.snapshots.size > MAX_TRACKED_SESSIONS) {
+      const oldest = this.snapshots.keys().next().value;
+      if (oldest === undefined) return;
+      this.snapshots.delete(oldest);
+      this.pendingObservations.delete(oldest);
+    }
+    while (this.watermarks.size > WATERMARK_MAX_SESSIONS) {
+      const oldest = this.watermarks.keys().next().value;
+      if (oldest === undefined) return;
+      this.watermarks.delete(oldest);
+    }
   }
 
   /** Bounded, content-free watermark set for the durable spool. */

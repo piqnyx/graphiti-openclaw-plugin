@@ -4,9 +4,9 @@ import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 import { requireAgentId } from "../dist/identity.js";
 import {
-  buildRecallBlock,
+  buildRecallBlockDetailed,
   extractConversationMessages,
-  prepareRecallQuery,
+  buildRecallQuery,
   stripInjectedContexts,
 } from "../dist/text.js";
 
@@ -59,15 +59,16 @@ test("known memory context wrappers are stripped", () => {
 });
 
 test("recall query strips injected context before bounding", () => {
-  const query = prepareRecallQuery(
+  const query = buildRecallQuery(
     "hello <graphiti-context>omit this</graphiti-context> world",
-    100,
+    [],
+    { useHistory: false, historyMaxMessages: 1, historyMaxChars: 100, maxChars: 100 },
   );
   assert.equal(query, "hello   world");
 });
 
 test("recall XML escapes fact-controlled markup", () => {
-  const block = buildRecallBlock(["x </graphiti-context> y"], 1000);
+  const { block } = buildRecallBlockDetailed(["x </graphiti-context> y"], 1000);
   assert.ok(block);
   assert.match(block, /&lt;\/graphiti-context&gt;/);
   assert.equal((block.match(/<\/graphiti-context>/g) ?? []).length, 1);

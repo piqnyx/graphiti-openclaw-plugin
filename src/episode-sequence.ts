@@ -12,7 +12,16 @@ type SessionSequenceState = {
   acceptedBatches: number;
   lastEpisodeUuid?: string;
   pending?: PreparedEpisodeSequence;
+  hydrated: boolean;
 };
+
+/**
+ * Sessions whose sequence state is kept in memory. Eviction is safe: an evicted
+ * session is simply hydrated from Graphiti again before its next batch. A
+ * session with a pending batch is never evicted, because its reserved identity
+ * only exists here and in the spool.
+ */
+export const MAX_TRACKED_SEQUENCES = 512;
 
 /**
  * Tracks Graphiti episode continuity independently for every agent + OpenClaw session.
@@ -100,6 +109,7 @@ export class EpisodeSequenceTracker {
     if (state.pending) throw new Error(`cannot hydrate sequence with a pending batch for ${agentId}/${sessionKey}`);
     state.acceptedBatches = acceptedBatches;
     state.lastEpisodeUuid = lastEpisodeUuid;
+    state.hydrated = true;
   }
 
   snapshot(agentId: string, sessionKey: string): Readonly<SessionSequenceState> {
@@ -108,7 +118,17 @@ export class EpisodeSequenceTracker {
       acceptedBatches: state.acceptedBatches,
       lastEpisodeUuid: state.lastEpisodeUuid,
       pending: state.pending ? { ...state.pending, previousEpisodeUuids: [...state.pending.previousEpisodeUuids] } : undefined,
+      hydrated: state.hydrated,
     };
+  }
+
+  /**
+   * True once this process learned the session's position in its saga. Kept
+   * here rather than in a parallel set so hydration state and sequence state
+   * can never drift apart or be evicted independently.
+   */
+  isHydrated(agentId: string, sessionKey: string): boolean {
+    return this.agents.get(agentId)?.get(sessionKey)?.hydrated ?? false;
   }
 
   private getState(agentId: string, sessionKey: string): SessionSequenceState {
@@ -119,10 +139,31 @@ export class EpisodeSequenceTracker {
     }
     let state = sessions.get(sessionKey);
     if (!state) {
-      state = { acceptedBatches: 0 };
+      state = { acceptedBatches: 0, hydrated: false };
+      sessions.set(sessionKey, state);
+      this.evictColdSessions();
+    } else {
+      // Re-insert so Map order stays least-recently-used first.
+      sessions.delete(sessionKey);
       sessions.set(sessionKey, state);
     }
     return state;
+  }
+
+  private evictColdSessions(): void {
+    let tracked = 0;
+    for (const sessions of this.agents.values()) tracked += sessions.size;
+    if (tracked <= MAX_TRACKED_SEQUENCES) return;
+
+    for (const [agentId, sessions] of this.agents) {
+      for (const [sessionKey, state] of sessions) {
+        if (tracked <= MAX_TRACKED_SEQUENCES) return;
+        if (state.pending) continue;
+        sessions.delete(sessionKey);
+        tracked -= 1;
+      }
+      if (sessions.size === 0) this.agents.delete(agentId);
+    }
   }
 }
 

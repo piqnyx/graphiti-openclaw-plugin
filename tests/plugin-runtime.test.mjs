@@ -506,3 +506,31 @@ test("invalid agents config is rejected at plugin load", (t) => {
   const { api } = makeApi(validConfig({ agents: { main: { user: "Вит" } } }));
   assert.throws(() => register(api), /assistant/);
 });
+
+test("two restored batches of one session reconcile without resetting the sequence", async (t) => {
+  const stateDir = join(runtimeStateRoot, "reconcile-two-entries");
+  const failing = makeFetchRecorder(t, { failAddMemory: true });
+  const first = makeApi(validConfig({ autoRecall: false, bufferLimit: 2 }), stateDir);
+  register(first.api);
+
+  // Two batches detach while delivery keeps failing, so both are spooled.
+  first.hooks.get("agent_end")(completedTurn(1), restartCtx);
+  first.hooks.get("agent_end")(completedTurn(2), restartCtx);
+  await waitFor(() => failing.some((call) => call.name === "add_memory"));
+  await first.hooks.get("gateway_stop")();
+
+  const calls = makeFetchRecorder(t);
+  const second = makeApi(validConfig({ autoRecall: false, bufferLimit: 2 }), stateDir);
+  register(second.api);
+  await waitFor(() => calls.filter((call) => call.name === "add_memory").length === 2);
+  await second.hooks.get("gateway_stop")();
+
+  const adds = calls.filter((call) => call.name === "add_memory").map((call) => call.arguments);
+  assert.deepEqual(
+    adds.map((add) => add.name),
+    ["6bc2a77c6957-1", "6bc2a77c6957-2"],
+    "batch numbering continues instead of restarting",
+  );
+  assert.equal(adds[1].saga_previous_episode_uuid, adds[0].uuid, "the chain stays linked");
+  assert.equal(calls.filter((call) => call.name === "get_saga").length, 1, "one reconciliation per session");
+});

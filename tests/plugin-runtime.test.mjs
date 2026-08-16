@@ -173,7 +173,7 @@ function completedTurn(n) {
 
 test("runtime registers capture and recall; recall is agent-scoped, bounded and history-aware", async (t) => {
   const toolCalls = makeFetchRecorder(t);
-  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true, logModelInput: true }));
 
   register(api);
   assert.ok(hooks.has("agent_end"));
@@ -210,7 +210,7 @@ test("runtime registers capture and recall; recall is agent-scoped, bounded and 
 
 test("llm_input raw diagnostics expose the assembled Graphiti and OpenViking memory wrappers", (t) => {
   makeFetchRecorder(t);
-  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  const { hooks, logs, api } = makeApi(validConfig({ logLevel: "debug", logContent: true, logModelInput: true }));
   register(api);
 
   hooks.get("llm_input")(
@@ -240,6 +240,15 @@ test("llm_input raw diagnostics expose the assembled Graphiti and OpenViking mem
   assert.match(rawLog, /Graphiti memory/);
   assert.match(rawLog, /current user prompt/);
   assert.match(rawLog, /older message/);
+});
+
+test("llm_input diagnostics stay off until explicitly asked for", (t) => {
+  makeFetchRecorder(t);
+  // Content logging is normal during tuning; dumping the whole assembled prompt
+  // on every run is not, so it needs its own switch.
+  const { hooks, api } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  register(api);
+  assert.equal(hooks.has("llm_input"), false);
 });
 
 test("llm_input raw diagnostics are not registered unless all content logging switches are enabled", (t) => {

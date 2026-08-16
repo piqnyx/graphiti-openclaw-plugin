@@ -900,7 +900,9 @@ export function register(api: OpenClawPluginApi): void {
     );
   }
 
-  if (cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent) {
+  // Opt-in on top of the content switches: this dumps the whole assembled
+  // prompt, system instructions included, on every single run.
+  if (cfg.logModelInput && cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent) {
     api.on("llm_input", (rawEvent: unknown, ctx?: HookContext): void => {
       const event = rawEvent as LlmInputEvent;
       logger.debugContent(
@@ -1049,7 +1051,8 @@ export function register(api: OpenClawPluginApi): void {
     recallHistoryMaxChars: cfg.recallHistoryMaxChars,
     logLevel: cfg.logLevel,
     logContent: cfg.logContent,
-    rawModelInputLogging: cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent,
+    rawModelInputLogging:
+      cfg.logModelInput && cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent,
     captureErrorUiStatus: Boolean(
       api.session?.state?.registerSessionExtension &&
         api.session?.controls?.registerControlUiDescriptor &&

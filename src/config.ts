@@ -24,6 +24,7 @@ export type GraphitiPluginConfig = {
   logOperations: boolean;
   logLevel: LogLevel;
   logContent: boolean;
+  logModelInput: boolean;
   bufferLimit: number;
   bufferTimeout: number;
   excludeSessionPatterns: string[];
@@ -47,6 +48,9 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logOperations: true,
   logLevel: "info",
   logContent: false,
+  // Off by default: the assembled model input is enormous and only useful when
+  // hunting a specific prompt-assembly question.
+  logModelInput: false,
   bufferLimit: 4,
   bufferTimeout: 900,
   // Defaults reproduce the background/slug-generator filtering that used to be
@@ -169,7 +173,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools", "agents",
+    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools", "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -192,6 +196,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logOperations: booleanValue(raw.logOperations, DEFAULT_CONFIG.logOperations, "logOperations"),
     logLevel: logLevelValue(raw.logLevel),
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
+    logModelInput: booleanValue(raw.logModelInput, DEFAULT_CONFIG.logModelInput, "logModelInput"),
     bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),

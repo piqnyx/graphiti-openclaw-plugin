@@ -4,7 +4,7 @@
   "description": "Graphiti companion plugin for OpenClaw",
   "activation": {
     "onStartup": true,
-    "onCapabilities": ["hook"]
+    "onCapabilities": ["hook", "tool"]
   },
   "configSchema": {
     "type": "object",

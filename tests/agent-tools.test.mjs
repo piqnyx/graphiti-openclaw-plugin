@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
@@ -202,4 +202,15 @@ test("a backend failure is reported, never thrown at the agent", async (t) => {
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
   assert.equal(result.details.ok, false);
   assert.match(result.content[0].text, /failed/i);
+});
+
+test("the manifest declares the tool capability the host needs to collect them", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+  const capabilities = manifest.activation.onCapabilities;
+
+  assert.ok(capabilities.includes("hook"), "capture and recall run on hooks");
+  assert.ok(
+    capabilities.includes("tool"),
+    "without the tool capability the host never collects graphiti_* tools, however correct the agent allowlist is",
+  );
 });

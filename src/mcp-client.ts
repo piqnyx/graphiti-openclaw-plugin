@@ -140,10 +140,12 @@ export class GraphitiMcpClient {
     name: string;
     jsonBody: string;
     groupId: string;
-    saga: string;
+    /** Omitted for standalone episodes such as agent notes, which belong to no dialog chronology. */
+    saga?: string;
     referenceTime: string;
     previousEpisodeUuids: string[];
     sagaPreviousEpisodeUuid?: string;
+    sourceDescription?: string;
   }): Promise<JsonObject> {
     const args: JsonObject = {
       uuid: params.uuid,
@@ -151,12 +153,12 @@ export class GraphitiMcpClient {
       episode_body: params.jsonBody,
       group_id: params.groupId,
       source: "json",
-      source_description: OPENCLAW_SOURCE_DESCRIPTION,
-      saga: params.saga,
+      source_description: params.sourceDescription ?? OPENCLAW_SOURCE_DESCRIPTION,
       reference_time: params.referenceTime,
       previous_episode_uuids: params.previousEpisodeUuids,
       custom_extraction_instructions: CUSTOM_EXTRACTION_PROMPT,
     };
+    if (params.saga) args.saga = params.saga;
     if (params.sagaPreviousEpisodeUuid) {
       args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
     }
@@ -201,6 +203,33 @@ export class GraphitiMcpClient {
       episodeName: optionalString(result.episode_name),
       saga: optionalString(result.saga),
     };
+  }
+
+  /**
+   * Entity search. Like searchFacts this is scoped to one group, which the fork
+   * resolves to that agent's physical graph.
+   */
+  async searchNodes(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
+    const result = await this.callTool("search_nodes", {
+      query,
+      group_ids: groupId,
+      max_nodes: limit,
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
+    return Array.isArray(result.nodes)
+      ? result.nodes.filter((node): node is JsonObject => isObject(node))
+      : [];
+  }
+
+  async getEpisodes(groupId: string, limit: number): Promise<JsonObject[]> {
+    const result = await this.callTool("get_episodes", {
+      group_ids: groupId,
+      max_episodes: limit,
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
+    return Array.isArray(result.episodes)
+      ? result.episodes.filter((episode): episode is JsonObject => isObject(episode))
+      : [];
   }
 
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {

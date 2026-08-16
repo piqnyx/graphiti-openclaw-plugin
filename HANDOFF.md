@@ -122,6 +122,7 @@ src/capture-spool.ts         atomic durable spool (batches + session watermarks)
 src/transcript-delta.ts      full-snapshot -> new-message delta + durable watermarks
 src/episode-sequence.ts      Saga numbering / caller UUID reservation
 src/session-filter.ts        excludeSessionPatterns matching for capture and recall
+src/tools.ts                 agent-visible graphiti_* tools
 src/identity.ts              fail-closed ctx.agentId validation
 src/types.ts                 OpenClaw plugin API / hook event types
 src/mcp-client.ts            Streamable HTTP MCP client
@@ -227,8 +228,9 @@ UI/status path best-effort: ошибка UI-state механизма не име
     "baseUrl": "http://127.0.0.1:8000/mcp/",
     "autoCapture": true,
     "autoRecall": true,
-    "bufferLimit": 30,
+    "bufferLimit": 20,
     "bufferTimeout": 900,
+    "agentTools": true,
     "excludeSessionPatterns": [
       ":cron:", ":heartbeat:", ":subagent:", "^cron$", "^heartbeat$", "^\\*\\*\\*$",
       "^agent:[^:]+:dreaming-"
@@ -639,6 +641,12 @@ capture_shutdown_complete
 capture_spool_load_failed
 capture_spool_write_recovered
 recall_skipped
+agent_tools_registered
+tool_recall
+tool_store
+tool_status
+tool_refused
+tool_failed
 recall_query
 recall_payload
 recall_completed

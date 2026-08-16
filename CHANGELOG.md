@@ -25,6 +25,13 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Structured logging with opt-in raw content diagnostics.
 - Regression tests for identity/session isolation, arbitrary role sequences, timeout/limit batching, abort capture, FIFO/retry, UUID continuity, Saga recovery, backend status, MCP shapes, logging and context stripping.
 
+### Added (agent tools)
+
+- `graphiti_recall`, `graphiti_search_entities`, `graphiti_episodes`, `graphiti_store` and `graphiti_status`, registered when the host exposes a tool API and `agentTools` is enabled.
+- Each tool resolves its agent from the invocation context and passes it as the Graphiti group; an excluded session cannot call them at all.
+- `graphiti_store` writes standalone episodes with no saga, so agent notes cannot fork a dialog's episode chain.
+- README documents every configuration key and every tool, including why no destructive tool is offered.
+
 ### Added (durability and session filtering)
 
 - Durable capture spool schema version 2 with automatic migration of version 1 files.

@@ -27,6 +27,7 @@ export type GraphitiPluginConfig = {
   bufferLimit: number;
   bufferTimeout: number;
   excludeSessionPatterns: string[];
+  agentTools: boolean;
   agents: Record<string, AgentActors>;
 };
 
@@ -50,6 +51,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   bufferTimeout: 900,
   // Defaults reproduce the background/slug-generator filtering that used to be
   // hardcoded. They are ordinary config: override or extend them freely.
+  agentTools: true,
   excludeSessionPatterns: [
     ":cron:",
     ":heartbeat:",
@@ -167,7 +169,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agents",
+    "logContent", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools", "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -193,6 +195,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
+    agentTools: booleanValue(raw.agentTools, DEFAULT_CONFIG.agentTools, "agentTools"),
     agents: agentsValue(raw.agents),
   };
 }

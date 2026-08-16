@@ -19,7 +19,9 @@ Tests in this repository exist to catch real regressions in memory routing, capt
 - **restart capture continuity** — a durable watermark resumes the transcript delta exactly where the previous process stopped: no replayed tail, no dropped turn;
 - **restart replay safety** — a batch already confirmed by `get_saga` is dropped, an unconfirmed one is replayed with its reserved caller UUID, name and predecessor;
 - **spool containment** — a failed durable write keeps every message in memory, is reported once, and is never surfaced as a capture transport failure;
-- **session exclusion** — an excluded session produces no MCP traffic in either direction;
+- **session exclusion** — an excluded session produces no MCP traffic in either direction, tools included;
+- **tool isolation** — every `graphiti_*` tool derives its group from the invocation context, refuses a run without a resolvable agent, and never throws a backend failure at the agent;
+- **note separation** — `graphiti_store` writes no saga, so an agent note cannot fork a dialog's episode chain;
 - **MCP shape** — caller UUID, `group_id`, `saga`, predecessor fields and `reference_time` match the fork contract;
 - **recall safety** — query sanitization happens before search and injected XML cannot be broken by fact text;
 - **logging privacy** — raw message/request content appears only with explicit debug content logging.

@@ -25,6 +25,10 @@
       "logContent": { "type": "boolean" },
       "bufferLimit": { "type": "integer", "minimum": 1, "maximum": 1000 },
       "bufferTimeout": { "type": "integer", "minimum": 30, "maximum": 604800 },
+      "agentTools": {
+        "type": "boolean",
+        "description": "Register the graphiti_* tools so agents can query and write memory on demand. Which agent may call which tool is still governed by the OpenClaw per-agent tool allowlist."
+      },
       "excludeSessionPatterns": {
         "type": "array",
         "maxItems": 64,

@@ -260,6 +260,32 @@ get_saga(saga_name=sessionKey, group_id=agentId)
 
 Это фильтр по **служебным sessions**, а не изоляция диалогов. Кросс-сессионная память внутри агента остаётся обязательной: факт из одной session должен находиться recall в другой session того же агента.
 
+## 8.3 Agent-visible tools
+
+Включаются ключом `agentTools` (по умолчанию `true`) и регистрируются только если host предоставляет tool API. Права на конкретный tool для конкретного агента остаются за OpenClaw allowlist — plugin не дублирует эту политику.
+
+```text
+graphiti_recall            поиск фактов в памяти агента
+graphiti_search_entities   поиск сущностей с их summary
+graphiti_episodes          последние закоммиченные батчи
+graphiti_store             одна durable-заметка
+graphiti_status            здоровье backend + позиция текущего диалога в саге
+```
+
+Инварианты:
+
+- agentId берётся из tool context и проходит `requireAgentId`; он же уходит как `group_id`. Tool физически не может обратиться к графу другого агента.
+- session, попавшая под `excludeSessionPatterns`, не может пользоваться tools вообще: то, что мы не записываем, не должно и запрашивать память.
+- `graphiti_store` пишет episode **без saga**. Saga — хронология одного диалога, которую ведёт capture pipeline; вставка заметки в эту цепочку разветвила бы predecessor links.
+- текст заметки проходит ту же санитизацию, что и capture, поэтому injected memory wrappers нельзя протащить обратно в граф через tool.
+- ошибка backend возвращается агенту текстом с `ok=false`, а не исключением.
+
+### 8.3.1 Почему нет destructive tools
+
+MCP-инструменты `delete_episode`, `delete_entity_edge` и `get_episode_entities` **не принимают `group_id`** и работают через общий driver, то есть по базе по умолчанию, а не по физическому графу агента. Дать агенту удаление поверх этого нельзя: изоляция, ради которой построен весь стек, на этом пути отсутствует.
+
+Условия, при которых `graphiti_forget` можно будет рассмотреть, перечислены в `TODO.md`; первым из них идёт group-scoped удаление на стороне форка.
+
 ## 9. Capture failure semantics
 
 ### 9.1 Ошибка до MCP acceptance

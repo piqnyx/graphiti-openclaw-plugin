@@ -53,9 +53,39 @@ export type SessionEntryLike = {
   pluginExtensions?: Record<string, Record<string, PluginJsonValue>>;
 };
 
+/** Context OpenClaw supplies when an agent invokes a plugin tool. */
+export type PluginToolContext = {
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  senderId?: string;
+  trigger?: string;
+};
+
+export type PluginToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details?: Record<string, unknown>;
+};
+
+export type PluginToolDefinition = {
+  name: string;
+  label: string;
+  description: string;
+  parameters: PluginJsonValue;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    ctx?: PluginToolContext,
+  ) => Promise<PluginToolResult>;
+};
+
 export type OpenClawPluginApi = {
   pluginConfig?: unknown;
   logger: PluginLogger;
+  registerTool?: (
+    toolOrFactory: PluginToolDefinition | ((ctx: PluginToolContext) => PluginToolDefinition),
+    opts?: { name?: string },
+  ) => void;
   on: (
     hookName: string,
     handler: (event: unknown, ctx?: HookContext) => unknown,

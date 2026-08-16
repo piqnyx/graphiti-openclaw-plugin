@@ -20,6 +20,7 @@ import {
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
+import { createGraphitiTools } from "./tools.js";
 import { TranscriptDeltaTracker } from "./transcript-delta.js";
 import type {
   AgentEndEvent,
@@ -701,6 +702,23 @@ export function register(api: OpenClawPluginApi): void {
     );
   }
 
+  if (cfg.agentTools && api.registerTool) {
+    const tools = createGraphitiTools({ cfg, client, logger, excludedSessionPatterns });
+    for (const tool of tools) {
+      // Registered per invocation context so each call resolves its own agent
+      // and session; the tool can never act on another agent's graph.
+      api.registerTool((ctx) => ({ ...tool, execute: (id, params) => tool.execute(id, params, ctx) }), {
+        name: tool.name,
+      });
+    }
+    logger.info("agent_tools_registered", { tools: tools.map((tool) => tool.name) });
+  } else if (cfg.agentTools && !api.registerTool) {
+    logger.warn("agent_tools_unavailable", {
+      reason: "host_does_not_expose_registerTool",
+      action: "capture_and_recall_continue_normally",
+    });
+  }
+
   if (cfg.autoRecall) {
     api.on(
       "before_prompt_build",
@@ -951,6 +969,7 @@ export function register(api: OpenClawPluginApi): void {
     captureDurableSpool: Boolean(captureSpool),
     captureSpoolPath: captureSpool?.path,
     excludeSessionPatterns: cfg.excludeSessionPatterns,
+    agentTools: cfg.agentTools && Boolean(api.registerTool),
     restoredCaptureMessages: captureSnapshotStats(restoredCaptureState).messages,
     agents: Object.entries(cfg.agents).map(([agentId, actors]) =>
       `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,

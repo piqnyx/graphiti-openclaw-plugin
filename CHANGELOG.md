@@ -44,6 +44,8 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Fixed
 
+- One capture pipeline per process instead of one per `register()` call. OpenClaw registers the plugin once per host surface, so a start with unsent messages gave every instance the same restored buffer and every instance flushed it: one batch became several episodes with the same name and different UUIDs, and the saga's `NEXT_EPISODE` chain forked. Observed live after a restart with a non-empty spool.
+- The backend queue poller now runs once per process rather than once per registration.
 - The durable watermark advances only after a delta is buffered, so a delta the engine refused is observed again by the next process instead of being recorded as captured.
 - The transcript delta tracker no longer keeps the full transcript of every session it has ever seen.
 - Reconciling a restored batch no longer re-hydrates a sequence this process already established, which could move the batch number backwards.

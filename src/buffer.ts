@@ -371,6 +371,11 @@ export class BufferEngine {
     return { agents };
   }
 
+  /** True once shutdown() or stop() has run; a stopped engine accepts no new capture. */
+  isStopped(): boolean {
+    return this.stopped;
+  }
+
   /** Checkpoint state that changed outside the engine (transcript watermarks, episode identity). */
   checkpoint(): void {
     this.persistState();

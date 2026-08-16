@@ -1,35 +1,48 @@
 /**
- * Session key exclusion, shared by capture and recall.
+ * Session exclusion, shared by capture and recall.
  *
- * Patterns use the same glob dialect as the OpenViking plugin's
- * bypassSessionPatterns, so one mental model covers both memory layers:
+ * There is exactly one source of truth for "this session must not touch
+ * Graphiti": the `excludeSessionPatterns` config list. Each entry is a
+ * JavaScript regular expression source, unanchored, tested against:
  *
- *   *  matches within a single ":" segment
- *   ** matches across segments
+ *   1. the OpenClaw session key (`agent:main:telegram:42`);
+ *   2. the run trigger (`cron`, `heartbeat`, `user`, ...), so a background run
+ *      is still excluded when its session key carries no marker.
  *
- * Example: `agent:*:dreaming-**` excludes every dreaming session of every agent.
+ * Anchor a pattern when you mean it: `:cron:` matches anywhere inside the key,
+ * `^cron$` matches the trigger exactly.
  */
+export type SessionExclusion = {
+  pattern: string;
+  matched: "sessionKey" | "trigger";
+};
+
 export function compileSessionPattern(pattern: string): RegExp {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    // NUL is a placeholder for "**" because it can never occur in a session key.
-    .replace(/\*\*/g, "\u0000")
-    .replace(/\*/g, "[^:]*")
-    .replace(/\u0000/g, ".*");
-  return new RegExp(`^${escaped}$`);
+  return new RegExp(pattern);
 }
 
 export function compileSessionPatterns(patterns: readonly string[]): RegExp[] {
   return patterns.map(compileSessionPattern);
 }
 
-/** An unknown session key can never match; the caller decides what that means. */
-export function matchesSessionPattern(
-  sessionKey: string | undefined,
+export function matchSessionExclusion(
+  ctx: { sessionKey?: string; trigger?: string },
   patterns: readonly RegExp[],
-): string | undefined {
+): SessionExclusion | undefined {
   if (patterns.length === 0) return undefined;
-  const candidate = typeof sessionKey === "string" ? sessionKey.trim() : "";
-  if (!candidate) return undefined;
-  return patterns.find((pattern) => pattern.test(candidate))?.source;
+
+  const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+  const trigger = typeof ctx.trigger === "string" ? ctx.trigger.trim() : "";
+
+  for (const pattern of patterns) {
+    // Patterns are compiled without the global flag, so lastIndex never carries
+    // over between calls and every test starts from the beginning.
+    if (sessionKey && pattern.test(sessionKey)) {
+      return { pattern: pattern.source, matched: "sessionKey" };
+    }
+    if (trigger && pattern.test(trigger)) {
+      return { pattern: pattern.source, matched: "trigger" };
+    }
+  }
+  return undefined;
 }

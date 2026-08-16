@@ -9,7 +9,6 @@ const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\
 const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
-export const SLUG_GENERATOR_SESSION_KEY = "***";
 export const SESSION_RESET_PROMPT_PREFIX = "A new session was started via /new or /reset";
 
 type ContentBlock = {

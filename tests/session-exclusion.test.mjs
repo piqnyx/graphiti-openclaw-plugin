@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compileSessionPatterns, matchesSessionPattern } from "../dist/session-filter.js";
+import { compileSessionPatterns, matchSessionExclusion } from "../dist/session-filter.js";
 import { parseConfig } from "../dist/config.js";
 import { register } from "../dist/index.js";
 
@@ -36,43 +36,77 @@ const baseConfig = (overrides = {}) => ({
   ...overrides,
 });
 
-test("glob patterns match within and across session key segments", () => {
-  const patterns = compileSessionPatterns([
-    "agent:*:dreaming-**",
-    "agent:*:cron:**",
-    "**:slug-generator",
-  ]);
+test("patterns are regular expressions tested against the session key", () => {
+  const patterns = compileSessionPatterns(["^agent:[^:]+:dreaming-", ":cron:"]);
 
-  assert.ok(matchesSessionPattern("agent:main:dreaming-narrative-memory-core-v2-rem-f00c", patterns));
-  assert.ok(matchesSessionPattern("agent:igor:cron:nightly:42", patterns));
-  assert.ok(matchesSessionPattern("agent:main:web:slug-generator", patterns));
-
-  assert.equal(matchesSessionPattern("agent:main:telegram:12345", patterns), undefined);
-  assert.equal(matchesSessionPattern("agent:main:web:conversation-a", patterns), undefined);
-  assert.equal(
-    matchesSessionPattern("agent:main:web:dreaming-lookalike", patterns),
-    undefined,
-    "a single * must not cross a segment boundary",
-  );
-  assert.equal(matchesSessionPattern(undefined, patterns), undefined);
-  assert.equal(matchesSessionPattern("agent:main:web:x", []), undefined);
-});
-
-test("pattern metacharacters in a session key are matched literally", () => {
-  const patterns = compileSessionPatterns(["agent:main:web:a.b+c"]);
-  assert.ok(matchesSessionPattern("agent:main:web:a.b+c", patterns));
-  assert.equal(matchesSessionPattern("agent:main:web:axbxc", patterns), undefined);
-});
-
-test("excludeSessionPatterns is validated and defaults to empty", () => {
-  assert.deepEqual(parseConfig({}).excludeSessionPatterns, []);
   assert.deepEqual(
-    parseConfig({ excludeSessionPatterns: ["agent:*:dreaming-**"] }).excludeSessionPatterns,
-    ["agent:*:dreaming-**"],
+    matchSessionExclusion({ sessionKey: "agent:main:dreaming-narrative-core-f00c" }, patterns),
+    { pattern: "^agent:[^:]+:dreaming-", matched: "sessionKey" },
   );
-  assert.throws(() => parseConfig({ excludeSessionPatterns: "agent:*" }), /must be an array/);
+  assert.equal(
+    matchSessionExclusion({ sessionKey: "agent:igor:cron:nightly:42" }, patterns).matched,
+    "sessionKey",
+  );
+  assert.equal(matchSessionExclusion({ sessionKey: "agent:main:telegram:12345" }, patterns), undefined);
+  assert.equal(matchSessionExclusion({}, patterns), undefined);
+  assert.equal(matchSessionExclusion({ sessionKey: "agent:main:web:x" }, []), undefined);
+});
+
+test("the same list also excludes by run trigger", () => {
+  const patterns = compileSessionPatterns(["^heartbeat$"]);
+
+  assert.deepEqual(
+    matchSessionExclusion({ sessionKey: "agent:main:web:plain-key", trigger: "heartbeat" }, patterns),
+    { pattern: "^heartbeat$", matched: "trigger" },
+  );
+  assert.equal(
+    matchSessionExclusion({ sessionKey: "agent:main:web:plain-key", trigger: "user" }, patterns),
+    undefined,
+  );
+});
+
+test("stateful regex flags cannot desynchronise repeated matching", () => {
+  const patterns = compileSessionPatterns([":cron:"]);
+  for (let i = 0; i < 5; i += 1) {
+    assert.ok(matchSessionExclusion({ sessionKey: "agent:main:cron:job" }, patterns), `attempt ${i}`);
+  }
+});
+
+test("excludeSessionPatterns defaults reproduce the old hardcoded filtering", () => {
+  const patterns = compileSessionPatterns(parseConfig({}).excludeSessionPatterns);
+
+  for (const sessionKey of [
+    "agent:main:cron:nightly",
+    "agent:main:heartbeat:1",
+    "agent:main:subagent:worker",
+    "***",
+  ]) {
+    assert.ok(matchSessionExclusion({ sessionKey }, patterns), sessionKey);
+  }
+  for (const trigger of ["cron", "heartbeat"]) {
+    assert.ok(matchSessionExclusion({ sessionKey: "agent:main:web:x", trigger }, patterns), trigger);
+  }
+
+  assert.equal(
+    matchSessionExclusion({ sessionKey: "agent:main:telegram:42", trigger: "user" }, patterns),
+    undefined,
+    "a real dialog is never excluded by the defaults",
+  );
+});
+
+test("excludeSessionPatterns is validated as regular expressions", () => {
+  assert.deepEqual(
+    parseConfig({ excludeSessionPatterns: ["^agent:[^:]+:dreaming-"] }).excludeSessionPatterns,
+    ["^agent:[^:]+:dreaming-"],
+  );
+  assert.deepEqual(parseConfig({ excludeSessionPatterns: [] }).excludeSessionPatterns, []);
+  assert.throws(() => parseConfig({ excludeSessionPatterns: "agent" }), /must be an array/);
   assert.throws(() => parseConfig({ excludeSessionPatterns: [""] }), /non-empty string/);
   assert.throws(() => parseConfig({ excludeSessionPatterns: [42] }), /non-empty string/);
+  assert.throws(
+    () => parseConfig({ excludeSessionPatterns: ["agent:[main"] }),
+    /not a valid regular expression/,
+  );
 });
 
 test("an excluded session is skipped by capture and by recall", async () => {
@@ -85,7 +119,7 @@ test("an excluded session is skipped by capture and by recall", async () => {
 
   try {
     const { hooks, logs } = makeRuntime(
-      baseConfig({ excludeSessionPatterns: ["agent:*:dreaming-**"] }),
+      baseConfig({ excludeSessionPatterns: ["^agent:[^:]+:dreaming-"] }),
     );
     const ctx = {
       agentId: "main",
@@ -114,7 +148,7 @@ test("an excluded session is skipped by capture and by recall", async () => {
   }
 });
 
-test("background runs never receive recall either", async () => {
+test("background runs never receive capture or recall by default", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     throw new Error("a background run must never reach Graphiti");
@@ -122,13 +156,14 @@ test("background runs never receive recall either", async () => {
 
   try {
     const { hooks, logs } = makeRuntime(baseConfig());
-    const result = await hooks.get("before_prompt_build")(
-      { prompt: "heartbeat prompt", messages: [] },
-      { agentId: "main", sessionKey: "agent:main:heartbeat:1", trigger: "heartbeat" },
-    );
+    const ctx = { agentId: "main", sessionKey: "agent:main:heartbeat:1", trigger: "heartbeat" };
+
+    hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "tick" }] }, ctx);
+    const result = await hooks.get("before_prompt_build")({ prompt: "heartbeat prompt", messages: [] }, ctx);
 
     assert.equal(result, undefined);
-    assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="background_run"')));
+    assert.ok(logs.some((line) => line.includes("event=capture_skipped") && line.includes('reason="excluded_session"')));
+    assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="excluded_session"')));
   } finally {
     globalThis.fetch = originalFetch;
   }

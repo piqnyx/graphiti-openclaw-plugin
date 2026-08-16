@@ -28,7 +28,8 @@
       "excludeSessionPatterns": {
         "type": "array",
         "maxItems": 64,
-        "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "description": "Regular expressions tested against the OpenClaw session key and the run trigger. A match excludes the session from both capture and recall. Replaces the previously hardcoded cron/heartbeat/subagent/slug-generator filtering; overriding this list overrides that too."
       },
       "agents": {
         "type": "object",

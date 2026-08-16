@@ -31,7 +31,7 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Per-session transcript watermarks in the spool, so a gateway restart neither replays a captured tail nor drops a turn whose `agent_end` never fired.
 - Reserved episode identity (`uuid`, `name`, `batchNumber`, predecessor) persisted before submission.
 - Restart reconciliation through read-only `get_saga`: a confirmed batch is dropped, an unconfirmed one is replayed with the same caller UUID instead of a new one.
-- `excludeSessionPatterns` config key applied to both capture and recall, using the same glob dialect as the OpenViking plugin.
+- `excludeSessionPatterns` config key: regular expressions tested against the session key and the run trigger, applied to both capture and recall. It replaces the hardcoded cron/heartbeat/subagent/slug-generator filtering, whose behaviour is now the default value of the list.
 - Regression coverage for restart replay, watermark resume, spool write failures, schema migration and session exclusion.
 
 ### Fixed

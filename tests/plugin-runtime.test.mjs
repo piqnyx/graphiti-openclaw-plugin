@@ -443,7 +443,7 @@ test("capture strips Graphiti and OpenViking injections from message deltas", ()
   assert.doesNotMatch(captureLog, /graphiti injection/);
 });
 
-test("heartbeat, cron and subagent sessions are rejected before buffering", () => {
+test("heartbeat, cron and subagent sessions are excluded by the default patterns", () => {
   const { hooks, logs, api } = makeApi(validConfig({ autoRecall: false, logLevel: "debug" }));
   register(api);
 
@@ -458,7 +458,7 @@ test("heartbeat, cron and subagent sessions are rejected before buffering", () =
     hooks.get("agent_end")(completedTurn(index + 1), { agentId: "main", ...ctx });
   });
 
-  assert.equal(logs.filter((line) => line.includes('reason="background_run"')).length, blocked.length);
+  assert.equal(logs.filter((line) => line.includes('reason="excluded_session"')).length, blocked.length);
   assert.equal(logs.some((line) => line.includes("event=capture_messages")), false);
 });
 

@@ -60,7 +60,7 @@ OpenClaw `agent_end` передаёт transcript snapshot, а не гарант�
 
 Capture pipeline:
 
-1. до работы с transcript отклоняются heartbeat, cron, subagent/background, slug-generator runs и sessions, попавшие под `excludeSessionPatterns`;
+1. до работы с transcript отклоняются sessions, попавшие под `excludeSessionPatterns` (см. 8.2);
 2. из snapshot остаются только `role=user|assistant`;
 3. text content извлекается и sanitizes;
 4. удаляются raw memory-injection blocks и известная OpenClaw metadata;
@@ -242,20 +242,28 @@ get_saga(saga_name=sessionKey, group_id=agentId)
 
 ## 8.2 Excluded sessions
 
-`excludeSessionPatterns` — список glob-паттернов session key, которые plugin игнорирует **и в capture, и в recall**. Диалект тот же, что у `bypassSessionPatterns` плагина OpenViking:
+`excludeSessionPatterns` — **единственный** источник правды о том, какие sessions plugin игнорирует. Применяется одинаково к capture и recall: session, которую мы не пишем, не должна и получать injected memory.
 
-```text
-*   внутри одного ":" сегмента
-**  через сегменты
-```
+Каждый элемент — исходник JavaScript-регулярки, unanchored. Проверяется по двум значениям:
 
-Пример:
+1. OpenClaw session key (`agent:main:telegram:42`);
+2. run trigger (`cron`, `heartbeat`, `user`, ...) — чтобы background run отсекался даже если в его session key нет маркера.
+
+Якорить нужно осознанно: `:cron:` ищется в любом месте ключа, `^cron$` совпадает ровно с trigger.
+
+Дефолт воспроизводит прежний hardcoded отсев и является обычным конфигом:
 
 ```json
-"excludeSessionPatterns": ["agent:*:dreaming-**"]
+"excludeSessionPatterns": [":cron:", ":heartbeat:", ":subagent:", "^cron$", "^heartbeat$", "^\\*\\*\\*$"]
 ```
 
-По умолчанию список пуст. Hardcoded отсев heartbeat/cron/subagent остаётся и применяется теперь также к recall: session, которую мы не пишем, не должна и получать injected memory.
+Если список переопределяется в конфиге, он переопределяется целиком — hardcoded отсева больше нет ни для чего. Невалидная регулярка отвергается при загрузке plugin вместе со всем конфигом.
+
+Пример добавления dreaming-сессий:
+
+```json
+"excludeSessionPatterns": [":cron:", ":heartbeat:", ":subagent:", "^cron$", "^heartbeat$", "^\\*\\*\\*$", "^agent:[^:]+:dreaming-"]
+```
 
 Это фильтр по **служебным sessions**, а не изоляция диалогов. Кросс-сессионная память внутри агента остаётся обязательной: факт из одной session должен находиться recall в другой session того же агента.
 

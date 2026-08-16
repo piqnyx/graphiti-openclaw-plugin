@@ -1,4 +1,5 @@
 import { MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
+import { compileSessionPattern } from "./session-filter.js";
 
 export { MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
 
@@ -47,7 +48,16 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logContent: false,
   bufferLimit: 4,
   bufferTimeout: 900,
-  excludeSessionPatterns: [],
+  // Defaults reproduce the background/slug-generator filtering that used to be
+  // hardcoded. They are ordinary config: override or extend them freely.
+  excludeSessionPatterns: [
+    ":cron:",
+    ":heartbeat:",
+    ":subagent:",
+    "^cron$",
+    "^heartbeat$",
+    "^\\*\\*\\*$",
+  ],
   agents: {
     main: { user: "Вит", assistant: "Краб" },
   },
@@ -118,7 +128,15 @@ function excludeSessionPatternsValue(raw: unknown): string[] {
         `excludeSessionPatterns[${index}] must be at most ${MAX_EXCLUDE_PATTERN_LENGTH} characters`,
       );
     }
-    return pattern.trim();
+    const trimmed = pattern.trim();
+    try {
+      compileSessionPattern(trimmed);
+    } catch (error) {
+      throw new Error(
+        `excludeSessionPatterns[${index}] is not a valid regular expression: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return trimmed;
   });
 }
 

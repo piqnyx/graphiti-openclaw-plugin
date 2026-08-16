@@ -545,7 +545,9 @@ export function register(api: OpenClawPluginApi): void {
 
       await ensureSequenceHydrated(agentId, sessionKey);
 
-      const sequence = sequences.prepare(agentId, sessionKey);
+      const episode: EpisodeJson = entry.buffer.episode;
+      const jsonBody = JSON.stringify(episode);
+      const sequence = sequences.prepare(agentId, sessionKey, jsonBody);
       // Record what we are about to submit before submitting it. If the answer is
       // lost with the process, the next start knows which episode to ask about.
       entry.episode = {
@@ -559,8 +561,6 @@ export function register(api: OpenClawPluginApi): void {
       };
       engine.checkpoint();
 
-      const episode: EpisodeJson = entry.buffer.episode;
-      const jsonBody = JSON.stringify(episode);
       const referenceTime = new Date(entry.enqueuedAt).toISOString();
 
       logger.debug("capture_flush_start", {

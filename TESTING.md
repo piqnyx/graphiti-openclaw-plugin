@@ -20,6 +20,7 @@ Tests in this repository exist to catch real regressions in memory routing, capt
 - **restart replay safety** — a batch already confirmed by `get_saga` is dropped, an unconfirmed one is replayed with its reserved caller UUID, name and predecessor;
 - **spool containment** — a failed durable write keeps every message in memory, is reported once, and is never surfaced as a capture transport failure;
 - **session exclusion** — an excluded session produces no MCP traffic in either direction, tools included;
+- **derived episode identity** — the same batch prepared twice yields the same UUID, and any change of agent, saga, batch number or body yields a different one;
 - **single capture pipeline** — repeated `register()` calls share one engine and one spool owner; a restart with unsent messages flushes the restored batch exactly once, and a stopped pipeline is replaced rather than inherited;
 - **tool isolation** — every `graphiti_*` tool derives its group from the invocation context, refuses a run without a resolvable agent, and never throws a backend failure at the agent;
 - **note separation** — `graphiti_store` writes no saga, so an agent note cannot fork a dialog's episode chain;

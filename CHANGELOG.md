@@ -42,6 +42,10 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - `excludeSessionPatterns` config key: regular expressions tested against the session key and the run trigger, applied to both capture and recall. It replaces the hardcoded cron/heartbeat/subagent/slug-generator filtering, whose behaviour is now the default value of the list.
 - Regression coverage for restart replay, watermark resume, spool write failures, schema migration and session exclusion.
 
+### Changed
+
+- Episode UUIDs are derived from the batch (agent, saga, batch number, body) instead of generated randomly, so two callers preparing the same batch reserve the same UUID and Graphiti merges the second submission onto the same node. Reservation still happens before the request and the server still echoes the value back.
+
 ### Fixed
 
 - One capture pipeline per process instead of one per `register()` call. OpenClaw registers the plugin once per host surface, so a start with unsent messages gave every instance the same restored buffer and every instance flushed it: one batch became several episodes with the same name and different UUIDs, and the saga's `NEXT_EPISODE` chain forked. Observed live after a restart with a non-empty spool.

@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EpisodeSequenceTracker, episodeNamePrefix } from "../dist/episode-sequence.js";
+import { EpisodeSequenceTracker, deriveEpisodeUuid, episodeNamePrefix } from "../dist/episode-sequence.js";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const BODY = JSON.stringify({ participants: { user: "U", assistant: "A" }, messages: [{ role: "user", text: "x" }] });
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 test("first batch has no predecessor and second batch chains to accepted UUID", () => {
   const tracker = new EpisodeSequenceTracker();
@@ -28,14 +29,14 @@ test("first batch has no predecessor and second batch chains to accepted UUID", 
 test("interleaved sessions of one agent never borrow each other's predecessor", () => {
   const tracker = new EpisodeSequenceTracker();
 
-  const a1 = tracker.prepare("main", "session:a");
+  const a1 = tracker.prepare("main", "session:a", BODY);
   tracker.accept("main", "session:a", a1.batchNumber, a1.episodeUuid);
 
-  const b1 = tracker.prepare("main", "session:b");
+  const b1 = tracker.prepare("main", "session:b", BODY);
   assert.deepEqual(b1.previousEpisodeUuids, []);
   tracker.accept("main", "session:b", b1.batchNumber, b1.episodeUuid);
 
-  const a2 = tracker.prepare("main", "session:a");
+  const a2 = tracker.prepare("main", "session:a", BODY);
   assert.deepEqual(a2.previousEpisodeUuids, [a1.episodeUuid]);
   assert.equal(a2.sagaPreviousEpisodeUuid, a1.episodeUuid);
   assert.equal(a2.batchNumber, 2);
@@ -43,18 +44,18 @@ test("interleaved sessions of one agent never borrow each other's predecessor", 
 
 test("same sessionKey under different agents is isolated", () => {
   const tracker = new EpisodeSequenceTracker();
-  const main1 = tracker.prepare("main", "same-session");
+  const main1 = tracker.prepare("main", "same-session", BODY);
   tracker.accept("main", "same-session", main1.batchNumber, main1.episodeUuid);
 
-  const igor1 = tracker.prepare("igor", "same-session");
+  const igor1 = tracker.prepare("igor", "same-session", BODY);
   assert.equal(igor1.batchNumber, 1);
   assert.deepEqual(igor1.previousEpisodeUuids, []);
 });
 
 test("prepare reserves one UUID and reuses it until MCP acceptance", () => {
   const tracker = new EpisodeSequenceTracker();
-  const firstAttempt = tracker.prepare("main", "s1");
-  const retryAttempt = tracker.prepare("main", "s1");
+  const firstAttempt = tracker.prepare("main", "s1", BODY);
+  const retryAttempt = tracker.prepare("main", "s1", BODY);
   assert.deepEqual(retryAttempt, firstAttempt);
   const snapshot = tracker.snapshot("main", "s1");
   assert.equal(snapshot.acceptedBatches, 0);
@@ -64,7 +65,7 @@ test("prepare reserves one UUID and reuses it until MCP acceptance", () => {
 
 test("accept rejects a UUID different from the reserved caller UUID", () => {
   const tracker = new EpisodeSequenceTracker();
-  const pending = tracker.prepare("main", "s1");
+  const pending = tracker.prepare("main", "s1", BODY);
   assert.throws(
     () => tracker.accept("main", "s1", pending.batchNumber, "00000000-0000-4000-8000-000000000000"),
     /unexpected episode UUID/,
@@ -73,14 +74,14 @@ test("accept rejects a UUID different from the reserved caller UUID", () => {
 
 test("accept rejects out-of-order updates", () => {
   const tracker = new EpisodeSequenceTracker();
-  tracker.prepare("main", "s1");
+  tracker.prepare("main", "s1", BODY);
   assert.throws(() => tracker.accept("main", "s1", 2, "uuid"), /out of order/);
 });
 
 test("hydrate restores persisted saga continuity after plugin restart", () => {
   const tracker = new EpisodeSequenceTracker();
   tracker.hydrate("main", "session:a", 6, "persisted-uuid-6");
-  const next = tracker.prepare("main", "session:a");
+  const next = tracker.prepare("main", "session:a", BODY);
   assert.equal(next.batchNumber, 7);
   assert.equal(next.name, "a-7");
   assert.deepEqual(next.previousEpisodeUuids, ["persisted-uuid-6"]);
@@ -107,7 +108,7 @@ test("a reserved identity is re-adopted only when the saga still expects it", ()
     sagaPreviousEpisodeUuid: "uuid-3",
   };
   assert.equal(tracker.adoptPending("main", "s1", reserved), true);
-  assert.deepEqual(tracker.prepare("main", "s1"), reserved, "the replay reuses the reserved identity");
+  assert.deepEqual(tracker.prepare("main", "s1", BODY), reserved, "the replay reuses the reserved identity");
 
   const diverged = new EpisodeSequenceTracker();
   diverged.hydrate("main", "s1", 5, "uuid-5");
@@ -123,5 +124,40 @@ test("a reserved identity is re-adopted only when the saga still expects it", ()
     otherPredecessor.adoptPending("main", "s1", reserved),
     false,
     "a different predecessor means the chain diverged",
+  );
+});
+
+test("the episode UUID is derived from the batch, so the same batch cannot become two episodes", () => {
+  const first = new EpisodeSequenceTracker();
+  const second = new EpisodeSequenceTracker();
+
+  // Two independent trackers preparing the same batch: what a duplicated
+  // pipeline used to do, and what a replay after a restart still does.
+  const a = first.prepare("main", "agent:main:web:s1", BODY);
+  const b = second.prepare("main", "agent:main:web:s1", BODY);
+  assert.equal(a.episodeUuid, b.episodeUuid);
+  assert.match(a.episodeUuid, UUID_RE);
+
+  // Anything that makes it a different batch makes it a different episode.
+  const otherAgent = second.prepare("igor", "agent:main:web:s1", BODY);
+  const otherSession = second.prepare("main", "agent:main:web:s2", BODY);
+  const otherBody = second.prepare("main", "agent:main:web:s3", BODY.replace("x", "y"));
+  assert.notEqual(otherAgent.episodeUuid, a.episodeUuid);
+  assert.notEqual(otherSession.episodeUuid, a.episodeUuid);
+  assert.notEqual(otherBody.episodeUuid, a.episodeUuid);
+
+  const later = new EpisodeSequenceTracker();
+  later.hydrate("main", "agent:main:web:s1", 1, a.episodeUuid);
+  assert.notEqual(
+    later.prepare("main", "agent:main:web:s1", BODY).episodeUuid,
+    a.episodeUuid,
+    "the same body in a later batch is a different episode",
+  );
+});
+
+test("deriveEpisodeUuid is stable across processes", () => {
+  assert.equal(
+    deriveEpisodeUuid("main", "agent:main:web:s1", 7, "{}"),
+    deriveEpisodeUuid("main", "agent:main:web:s1", 7, "{}"),
   );
 });

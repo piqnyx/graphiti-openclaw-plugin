@@ -769,7 +769,27 @@ export function register(api: OpenClawPluginApi): void {
   }
 
   if (cfg.agentTools && api.registerTool) {
-    const tools = createGraphitiTools({ cfg, client, logger, excludedSessionPatterns });
+    const tools = createGraphitiTools({
+      cfg,
+      client,
+      logger,
+      excludedSessionPatterns,
+      // Only this process knows what has been captured but not yet submitted;
+      // the backend cannot report a batch it has never seen.
+      localCaptureState: (agentId) => {
+        const agent = engine.snapshot().agents.find((entry) => entry.agentId === agentId);
+        const buffers = agent?.activeBuffers ?? [];
+        const lastActivity = buffers.map((buffer) => buffer.lastActivityAt);
+        return {
+          bufferedMessages: buffers.reduce((sum, buffer) => sum + buffer.messages.length, 0),
+          queuedBatches: agent?.queue.length ?? 0,
+          ...(lastActivity.length > 0
+            ? { oldestBufferAgeMs: Date.now() - Math.min(...lastActivity) }
+            : {}),
+          ...(captureSpool ? { spoolPath: captureSpool.path } : {}),
+        };
+      },
+    });
     for (const tool of tools) {
       // Registered per invocation context so each call resolves its own agent
       // and session; the tool can never act on another agent's graph.

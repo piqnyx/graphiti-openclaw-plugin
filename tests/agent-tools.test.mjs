@@ -172,12 +172,31 @@ test("injected memory wrappers cannot be smuggled back through a tool", async (t
   assert.doesNotMatch(body, /подделка/);
 });
 
+test("status reports what is still waiting locally, which no backend can see", async (t) => {
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
+    get_episodes: () => ({ episodes: [] }),
+  });
+  const { tools } = makeRuntime({ bufferLimit: 20, bufferTimeout: 900 });
+
+  const result = await call(tools, "graphiti_status", {},
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+
+  assert.equal(result.details.bufferedMessages, 0);
+  assert.equal(result.details.queuedBatches, 0);
+  assert.match(result.content[0].text, /Nothing is waiting locally/);
+  assert.match(result.content[0].text, /commit every 20 messages or after 15 min/);
+  assert.match(result.content[0].text, /no episodes at all yet/);
+});
+
 test("status reports a blocked backend instead of pretending memory works", async (t) => {
   installFetch(t, {
     get_queue_status: () => ({
       group_id: "main", blocked: true, attempts: 5, pending: 3, last_error: "LLM returned an empty response",
     }),
     get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
+    get_episodes: () => ({ episodes: [] }),
   });
   const { tools } = makeRuntime();
 

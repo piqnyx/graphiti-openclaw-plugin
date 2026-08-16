@@ -40,11 +40,21 @@ function limitParam(params: Record<string, unknown>, key: string, fallback: numb
   return Math.min(Math.max(Math.trunc(value), 1), max);
 }
 
+/** What the local pipeline is holding for one agent right now. */
+export type LocalCaptureState = {
+  bufferedMessages: number;
+  queuedBatches: number;
+  /** Age of the least recently touched buffer, or undefined when nothing is buffered. */
+  oldestBufferAgeMs?: number;
+  spoolPath?: string;
+};
+
 export type ToolDependencies = {
   cfg: GraphitiPluginConfig;
   client: GraphitiMcpClient;
   logger: GraphitiLogger;
   excludedSessionPatterns: readonly RegExp[];
+  localCaptureState: (agentId: string) => LocalCaptureState;
 };
 
 /**
@@ -61,7 +71,7 @@ export type ToolDependencies = {
  * agent's graph, so exposing them to an agent could not be made isolation-safe.
  */
 export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinition[] {
-  const { cfg, client, logger, excludedSessionPatterns } = deps;
+  const { cfg, client, logger, excludedSessionPatterns, localCaptureState } = deps;
 
   const resolve = (
     toolName: string,
@@ -375,8 +385,8 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_status",
       label: "Memory status (Graphiti)",
       description:
-        "Report whether this agent's long-term memory backend is healthy and how much of the current dialog has been committed. " +
-        "Use when the user asks whether you are remembering the conversation, or when memory looks stale or empty and you need to say why.",
+        "Full diagnostic of this agent's long-term memory: backend health, what this dialog has committed, what is still waiting locally, how fresh the newest memory is, and the batching settings in force. " +
+        "Use when the user asks whether you are remembering the conversation, when memory looks stale or empty and you need to say why, or when the user is debugging the memory pipeline and wants numbers rather than reassurance.",
       parameters: { type: "object", properties: {} },
       async execute(_toolCallId, _params, ctx) {
         const resolved = resolve("graphiti_status", ctx);
@@ -414,12 +424,58 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           }
         }
 
+        // What has not left this process yet. Nothing else can report it: the
+        // backend cannot see a batch that was never submitted.
+        const local = localCaptureState(resolved.agentId);
+        details.bufferedMessages = local.bufferedMessages;
+        details.queuedBatches = local.queuedBatches;
+        const untilFlush = cfg.bufferLimit - local.bufferedMessages;
+        lines.push(
+          local.bufferedMessages === 0 && local.queuedBatches === 0
+            ? "Nothing is waiting locally: everything captured so far has been handed to the backend."
+            : `Waiting locally: ${local.bufferedMessages} message(s) in the open batch` +
+              (untilFlush > 0 ? ` (${untilFlush} more, or ${Math.round(cfg.bufferTimeout / 60)} min of silence, triggers the next commit)` : "") +
+              (local.queuedBatches > 0 ? `, plus ${local.queuedBatches} batch(es) queued for delivery` : "") + ".",
+        );
+
+        if (local.oldestBufferAgeMs !== undefined && local.oldestBufferAgeMs > cfg.bufferTimeout * 1000 * 1.5) {
+          details.staleBuffer = true;
+          lines.push(
+            `WARNING: the open batch has been idle for ${Math.round(local.oldestBufferAgeMs / 60000)} min, longer than the ${Math.round(cfg.bufferTimeout / 60)} min timeout. It should have been committed already.`,
+          );
+        }
+
+        try {
+          const episodes = await client.getEpisodes(resolved.agentId, 5);
+          details.recentEpisodes = episodes.length;
+          const newest = episodes[0];
+          const createdAt = typeof newest?.created_at === "string" ? Date.parse(newest.created_at) : NaN;
+          if (Number.isFinite(createdAt)) {
+            const ageMin = Math.round((Date.now() - createdAt) / 60000);
+            details.newestEpisodeAgeMinutes = ageMin;
+            lines.push(`Newest memory across all this agent's dialogs is ${ageMin} min old.`);
+          } else if (episodes.length === 0) {
+            lines.push("This agent has no episodes at all yet.");
+          }
+        } catch (error) {
+          lines.push(`Could not list recent episodes: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        lines.push(
+          `Settings: commit every ${cfg.bufferLimit} messages or after ${Math.round(cfg.bufferTimeout / 60)} min of silence; ` +
+            `automatic recall is ${cfg.autoRecall ? `on (up to ${cfg.recallLimit} facts)` : "off"}.`,
+        );
+        if (!cfg.autoCapture) lines.push("WARNING: automatic capture is switched off, so this dialog is not being recorded.");
+
         logger.info("tool_status", {
           agentId: resolved.agentId,
           group_id: resolved.agentId,
           blocked: details.blocked,
           pending: details.pending,
           episodeCount: details.episodeCount,
+          bufferedMessages: details.bufferedMessages,
+          queuedBatches: details.queuedBatches,
+          recentEpisodes: details.recentEpisodes,
         });
         return textResult(lines.join("\n"), details);
       },

@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { GraphitiMcpClient } from "../dist/mcp-client.js";
 import { register } from "../dist/index.js";
+
+/** register() with autoCapture touches the durable spool; never let that be the real state dir. */
+function isolateStateDir(t) {
+  const stateDir = mkdtempSync(join(tmpdir(), "graphiti-backend-status-"));
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+}
 
 function jsonResponse(body, init = {}) {
   return new Response(JSON.stringify(body), {
@@ -71,6 +81,7 @@ test("getQueueStatus maps terminal backend failure metadata", async (t) => {
 });
 
 test("backend poll publishes errors only to the failed saga session", async (t) => {
+  isolateStateDir(t);
   const originalFetch = globalThis.fetch;
   const originalSetInterval = globalThis.setInterval;
   const intervals = [];

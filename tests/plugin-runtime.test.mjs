@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { register } from "../dist/index.js";
 
 function jsonResponse(body, init = {}) {
@@ -131,9 +134,14 @@ const validConfig = (overrides = {}) => ({
   ...overrides,
 });
 
+// Every runtime gets its own state dir so the durable spool never leaks between
+// tests or into the real OpenClaw state directory.
+const runtimeStateRoot = mkdtempSync(join(tmpdir(), "graphiti-runtime-"));
+process.on("exit", () => rmSync(runtimeStateRoot, { recursive: true, force: true }));
+
 let apiInstance = 0;
 function makeApi(pluginConfig) {
-  process.env.OPENCLAW_STATE_DIR = `/tmp/graphiti-openclaw-plugin-runtime-${process.pid}-${apiInstance++}`;
+  process.env.OPENCLAW_STATE_DIR = join(runtimeStateRoot, `api-${apiInstance++}`);
   const hooks = new Map();
   const logs = [];
   return {

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
-import { TOOL_NAMES, TOOL_PREFIX } from "../dist/tools.js";
+import { TOOL_NAMES, TOOL_PREFIX, inspectEpisodeNumbering } from "../dist/tools.js";
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-tools-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
@@ -243,4 +243,44 @@ test("the manifest declares exactly the tools the code registers", () => {
     [...TOOL_NAMES].sort(),
     "the host publishes only tools declared in contracts.tools, so this list must track the code",
   );
+});
+
+test("numbering inspection names the two failures this project has actually had", () => {
+  const key = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
+  const episode = (n) => ({ name: `6bc2a77c6957-${n}` });
+
+  const healthy = inspectEpisodeNumbering(key, [episode(3), episode(1), episode(2)]);
+  assert.deepEqual(healthy, { seen: 3, highest: 3, duplicates: [], gaps: [] });
+
+  // Three engines that each flushed the same restored buffer.
+  const duplicated = inspectEpisodeNumbering(key, [episode(9), episode(10), episode(10), episode(10)]);
+  assert.deepEqual(duplicated.duplicates, [10]);
+
+  // A batch that never reached the backend.
+  const lost = inspectEpisodeNumbering(key, [episode(1), episode(2), episode(5)]);
+  assert.deepEqual(lost.gaps, [3, 4]);
+
+  // Episodes of other sagas and standalone notes must not be counted here.
+  const foreign = inspectEpisodeNumbering(key, [episode(1), { name: "deadbeefcafe-1" }, { name: "правило" }]);
+  assert.equal(foreign.seen, 1);
+});
+
+test("status refuses to call a duplicated dialog healthy", async (t) => {
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_saga: () => ({
+      message: "retrieved", uuid: "s", name: "agent:main:telegram:1", group_id: "main",
+      summary: "", first_episode_uuid: "a", last_episode_uuid: "b", episode_count: 4,
+    }),
+    get_episodes: () => ({
+      episodes: [{ name: "1-3" }, { name: "1-2" }, { name: "1-2" }, { name: "1-1" }],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_status", {},
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+
+  assert.equal(result.details.ok, false);
+  assert.match(result.content[0].text, /batch number\(s\) 2 appear more than once/);
 });

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { GraphitiPluginConfig } from "./config.js";
+import { episodeNamePrefix } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import type { GraphitiLogger } from "./logging.js";
 import type { GraphitiMcpClient } from "./mcp-client.js";
@@ -19,6 +20,42 @@ export const TOOL_NAMES = [
 ] as const;
 
 const MAX_STORE_CHARS = 32_000;
+/** How many recent episodes the status tool inspects when checking numbering. */
+const CHAIN_CHECK_EPISODES = 100;
+
+/**
+ * Verify the batch numbering of one saga from episode names alone.
+ *
+ * The plugin cannot traverse NEXT_EPISODE — MCP exposes no query interface — but
+ * every episode is named `<saga tail>-<batch number>`, and the two failures this
+ * project has actually suffered both show up there: a duplicated batch appears
+ * as a repeated number, a lost one as a gap. Structural edge validation remains
+ * the job of the read-only Falkor validator.
+ */
+export function inspectEpisodeNumbering(
+  sessionKey: string,
+  episodes: readonly Record<string, unknown>[],
+): { seen: number; highest: number; duplicates: number[]; gaps: number[] } {
+  const prefix = `${episodeNamePrefix(sessionKey)}-`;
+  const numbers: number[] = [];
+  for (const episode of episodes) {
+    const name = typeof episode.name === "string" ? episode.name : "";
+    if (!name.startsWith(prefix)) continue;
+    const parsed = Number.parseInt(name.slice(prefix.length), 10);
+    if (Number.isInteger(parsed) && parsed > 0) numbers.push(parsed);
+  }
+
+  const counts = new Map<number, number>();
+  for (const value of numbers) counts.set(value, (counts.get(value) ?? 0) + 1);
+  const highest = numbers.length > 0 ? Math.max(...numbers) : 0;
+  const lowest = numbers.length > 0 ? Math.min(...numbers) : 0;
+  const duplicates = [...counts.entries()].filter(([, count]) => count > 1).map(([value]) => value).sort((a, b) => a - b);
+  const gaps: number[] = [];
+  for (let value = lowest; value <= highest; value += 1) {
+    if (!counts.has(value)) gaps.push(value);
+  }
+  return { seen: numbers.length, highest, duplicates, gaps };
+}
 const STORE_SOURCE_DESCRIPTION = "OpenClaw agent note";
 
 function textResult(text: string, details: Record<string, unknown>): PluginToolResult {
@@ -446,8 +483,34 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         }
 
         try {
-          const episodes = await client.getEpisodes(resolved.agentId, 5);
+          const episodes = await client.getEpisodes(resolved.agentId, CHAIN_CHECK_EPISODES);
           details.recentEpisodes = episodes.length;
+
+          if (sessionKey) {
+            const chain = inspectEpisodeNumbering(sessionKey, episodes);
+            details.chain = chain;
+            if (chain.duplicates.length > 0) {
+              lines.push(
+                `PROBLEM: batch number(s) ${chain.duplicates.join(", ")} appear more than once in this dialog. The same messages were committed twice.`,
+              );
+              details.ok = false;
+            }
+            if (chain.gaps.length > 0) {
+              lines.push(
+                `PROBLEM: batch number(s) ${chain.gaps.join(", ")} are missing from this dialog. Those messages never reached memory.`,
+              );
+              details.ok = false;
+            }
+            if (chain.seen > 0 && chain.duplicates.length === 0 && chain.gaps.length === 0) {
+              lines.push(`Batch numbering is continuous: ${chain.seen} batch(es), 1 through ${chain.highest}, none repeated.`);
+            }
+            if (typeof details.episodeCount === "number" && details.episodeCount !== chain.seen && chain.seen > 0) {
+              lines.push(
+                `Note: the saga reports ${details.episodeCount} episode link(s) but ${chain.seen} distinct batch(es) are visible; a mismatch usually means duplicated saga edges.`,
+              );
+            }
+          }
+
           const newest = episodes[0];
           const createdAt = typeof newest?.created_at === "string" ? Date.parse(newest.created_at) : NaN;
           if (Number.isFinite(createdAt)) {

@@ -195,3 +195,39 @@ test("a different configuration gets its own pipeline", (t) => {
   const changed = registerRuntime(dir, { bufferLimit: 9 });
   assert.ok(changed.logs.some((l) => l.includes('outcome="replaced_reconfigured"')));
 });
+
+test("one spool holds several agents without their data ever meeting", async (t) => {
+  resetCaptureRuntimeForTests();
+  const dir = join(stateRoot, "multi-agent");
+  const before = installFetch(t);
+
+  // Two agents talk through the same process; neither is flushed yet.
+  const gateway = registerRuntime(dir, { bufferLimit: 6 });
+  gateway.hooks.get("agent_end")(
+    { success: true, messages: [{ role: "user", content: "секрет вита" }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1", trigger: "user" },
+  );
+  gateway.hooks.get("agent_end")(
+    { success: true, messages: [{ role: "user", content: "секрет игоря" }] },
+    { agentId: "igor", sessionKey: "agent:igor:telegram:2", trigger: "user" },
+  );
+  await gateway.hooks.get("gateway_stop")();
+  assert.deepEqual(before.filter((c) => c.name === "add_memory"), []);
+
+  // Restart: both survive, and each one flushes into its own group only.
+  resetCaptureRuntimeForTests();
+  const calls = installFetch(t);
+  const after = registerRuntime(dir, { bufferLimit: 2, bufferTimeout: 30 });
+  after.hooks.get("agent_end")(
+    { success: true, messages: [{ role: "user", content: "секрет вита" }, { role: "assistant", content: "ответ виту" }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1", trigger: "user" },
+  );
+  await waitFor(() => calls.some((c) => c.name === "add_memory"));
+
+  const adds = calls.filter((c) => c.name === "add_memory").map((c) => c.arguments);
+  assert.equal(adds.length, 1, "only the agent that reached its limit is submitted");
+  assert.equal(adds[0].group_id, "main");
+  assert.match(adds[0].episode_body, /секрет вита/);
+  assert.doesNotMatch(adds[0].episode_body, /секрет игоря/, "another agent's buffer must never join this episode");
+  await after.hooks.get("gateway_stop")();
+});

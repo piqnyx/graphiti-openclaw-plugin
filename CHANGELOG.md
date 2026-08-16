@@ -36,6 +36,13 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Fixed
 
+- The durable watermark advances only after a delta is buffered, so a delta the engine refused is observed again by the next process instead of being recorded as captured.
+- The transcript delta tracker no longer keeps the full transcript of every session it has ever seen.
+- Reconciling a restored batch no longer re-hydrates a sequence this process already established, which could move the batch number backwards.
+- The MCP client retries only transport failures; a tool error whose text mentioned a session no longer causes a second submission of the same episode.
+- Concurrent first MCP calls share one handshake instead of racing two sessions.
+- Hydration state lives inside the episode sequence tracker instead of a parallel set that had to be kept in sync by hand.
+- Capturing for an agent missing from `agents` is reported once instead of silently using default participant names.
 - A failed spool write no longer aborts capture or discards the remainder of an observed transcript delta.
 - A spool write failure after Graphiti acceptance is no longer reported as a capture transport failure.
 - An empty plugin runtime can no longer delete a spool file created by another live runtime.

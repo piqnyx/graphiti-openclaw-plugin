@@ -37,6 +37,9 @@ U followed by timeout
 U on an aborted/stopped run
 successive full snapshots without duplicate replay
 snapshot rewrite/overlap fallback
+gateway stop on a user-only tail, then the session resumes
+a batch submitted but unanswered before the stop
+a session key or trigger matched by excludeSessionPatterns
 ```
 
 ## What not to do

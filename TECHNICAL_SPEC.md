@@ -157,14 +157,7 @@ buffer 2 = U A
 
 `bufferTimeout` задаётся в секундах. Минимум 30 секунд. Operational ticker равен 30 секундам.
 
-Для текущего live acceptance используется:
-
-```json
-{
-  "bufferLimit": 6,
-  "bufferTimeout": 300
-}
-```
+Реально развёрнутые значения хранятся в OpenClaw config и в HANDOFF §5. Крупные batch намеренно предпочтительнее мелких: extraction лучше строит личности и связи на большом куске диалога и реже дёргает LLM. Верхняя граница определяется не плагином, а тем, сколько текста стабильно переваривает LLM backend Graphiti.
 
 ### 6.1 QueueEntry
 
@@ -354,9 +347,13 @@ last_episode_uuid == зарезервированный uuid -> episode уже �
 
 Неудачная запись spool никогда не отменяет capture: сообщения остаются в памяти, ошибка сообщается один раз (`capture_spool_write_failed`), следующая мутация повторяет checkpoint. Checkpoint после acceptance вынесен из delivery try/catch и не может быть показан пользователю как transport failure.
 
-# 12. ТЕКУЩИЙ ЭТАП: recall hardening и clean-memory live acceptance
+# 12. Recall pipeline и его live acceptance
 
-Capture architecture до обнаружения конкретного дефекта **не переписывать**. Базовый Graphiti recall уже доказан live; текущая работа делает его наблюдаемым, более устойчивым к контекстно-зависимым вопросам и настраиваемым без изменения isolation model.
+Recall hardening из этого раздела **реализован**; раздел остаётся авторитетным описанием recall pipeline, его конфигурации и критериев приёмки, а не списком незавершённой работы.
+
+Capture architecture до обнаружения конкретного дефекта **не переписывать**. Базовый Graphiti recall доказан live; работа этого этапа сделала его наблюдаемым, устойчивым к контекстно-зависимым вопросам и настраиваемым без изменения isolation model.
+
+Текущий активный этап — стабильность capture: durable spool под штатные stop/start (раздел 11), единый фильтр sessions (8.2) и live acceptance обоих направлений на чистой памяти.
 
 ## 12.1 Уже доказано live до hardening patch
 

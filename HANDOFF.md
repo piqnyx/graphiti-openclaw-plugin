@@ -118,8 +118,12 @@ server: /home/openclaw/plugins/graphiti-openclaw-plugin
 ```text
 src/index.ts                 hooks, capture/recall orchestration, status, llm_input diagnostics
 src/buffer.ts                buffers + per-agent FIFO
-src/transcript-delta.ts      full-snapshot -> new-message delta
+src/capture-spool.ts         atomic durable spool (batches + session watermarks)
+src/transcript-delta.ts      full-snapshot -> new-message delta + durable watermarks
 src/episode-sequence.ts      Saga numbering / caller UUID reservation
+src/session-filter.ts        excludeSessionPatterns matching for capture and recall
+src/identity.ts              fail-closed ctx.agentId validation
+src/types.ts                 OpenClaw plugin API / hook event types
 src/mcp-client.ts            Streamable HTTP MCP client
 src/text.ts                  sanitization + recall query/block construction
 src/config.ts                config parsing/defaults
@@ -223,8 +227,12 @@ UI/status path best-effort: ошибка UI-state механизма не име
     "baseUrl": "http://127.0.0.1:8000/mcp/",
     "autoCapture": true,
     "autoRecall": true,
-    "bufferLimit": 6,
-    "bufferTimeout": 300,
+    "bufferLimit": 30,
+    "bufferTimeout": 900,
+    "excludeSessionPatterns": [
+      ":cron:", ":heartbeat:", ":subagent:", "^cron$", "^heartbeat$", "^\\*\\*\\*$",
+      "^agent:[^:]+:dreaming-"
+    ],
     "agents": {
       "main":   { "user": "Вит",     "assistant": "Краб" },
       "igor":   { "user": "Игорь",   "assistant": "Краб" },
@@ -617,10 +625,20 @@ plugin_loaded
 capture_messages
 capture_sequence_hydrated
 capture_flush_start
+capture_skipped
+capture_agent_unconfigured
 capture_queue_accepted
 capture_flush_failed
 capture_flush_recovered
-capture_backend_*
+capture_backend_blocked
+capture_backend_recovered
+capture_backend_healthcheck_failed
+capture_ui_status_failed
+capture_shutdown_checkpoint
+capture_shutdown_complete
+capture_spool_load_failed
+capture_spool_write_recovered
+recall_skipped
 recall_query
 recall_payload
 recall_completed

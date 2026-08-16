@@ -6,11 +6,10 @@
 
 ## Надёжность и durability
 
-- Crash-durable pre-MCP spool для active buffers, transcript-delta snapshots и unsent FIFO entries.
-- Bounded backlog policy без silent data loss.
+- Bounded backlog policy без silent data loss: spool сейчас растёт вместе с очередью и переписывается целиком на каждое сообщение.
 - Byte-aware request bounds и явная стратегия split/reject для oversized batch.
-- Продуманная safe-shutdown policy: flush, spool или осознанно ephemeral state.
 - Отдельная диагностика/метрики размера очереди и возраста oldest pending batch.
+- Подтверждение персистентности episode после acceptance, чтобы restart самого MCP-сервера не терял принятый, но необработанный batch.
 
 ## Recall hardening после завершения текущего recall phase
 
@@ -54,6 +53,9 @@
 Следующее уже реализовано и не должно появляться здесь как незавершённая работа:
 
 - message-delta capture;
+- durable spool active buffers, FIFO entries, transcript watermarks и зарезервированной episode identity;
+- reconciliation восстановленного batch через `get_saga` вместо слепого повтора;
+- `excludeSessionPatterns` для capture и recall;
 - arbitrary `user|assistant` sequences;
 - `bufferLimit` как количество сообщений без требования чётности;
 - user-only timeout flush;

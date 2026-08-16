@@ -16,6 +16,10 @@ Tests in this repository exist to catch real regressions in memory routing, capt
 - **failure retention** — transport/MCP failure retains the exact queue head, detach reason, Saga sequence and caller-reserved UUID for retry;
 - **backend failure visibility** — terminal asynchronous Graphiti queue failures are surfaced through error-only plugin session status;
 - **restart Saga continuity** — `get_saga` restores persisted episode count and last UUID before the next accepted batch;
+- **restart capture continuity** — a durable watermark resumes the transcript delta exactly where the previous process stopped: no replayed tail, no dropped turn;
+- **restart replay safety** — a batch already confirmed by `get_saga` is dropped, an unconfirmed one is replayed with its reserved caller UUID, name and predecessor;
+- **spool containment** — a failed durable write keeps every message in memory, is reported once, and is never surfaced as a capture transport failure;
+- **session exclusion** — an excluded session produces no MCP traffic in either direction;
 - **MCP shape** — caller UUID, `group_id`, `saga`, predecessor fields and `reference_time` match the fork contract;
 - **recall safety** — query sanitization happens before search and injected XML cannot be broken by fact text;
 - **logging privacy** — raw message/request content appears only with explicit debug content logging.

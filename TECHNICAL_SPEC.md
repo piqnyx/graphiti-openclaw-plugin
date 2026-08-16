@@ -60,7 +60,7 @@ OpenClaw `agent_end` передаёт transcript snapshot, а не гарант�
 
 Capture pipeline:
 
-1. до работы с transcript отклоняются heartbeat, cron, subagent/background и slug-generator runs;
+1. до работы с transcript отклоняются heartbeat, cron, subagent/background, slug-generator runs и sessions, попавшие под `excludeSessionPatterns`;
 2. из snapshot остаются только `role=user|assistant`;
 3. text content извлекается и sanitizes;
 4. удаляются raw memory-injection blocks и известная OpenClaw metadata;
@@ -238,6 +238,27 @@ get_saga(saga_name=sessionKey, group_id=agentId)
 
 После этого numbering и predecessor chain продолжаются с persisted Graphiti state.
 
+Если в spool лежит batch с уже зарезервированной episode identity, тот же вызов используется для reconciliation (см. 11.2): identity сверяется с `last_episode_uuid` до любой повторной отправки.
+
+## 8.2 Excluded sessions
+
+`excludeSessionPatterns` — список glob-паттернов session key, которые plugin игнорирует **и в capture, и в recall**. Диалект тот же, что у `bypassSessionPatterns` плагина OpenViking:
+
+```text
+*   внутри одного ":" сегмента
+**  через сегменты
+```
+
+Пример:
+
+```json
+"excludeSessionPatterns": ["agent:*:dreaming-**"]
+```
+
+По умолчанию список пуст. Hardcoded отсев heartbeat/cron/subagent остаётся и применяется теперь также к recall: session, которую мы не пишем, не должна и получать injected memory.
+
+Это фильтр по **служебным sessions**, а не изоляция диалогов. Кросс-сессионная память внутри агента остаётся обязательной: факт из одной session должен находиться recall в другой session того же агента.
+
 ## 9. Capture failure semantics
 
 ### 9.1 Ошибка до MCP acceptance
@@ -282,17 +303,46 @@ OpenViking работает независимо как `contextEngine`. Graphit
 
 OpenClaw core для этого не патчится.
 
-## 11. In-memory boundary
+## 11. Durable capture state
 
-До MCP acceptance следующие данные пока находятся только в памяти процесса OpenClaw:
+До MCP acceptance capture state хранится в атомарном local spool:
 
-- active buffers;
-- transcript-delta snapshots;
-- unsent/retained plugin FIFO queue entries.
+```text
+$OPENCLAW_STATE_DIR/graphiti-openclaw-plugin/capture-spool.json
+```
 
-Persisted Saga continuity после restart восстанавливается через `get_saga`, но pre-MCP data crash-durable storage пока не имеет.
+Файл пишется через temp + `fsync` + `rename` + `fsync` каталога, права `0600`, schema version 2. Version 1 файлы мигрируются при чтении, чтобы upgrade gateway не оставлял capture data за проверкой схемы.
 
-Это известное ограничение, а не случайный баг.
+Spool содержит:
+
+- active buffers каждой session;
+- unsent/retained FIFO entries агента вместе с их `reason` и `enqueuedAt`;
+- зарезервированную episode identity уже отправленного batch (`uuid`, `name`, `batchNumber`, predecessor);
+- per-session transcript watermarks.
+
+### 11.1 Transcript watermarks
+
+Watermark — это FNV-хеши последних 12 наблюдённых сообщений session плюс их количество. Content в spool не попадает. При первом `agent_end` после restart delta считается от watermark, а не от boundary detection, поэтому session не переигрывает уже захваченный хвост и не теряет turn, чей `agent_end` не успел сработать до остановки. Если transcript переписан настолько, что watermark не находится, применяется прежний conservative fallback.
+
+Watermarks живут не дольше 14 суток и ограничены 64 последними sessions.
+
+### 11.2 Reconciliation восстановленного batch
+
+Batch, чей ответ `add_memory` потерян вместе с процессом, **не переотправляется вслепую**. Перед повтором вызывается `get_saga`:
+
+```text
+last_episode_uuid == зарезервированный uuid -> episode уже в графе:
+                                               batch снимается, chain продолжается с него
+иначе                                       -> повтор с тем же uuid, name и predecessor
+```
+
+Если saga ушла дальше зарезервированного `batchNumber` или чейнится с другим predecessor, identity не переиспользуется, резервируется новая, и это пишется в лог как `capture_replay_identity_diverged`.
+
+Точка коммита остаётся прежней — MCP acceptance. Graphiti queue живёт в памяти MCP-процесса, поэтому restart самого MCP-сервера всё ещё может потерять принятый, но необработанный episode; это ловится через `get_queue_status` и остаётся известным ограничением backend, а не плагина.
+
+### 11.3 Ошибка записи spool
+
+Неудачная запись spool никогда не отменяет capture: сообщения остаются в памяти, ошибка сообщается один раз (`capture_spool_write_failed`), следующая мутация повторяет checkpoint. Checkpoint после acceptance вынесен из delivery try/catch и не может быть показан пользователю как transport failure.
 
 # 12. ТЕКУЩИЙ ЭТАП: recall hardening и clean-memory live acceptance
 

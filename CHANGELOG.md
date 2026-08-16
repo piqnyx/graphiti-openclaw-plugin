@@ -25,6 +25,23 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Structured logging with opt-in raw content diagnostics.
 - Regression tests for identity/session isolation, arbitrary role sequences, timeout/limit batching, abort capture, FIFO/retry, UUID continuity, Saga recovery, backend status, MCP shapes, logging and context stripping.
 
+### Added (durability and session filtering)
+
+- Durable capture spool schema version 2 with automatic migration of version 1 files.
+- Per-session transcript watermarks in the spool, so a gateway restart neither replays a captured tail nor drops a turn whose `agent_end` never fired.
+- Reserved episode identity (`uuid`, `name`, `batchNumber`, predecessor) persisted before submission.
+- Restart reconciliation through read-only `get_saga`: a confirmed batch is dropped, an unconfirmed one is replayed with the same caller UUID instead of a new one.
+- `excludeSessionPatterns` config key applied to both capture and recall, using the same glob dialect as the OpenViking plugin.
+- Regression coverage for restart replay, watermark resume, spool write failures, schema migration and session exclusion.
+
+### Fixed
+
+- A failed spool write no longer aborts capture or discards the remainder of an observed transcript delta.
+- A spool write failure after Graphiti acceptance is no longer reported as a capture transport failure.
+- An empty plugin runtime can no longer delete a spool file created by another live runtime.
+- Background runs (cron, heartbeat, subagent) no longer receive injected `<graphiti-context>`.
+- Runtime tests no longer read or write the real OpenClaw state directory.
+
 ### Changed
 
 - Capture atomic unit is now an individual sanitized `user|assistant` message. The old completed `user+assistant` turn model has been removed.

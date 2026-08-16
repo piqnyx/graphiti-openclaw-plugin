@@ -394,7 +394,7 @@ Recall baseline, доказано 2026-08-15 до hardening patch:
 
 - errors-only Control UI при специально вызванной ошибке;
 - terminal backend blocked notification в failure injection;
-- crash durability pre-MCP, которая вообще пока не реализована.
+- durable capture spool под живым stop/start gateway (реализован и покрыт тестами, но live-прогон ещё нужен).
 
 ---
 
@@ -500,12 +500,12 @@ logContent=true
 видны:
 
 ```text
-mcp_raw_request
-mcp_raw_response
 recall_query
 recall_payload
 llm_input_raw
 ```
+
+Raw MCP transport dumps (`mcp_raw_request` / `mcp_raw_response`) подавлены навсегда и не появятся ни при каких переключателях: структурированной capture/recall диагностики достаточно, а дубли JSON-RPC/SSE забивали journald.
 
 `recall_payload` показывает `retrievedFacts`, `injectedFacts`, `skippedFacts`, `injectedChars`, raw facts и готовый injection block.
 
@@ -607,7 +607,7 @@ Recall/diagnostic filter:
 
 ```bash
 journalctl --user -u openclaw-gateway.service --since "5 min ago" --no-pager \
-  | grep -E 'graphiti: event=(recall_query|recall_payload|recall_completed|recall_failed|llm_input_raw|mcp_raw_request|mcp_raw_response)'
+  | grep -E 'graphiti: event=(recall_query|recall_payload|recall_completed|recall_failed|llm_input_raw)'
 ```
 
 Полезные operational events:
@@ -626,8 +626,11 @@ recall_payload
 recall_completed
 recall_failed
 llm_input_raw
-mcp_raw_request
-mcp_raw_response
+capture_spool_restored
+capture_spool_write_failed
+capture_replay_already_persisted
+capture_replay_reserved_identity
+capture_replay_identity_diverged
 ```
 
 Raw strings JSON-escaped, поэтому XML/newlines в journald идут одной строкой с `\n`.
@@ -763,9 +766,7 @@ f95ed257... read-only Falkor Saga validator
 
 См. `TODO.md`:
 
-- durable pre-MCP spool;
 - backlog/request bounds;
-- safe shutdown;
 - recall cooldown только если live failure докажет необходимость;
 - richer quality/rerank controls только по traces;
 - agent-visible `graphiti_*` tools;

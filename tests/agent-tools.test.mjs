@@ -214,3 +214,14 @@ test("the manifest declares the tool capability the host needs to collect them",
     "without the tool capability the host never collects graphiti_* tools, however correct the agent allowlist is",
   );
 });
+
+test("the manifest declares exactly the tools the code registers", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+  const declared = manifest.contracts?.tools ?? [];
+
+  assert.deepEqual(
+    [...declared].sort(),
+    [...TOOL_NAMES].sort(),
+    "the host publishes only tools declared in contracts.tools, so this list must track the code",
+  );
+});

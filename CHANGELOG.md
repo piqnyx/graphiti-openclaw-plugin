@@ -31,7 +31,7 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Each tool resolves its agent from the invocation context and passes it as the Graphiti group; an excluded session cannot call them at all.
 - `graphiti_store` writes standalone episodes with no saga, so agent notes cannot fork a dialog's episode chain.
 - README documents every configuration key and every tool, including why no destructive tool is offered.
-- The plugin manifest declares the `tool` activation capability; without it the host never collects the tools, no matter how the agent allowlist is configured.
+- The plugin manifest declares the `tool` activation capability and lists the tools in `contracts.tools`; the host publishes only declared tools, so a runtime registration alone leaves agents with none.
 
 ### Added (durability and session filtering)
 

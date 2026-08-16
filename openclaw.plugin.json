@@ -6,6 +6,15 @@
     "onStartup": true,
     "onCapabilities": ["hook", "tool"]
   },
+  "contracts": {
+    "tools": [
+      "graphiti_recall",
+      "graphiti_search_entities",
+      "graphiti_episodes",
+      "graphiti_store",
+      "graphiti_status"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

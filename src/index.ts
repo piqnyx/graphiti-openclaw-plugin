@@ -551,6 +551,17 @@ export function register(api: OpenClawPluginApi): void {
         });
         clearCaptureError(agentId, sessionKey);
       },
+      notifyPersistError: (error) => {
+        logger.error("capture_spool_write_failed", {
+          path: captureSpool?.path,
+          error: errorText(error),
+          action: "kept_in_memory",
+          durableReplayRequired: true,
+        });
+      },
+      notifyPersistRecovered: () => {
+        logger.info("capture_spool_write_recovered", { path: captureSpool?.path });
+      },
     },
   );
 

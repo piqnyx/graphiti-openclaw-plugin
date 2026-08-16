@@ -114,6 +114,7 @@ export class BufferEngine {
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly bufferTimeoutMs: number;
   private stopped = false;
+  private persistFailureActive = false;
 
   constructor(
     private readonly agents: Record<string, AgentActors>,
@@ -124,6 +125,8 @@ export class BufferEngine {
       notifyError?: (agentId: string, sessionKey: string, reason: FlushReason, error: Error) => void;
       notifyRecovered?: (agentId: string, sessionKey: string, reason: FlushReason) => void;
       onStateChange?: (snapshot: BufferEngineSnapshot) => void;
+      notifyPersistError?: (error: Error) => void;
+      notifyPersistRecovered?: () => void;
       initialState?: BufferEngineSnapshot;
     } = {},
   ) {
@@ -295,15 +298,6 @@ export class BufferEngine {
         const reason = entry.reason;
         try {
           await this.sink(agent.agentId, entry, reason);
-          agent.queue.shift();
-          // Remote acceptance is the commit point. Remove the local durable copy
-          // immediately after acceptance so successful entries are not replayed.
-          this.persistState();
-          if (agent.failureActive) {
-            this.opts.notifyRecovered?.(agent.agentId, entry.buffer.sessionKey, reason);
-          }
-          agent.failureActive = false;
-          agent.retryAfter = 0;
         } catch (error) {
           agent.retryAfter = Date.now() + CHECK_INTERVAL_SEC * 1000;
           if (!agent.failureActive) {
@@ -314,6 +308,17 @@ export class BufferEngine {
           // content, reason and saga order.
           break;
         }
+
+        // Delivery succeeded. The checkpoint below is deliberately outside the
+        // delivery try/catch: a local write failure is a spool problem, never a
+        // capture failure, and must not be reported to the user as one.
+        agent.queue.shift();
+        this.persistState();
+        if (agent.failureActive) {
+          this.opts.notifyRecovered?.(agent.agentId, entry.buffer.sessionKey, reason);
+        }
+        agent.failureActive = false;
+        agent.retryAfter = 0;
       }
     } finally {
       agent.processing = false;
@@ -347,8 +352,27 @@ export class BufferEngine {
     return { version: 1, agents };
   }
 
+  /**
+   * Durable checkpointing must never destroy the capture it exists to protect.
+   * A failed write keeps every message in memory and is reported once; the next
+   * mutation retries the checkpoint and reports recovery.
+   */
   private persistState(): void {
-    this.opts.onStateChange?.(this.snapshot());
+    const onStateChange = this.opts.onStateChange;
+    if (!onStateChange) return;
+    try {
+      onStateChange(this.snapshot());
+    } catch (error) {
+      if (!this.persistFailureActive) {
+        this.persistFailureActive = true;
+        this.opts.notifyPersistError?.(asError(error));
+      }
+      return;
+    }
+    if (this.persistFailureActive) {
+      this.persistFailureActive = false;
+      this.opts.notifyPersistRecovered?.();
+    }
   }
 
   /**

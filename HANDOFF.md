@@ -118,7 +118,9 @@ server: /home/openclaw/plugins/graphiti-openclaw-plugin
 ```text
 src/index.ts                 hooks, capture/recall orchestration, status, llm_input diagnostics
 src/buffer.ts                buffers + per-agent FIFO
+src/capture-runtime.ts       process-wide ownership of the capture pipeline
 src/capture-spool.ts         atomic durable spool (batches + session watermarks)
+src/tools.ts                 agent-facing graphiti_* tools
 src/transcript-delta.ts      full-snapshot -> new-message delta + durable watermarks
 src/episode-sequence.ts      Saga numbering / caller UUID reservation
 src/session-filter.ts        excludeSessionPatterns matching for capture and recall
@@ -250,7 +252,8 @@ UI/status path best-effort: ошибка UI-state механизма не име
     "recallHistoryMaxChars": 4000,
     "logOperations": true,
     "logLevel": "debug",
-    "logContent": true
+    "logContent": true,
+    "logModelInput": false
   }
 }
 ```
@@ -640,7 +643,17 @@ capture_shutdown_checkpoint
 capture_shutdown_complete
 capture_spool_load_failed
 capture_spool_write_recovered
+capture_pipeline
 recall_skipped
+agent_tools_registered
+agent_tools_unavailable
+tool_status
+tool_recall
+tool_search_entities
+tool_episodes
+tool_store
+tool_refused
+tool_failed
 agent_tools_registered
 tool_recall
 tool_store

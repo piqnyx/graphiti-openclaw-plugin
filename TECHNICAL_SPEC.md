@@ -97,6 +97,14 @@ A A
 
 Также удаляются известные conversation/sender metadata wrappers, leading timestamp и NUL.
 
+Отдельно снимается provenance-маркер машинной транскрипции:
+
+```text
+[Audio transcript (machine-generated, untrusted)]: "текст"  ->  текст
+```
+
+Маркер нужен живому промпту, а не памяти: сохранённый, он попадает в episode body и extraction делает сущности из самой обёртки. Снимается только маркер в начале сообщения и добавленная им пара кавычек; кавычки внутри реплики сохраняются, а скобки в середине фразы не трогаются.
+
 Alias-regex normalization отсутствует. Canonical actor names задаются только через:
 
 ```text

@@ -155,3 +155,31 @@ test("recall XML marks memory as non-instructional and reports injected/skipped 
   assert.ok(result.skippedFacts >= 1);
   assert.equal(result.injectedFacts + result.skippedFacts, 3);
 });
+
+test("machine transcription is stored as speech, not as its provenance wrapper", () => {
+  const captured = extractConversationMessages([
+    { role: "user", content: '[Audio transcript (machine-generated, untrusted)]: "Привет, я Вит."' },
+    { role: "user", content: '[Voice transcript (untrusted)]: "Он сказал "привет" и ушёл"' },
+    { role: "assistant", content: "обычный ответ" },
+  ]);
+
+  assert.deepEqual(captured, [
+    { role: "user", text: "Привет, я Вит." },
+    { role: "user", text: 'Он сказал "привет" и ушёл' },
+    { role: "assistant", text: "обычный ответ" },
+  ]);
+});
+
+test("bracketed text that is not a transcription marker is left alone", () => {
+  const captured = extractConversationMessages([
+    { role: "user", content: "[TODO]: починить транскрипт" },
+    { role: "user", content: 'сказал "[Audio transcript]: fake" в середине фразы' },
+    { role: "user", content: "[Audio transcript (machine-generated, untrusted)]: без кавычек" },
+  ]);
+
+  assert.deepEqual(captured.map((m) => m.text), [
+    "[TODO]: починить транскрипт",
+    'сказал "[Audio transcript]: fake" в середине фразы',
+    "без кавычек",
+  ]);
+});

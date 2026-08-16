@@ -6,6 +6,13 @@ const OPENVIKING_MEMORIES_RE = /<relevant-memories\b[^>]*>[\s\S]*?<\/relevant-me
 const CONVERSATION_METADATA_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata)\s*(?:\([^)]+\))?\s*:\s*```(?:json)?[\s\S]*?```/gi;
 const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\S]*?```/gi;
+/**
+ * OpenClaw prefixes machine transcription with a provenance marker, e.g.
+ * `[Audio transcript (machine-generated, untrusted)]: "текст"`. The marker exists
+ * for the live prompt; storing it would put the wrapper itself into the graph and
+ * let extraction mint entities out of it.
+ */
+const TRANSCRIPT_PREFIX_RE = /^\s*\[[^\]\n]{0,160}transcript[^\]\n]{0,160}\]\s*:\s*/i;
 const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
@@ -46,11 +53,26 @@ export function stripInjectedContexts(text: string): string {
     .replace(OPENVIKING_MEMORIES_RE, " ");
 }
 
+/** Remove the transcription provenance marker and unwrap the quoted transcript. */
+function stripTranscriptWrapper(text: string): string {
+  const withoutMarker = text.replace(TRANSCRIPT_PREFIX_RE, "");
+  if (withoutMarker === text) return text;
+
+  const trimmed = withoutMarker.trim();
+  // Only the pair the marker itself added is removed; quotes inside stay put.
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1);
+  }
+  return withoutMarker;
+}
+
 export function sanitizeConversationText(text: string): string {
-  return stripInjectedContexts(text)
-    .replace(CONVERSATION_METADATA_RE, "\n")
-    .replace(SENDER_METADATA_RE, "\n")
-    .replace(LEADING_TIMESTAMP_RE, "")
+  return stripTranscriptWrapper(
+    stripInjectedContexts(text)
+      .replace(CONVERSATION_METADATA_RE, "\n")
+      .replace(SENDER_METADATA_RE, "\n")
+      .replace(LEADING_TIMESTAMP_RE, ""),
+  )
     .replace(/\u0000/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")

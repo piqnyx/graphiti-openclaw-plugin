@@ -61,8 +61,8 @@ export type PersistedAgentCaptureState = {
   queue: PersistedQueueEntry[];
 };
 
+/** Engine-owned part of the durable capture state; the spool file owns schema versioning. */
 export type BufferEngineSnapshot = {
-  version: 1;
   agents: PersistedAgentCaptureState[];
 };
 
@@ -234,8 +234,6 @@ export class BufferEngine {
   }
 
   private restore(snapshot: BufferEngineSnapshot): void {
-    if (snapshot.version !== 1) throw new Error(`unsupported capture snapshot version ${snapshot.version}`);
-
     for (const persisted of snapshot.agents) {
       const agent = this.ensureAgent(persisted.agentId);
       for (const storedBuffer of persisted.activeBuffers) {
@@ -349,7 +347,12 @@ export class BufferEngine {
       if (activeBuffers.length === 0 && queue.length === 0) continue;
       agents.push({ agentId: state.agentId, activeBuffers, queue });
     }
-    return { version: 1, agents };
+    return { agents };
+  }
+
+  /** Checkpoint state that changed outside the engine (transcript watermarks, episode identity). */
+  checkpoint(): void {
+    this.persistState();
   }
 
   /**

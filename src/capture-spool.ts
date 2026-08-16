@@ -13,13 +13,21 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type {
-  BufferEngineSnapshot,
   PersistedAgentCaptureState,
   PersistedBuffer,
   PersistedQueueEntry,
 } from "./buffer.js";
+import type { SessionWatermark } from "./transcript-delta.js";
 
-const SPOOL_VERSION = 1 as const;
+/** Durable capture state: unaccepted batches plus per-session transcript watermarks. */
+export type CaptureSpoolState = {
+  version: 2;
+  agents: PersistedAgentCaptureState[];
+  sessions: SessionWatermark[];
+};
+
+const SPOOL_VERSION = 2 as const;
+const LEGACY_SPOOL_VERSION = 1 as const;
 const SPOOL_DIR_NAME = "graphiti-openclaw-plugin";
 const SPOOL_FILE_NAME = "capture-spool.json";
 
@@ -121,18 +129,64 @@ function parseAgentState(value: unknown): PersistedAgentCaptureState {
   };
 }
 
-function parseSnapshot(value: unknown): BufferEngineSnapshot {
-  if (!isObject(value) || value.version !== SPOOL_VERSION || !Array.isArray(value.agents)) {
+function parseSessionWatermark(value: unknown): SessionWatermark {
+  if (!isObject(value)) throw new Error("capture spool contains an invalid session watermark");
+  if (typeof value.agentId !== "string" || value.agentId.trim() === "") {
+    throw new Error("capture spool session watermark has an invalid agentId");
+  }
+  if (typeof value.sessionKey !== "string" || value.sessionKey.trim() === "") {
+    throw new Error("capture spool session watermark has an invalid sessionKey");
+  }
+  if (
+    !Array.isArray(value.tailHashes) ||
+    !value.tailHashes.every((hash) => typeof hash === "string" && hash.trim() !== "")
+  ) {
+    throw new Error("capture spool session watermark has invalid tailHashes");
+  }
+  if (typeof value.observedMessages !== "number" || !Number.isFinite(value.observedMessages)) {
+    throw new Error("capture spool session watermark has an invalid observedMessages");
+  }
+  if (typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt)) {
+    throw new Error("capture spool session watermark has an invalid updatedAt");
+  }
+  return {
+    agentId: value.agentId,
+    sessionKey: value.sessionKey,
+    tailHashes: value.tailHashes as string[],
+    observedMessages: value.observedMessages,
+    updatedAt: value.updatedAt,
+  };
+}
+
+/**
+ * Version 1 spools carry unaccepted batches but no session watermarks. They are
+ * accepted as-is so a gateway upgrade never strands capture data behind a
+ * schema check.
+ */
+function parseState(value: unknown): CaptureSpoolState {
+  if (!isObject(value) || !Array.isArray(value.agents)) {
+    throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
+  }
+  if (value.version === LEGACY_SPOOL_VERSION) {
+    return {
+      version: SPOOL_VERSION,
+      agents: value.agents.map(parseAgentState),
+      sessions: [],
+    };
+  }
+  if (value.version !== SPOOL_VERSION) {
     throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
   }
   return {
     version: SPOOL_VERSION,
     agents: value.agents.map(parseAgentState),
+    sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
   };
 }
 
-function hasData(snapshot: BufferEngineSnapshot): boolean {
-  return snapshot.agents.some(
+function hasData(state: CaptureSpoolState): boolean {
+  if (state.sessions.length > 0) return true;
+  return state.agents.some(
     (agent) => agent.activeBuffers.some((buffer) => buffer.messages.length > 0) || agent.queue.length > 0,
   );
 }
@@ -152,12 +206,12 @@ export class CaptureSpool {
     this.path = path;
   }
 
-  load(): BufferEngineSnapshot | undefined {
+  load(): CaptureSpoolState | undefined {
     if (!existsSync(this.path)) return undefined;
     try {
-      const snapshot = parseSnapshot(JSON.parse(readFileSync(this.path, "utf8")) as unknown);
+      const state = parseState(JSON.parse(readFileSync(this.path, "utf8")) as unknown);
       this.ownsFile = true;
-      return snapshot;
+      return state;
     } catch (error) {
       throw new Error(
         `failed to read durable Graphiti capture spool ${this.path}; refusing to overwrite it: ${error instanceof Error ? error.message : String(error)}`,
@@ -165,7 +219,7 @@ export class CaptureSpool {
     }
   }
 
-  save(snapshot: BufferEngineSnapshot): void {
+  save(snapshot: CaptureSpoolState): void {
     if (!hasData(snapshot)) {
       // register() may run in more than one OpenClaw runtime/process. An instance
       // that started with no spool and never wrote capture data must not unlink a

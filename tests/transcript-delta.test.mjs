@@ -81,3 +81,69 @@ test("one lonely user message is eligible for timeout flush", async (t) => {
   assert.equal(entries[0].reason, "timeout");
   assert.deepEqual(entries[0].entry.buffer.messages, [u("lonely-user")]);
 });
+
+test("a durable watermark resumes an aborted user-only tail without replaying it", () => {
+  const before = new TranscriptDeltaTracker();
+  // Run ended on a user message with no assistant reply, then the gateway stopped.
+  assert.deepEqual(before.take("main", "s1", [u("old-u"), a("old-a"), u("u1")]), [u("u1")]);
+  const carried = before.export();
+  assert.equal(carried.length, 1);
+  assert.equal(carried[0].sessionKey, "s1");
+
+  const after = new TranscriptDeltaTracker();
+  assert.equal(after.restore(carried), 1);
+  assert.deepEqual(
+    after.take("main", "s1", [u("old-u"), a("old-a"), u("u1"), u("u2"), a("a2")]),
+    [u("u2"), a("a2")],
+    "u1 was already captured before the restart and must not be captured twice",
+  );
+});
+
+test("a durable watermark recovers a turn that was never observed before the restart", () => {
+  const before = new TranscriptDeltaTracker();
+  before.take("main", "s1", [u("u1"), a("a1")]);
+  const carried = before.export();
+
+  const after = new TranscriptDeltaTracker();
+  after.restore(carried);
+  assert.deepEqual(
+    after.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
+    [u("u2"), a("a2")],
+  );
+});
+
+test("watermarks are content free, bounded and expire", () => {
+  const tracker = new TranscriptDeltaTracker();
+  const long = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? u(`u${i}`) : a(`a${i}`)));
+  tracker.take("main", "s1", long);
+
+  const [watermark] = tracker.export();
+  assert.equal(watermark.tailHashes.length, 12, "only a bounded tail is persisted");
+  assert.equal(watermark.observedMessages, 40);
+  assert.match(JSON.stringify(watermark), /^[^а-яА-Я]*$/);
+  assert.ok(!JSON.stringify(watermark).includes("u38"), "message text never reaches the spool");
+
+  const expired = new TranscriptDeltaTracker();
+  assert.equal(
+    expired.restore([{ ...watermark, updatedAt: Date.now() - 30 * 24 * 60 * 60 * 1000 }]),
+    0,
+    "a stale watermark is dropped instead of anchoring an old transcript",
+  );
+});
+
+test("a rewritten transcript with no watermark match falls back to tail detection", () => {
+  const tracker = new TranscriptDeltaTracker();
+  tracker.restore([
+    {
+      agentId: "main",
+      sessionKey: "s1",
+      tailHashes: ["00000000", "11111111"],
+      observedMessages: 2,
+      updatedAt: Date.now(),
+    },
+  ]);
+  assert.deepEqual(
+    tracker.take("main", "s1", [u("old-u"), a("old-a"), u("u1"), a("a1")]),
+    [u("u1"), a("a1")],
+  );
+});

@@ -30,7 +30,7 @@ function tempSpool(t) {
 test("capture spool atomically round-trips pending state and removes empty checkpoints", (t) => {
   const spool = tempSpool(t);
   const snapshot = {
-    version: 1,
+    version: 2,
     agents: [
       {
         agentId: "main",
@@ -46,13 +46,22 @@ test("capture spool atomically round-trips pending state and removes empty check
         queue: [],
       },
     ],
+    sessions: [
+      {
+        agentId: "main",
+        sessionKey: "s1",
+        tailHashes: ["deadbeef", "cafebabe"],
+        observedMessages: 7,
+        updatedAt: 300,
+      },
+    ],
   };
 
   spool.save(snapshot);
   assert.deepEqual(spool.load(), snapshot);
   assert.match(readFileSync(spool.path, "utf8"), /не потеряй меня/);
 
-  spool.save({ version: 1, agents: [] });
+  spool.save({ version: 2, agents: [], sessions: [] });
   assert.equal(spool.load(), undefined);
 });
 
@@ -70,7 +79,7 @@ test("partial active buffer survives process-style restart without losing messag
   const first = new BufferEngine(agents, 4, 3600, async () => {
     assert.fail("partial buffer must not flush before restart");
   }, {
-    onStateChange: (snapshot) => spool.save(snapshot),
+    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
   });
 
   first.addMessage("main", "s1", "user", "u1");
@@ -85,7 +94,7 @@ test("partial active buffer survives process-style restart without losing messag
     flushes.push(entry.buffer.messages.map((message) => `${message.role}:${message.text}`));
   }, {
     initialState: restored,
-    onStateChange: (snapshot) => spool.save(snapshot),
+    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
   });
   t.after(() => second.stop());
   second.resumeRestored();
@@ -104,7 +113,7 @@ test("failed local FIFO head survives restart and is retried before new work", a
   const first = new BufferEngine(agents, 1, 3600, async () => {
     throw new Error("backend unavailable");
   }, {
-    onStateChange: (snapshot) => spool.save(snapshot),
+    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
     notifyError: (_agentId, _sessionKey, _reason, error) => errors.push(error.message),
   });
 
@@ -121,7 +130,7 @@ test("failed local FIFO head survives restart and is retried before new work", a
     order.push(entry.buffer.messages[0].text);
   }, {
     initialState: restored,
-    onStateChange: (snapshot) => spool.save(snapshot),
+    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
   });
   t.after(() => second.stop());
 
@@ -131,4 +140,55 @@ test("failed local FIFO head survives restart and is retried before new work", a
   await waitFor(() => order.length === 2);
   assert.deepEqual(order, ["old-message", "new-message"]);
   await waitFor(() => spool.load() === undefined);
+});
+
+test("a version 1 spool from an older gateway is migrated, not rejected", (t) => {
+  const spool = tempSpool(t);
+  const legacy = {
+    version: 1,
+    agents: [
+      {
+        agentId: "main",
+        activeBuffers: [],
+        queue: [
+          {
+            buffer: {
+              sessionKey: "s1",
+              participants: { user: "Вит", assistant: "Краб" },
+              messages: [{ role: "user", text: "написано старой версией" }],
+              createdAt: 100,
+              lastActivityAt: 200,
+            },
+            enqueuedAt: 200,
+            reason: "limit",
+          },
+        ],
+      },
+    ],
+  };
+  writeFileSync(spool.path, `${JSON.stringify(legacy)}\n`, { encoding: "utf8", flag: "w" });
+
+  const restored = spool.load();
+  assert.equal(restored.version, 2);
+  assert.deepEqual(restored.sessions, []);
+  assert.deepEqual(
+    restored.agents[0].queue[0].buffer.messages,
+    [{ role: "user", text: "написано старой версией" }],
+    "unaccepted batches survive the schema upgrade",
+  );
+});
+
+test("session watermarks alone keep the spool alive", (t) => {
+  const spool = tempSpool(t);
+  spool.save({
+    version: 2,
+    agents: [],
+    sessions: [
+      { agentId: "main", sessionKey: "s1", tailHashes: ["abc12345"], observedMessages: 4, updatedAt: 1 },
+    ],
+  });
+
+  const restored = spool.load();
+  assert.equal(restored.sessions.length, 1);
+  assert.equal(restored.agents.length, 0);
 });

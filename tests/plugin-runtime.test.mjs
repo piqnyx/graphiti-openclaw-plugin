@@ -140,8 +140,8 @@ const runtimeStateRoot = mkdtempSync(join(tmpdir(), "graphiti-runtime-"));
 process.on("exit", () => rmSync(runtimeStateRoot, { recursive: true, force: true }));
 
 let apiInstance = 0;
-function makeApi(pluginConfig) {
-  process.env.OPENCLAW_STATE_DIR = join(runtimeStateRoot, `api-${apiInstance++}`);
+function makeApi(pluginConfig, stateDir) {
+  process.env.OPENCLAW_STATE_DIR = stateDir ?? join(runtimeStateRoot, `api-${apiInstance++}`);
   const hooks = new Map();
   const logs = [];
   return {
@@ -311,6 +311,44 @@ test("restart recovery continues persisted saga at episode 7", async (t) => {
   assert.equal(add.name, "6bc2a77c6957-7");
   assert.deepEqual(add.previous_episode_uuids, ["persisted-uuid-6"]);
   assert.equal(add.saga_previous_episode_uuid, "persisted-uuid-6");
+});
+
+test("a gateway restart neither replays nor drops the tail of a live session", async (t) => {
+  const toolCalls = makeFetchRecorder(t);
+  const stateDir = join(runtimeStateRoot, "restart-tail");
+  const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
+  const ctx = { agentId: "main", sessionKey, trigger: "user" };
+  const message = (role, text) => ({ role, content: text });
+
+  const first = makeApi(validConfig({ autoRecall: false, bufferLimit: 5 }), stateDir);
+  register(first.api);
+  // The run ended on a user message with no assistant reply, then the gateway stopped.
+  first.hooks.get("agent_end")({ success: false, messages: [message("user", "u1")] }, ctx);
+  await first.hooks.get("gateway_stop")();
+
+  const second = makeApi(validConfig({ autoRecall: false, bufferLimit: 5 }), stateDir);
+  register(second.api);
+  // OpenClaw replays the whole transcript snapshot for the resumed session.
+  second.hooks.get("agent_end")(
+    {
+      success: true,
+      messages: [
+        message("user", "u1"),
+        message("user", "u2"),
+        message("assistant", "a2"),
+        message("user", "u3"),
+        message("assistant", "a3"),
+      ],
+    },
+    ctx,
+  );
+  await waitFor(() => toolCalls.some((call) => call.name === "add_memory"));
+  await second.hooks.get("gateway_stop")();
+
+  const captured = toolCalls
+    .filter((call) => call.name === "add_memory")
+    .flatMap((call) => JSON.parse(call.arguments.episode_body).messages.map((m) => m.text));
+  assert.deepEqual(captured, ["u1", "u2", "a2", "u3", "a3"], "every message exactly once, in order");
 });
 
 test("capture strips Graphiti and OpenViking injections from message deltas", () => {

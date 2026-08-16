@@ -1,7 +1,34 @@
 import type { ConversationMessage } from "./text.js";
 
+/** Messages kept in a durable session watermark. */
+export const WATERMARK_TAIL_MESSAGES = 12;
+/** Most recent sessions kept in the durable watermark set. */
+export const WATERMARK_MAX_SESSIONS = 64;
+/** Watermarks older than this are dropped; an older session falls back to tail detection. */
+export const WATERMARK_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+export type SessionWatermark = {
+  agentId: string;
+  sessionKey: string;
+  /** Hashes of the last observed messages; content itself never reaches the spool. */
+  tailHashes: string[];
+  observedMessages: number;
+  updatedAt: number;
+};
+
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
   return a.role === b.role && a.text === b.text;
+}
+
+/** Stable FNV-1a over role+text so a watermark written before a restart still matches after it. */
+export function messageHash(message: ConversationMessage): string {
+  const text = `${message.role}|${message.text}`;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 function initialTail(snapshot: readonly ConversationMessage[]): ConversationMessage[] {
@@ -31,6 +58,30 @@ function initialTail(snapshot: readonly ConversationMessage[]): ConversationMess
   }
 
   return snapshot.slice(boundary + 1).map((message) => ({ ...message }));
+}
+
+/**
+ * Find where the durable watermark ends inside the current transcript.
+ *
+ * The longest stored suffix is tried first so a repeated short message cannot
+ * anchor the delta too early. Compaction that dropped part of the stored tail
+ * still matches through the shorter suffixes. Returns -1 when nothing matches.
+ */
+function findWatermarkEnd(hashes: readonly string[], tailHashes: readonly string[]): number {
+  for (let length = Math.min(tailHashes.length, hashes.length); length > 0; length -= 1) {
+    const wanted = tailHashes.slice(tailHashes.length - length);
+    for (let start = hashes.length - length; start >= 0; start -= 1) {
+      let matches = true;
+      for (let i = 0; i < length; i += 1) {
+        if (hashes[start + i] !== wanted[i]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return start + length - 1;
+    }
+  }
+  return -1;
 }
 
 function longestSuffixPrefixOverlap(
@@ -63,6 +114,7 @@ function commonPrefixLength(
 
 export class TranscriptDeltaTracker {
   private readonly snapshots = new Map<string, ConversationMessage[]>();
+  private readonly watermarks = new Map<string, SessionWatermark>();
 
   take(agentId: string, sessionKey: string, snapshot: readonly ConversationMessage[]): ConversationMessage[] {
     const key = JSON.stringify([agentId, sessionKey]);
@@ -70,7 +122,17 @@ export class TranscriptDeltaTracker {
     const previous = this.snapshots.get(key);
     this.snapshots.set(key, current);
 
-    if (!previous) return initialTail(current);
+    const delta = this.computeDelta(key, previous, current);
+    this.recordWatermark(key, agentId, sessionKey, current);
+    return delta;
+  }
+
+  private computeDelta(
+    key: string,
+    previous: ConversationMessage[] | undefined,
+    current: ConversationMessage[],
+  ): ConversationMessage[] {
+    if (!previous) return this.firstObservation(key, current);
     if (current.length === 0) return [];
 
     const prefix = commonPrefixLength(previous, current);
@@ -88,5 +150,60 @@ export class TranscriptDeltaTracker {
     // No trustworthy overlap: fail conservatively by treating this like the
     // first observation rather than replaying the entire historical transcript.
     return initialTail(current);
+  }
+
+  /**
+   * First observation inside this process. A durable watermark from before a
+   * restart tells us exactly how far the transcript was already observed, so the
+   * session resumes without replaying or skipping its own tail. Without one we
+   * fall back to boundary detection.
+   */
+  private firstObservation(key: string, current: ConversationMessage[]): ConversationMessage[] {
+    const watermark = this.watermarks.get(key);
+    if (!watermark || watermark.tailHashes.length === 0 || current.length === 0) {
+      return initialTail(current);
+    }
+
+    const end = findWatermarkEnd(current.map(messageHash), watermark.tailHashes);
+    if (end < 0) return initialTail(current);
+    return current.slice(end + 1).map((message) => ({ ...message }));
+  }
+
+  private recordWatermark(
+    key: string,
+    agentId: string,
+    sessionKey: string,
+    current: readonly ConversationMessage[],
+  ): void {
+    if (current.length === 0) return;
+    this.watermarks.set(key, {
+      agentId,
+      sessionKey,
+      tailHashes: current.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
+      observedMessages: current.length,
+      updatedAt: Date.now(),
+    });
+  }
+
+  /** Bounded, content-free watermark set for the durable spool. */
+  export(now = Date.now()): SessionWatermark[] {
+    return [...this.watermarks.values()]
+      .filter((watermark) => now - watermark.updatedAt <= WATERMARK_MAX_AGE_MS)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, WATERMARK_MAX_SESSIONS);
+  }
+
+  restore(watermarks: readonly SessionWatermark[], now = Date.now()): number {
+    let restored = 0;
+    for (const watermark of watermarks) {
+      if (now - watermark.updatedAt > WATERMARK_MAX_AGE_MS) continue;
+      if (watermark.tailHashes.length === 0) continue;
+      this.watermarks.set(JSON.stringify([watermark.agentId, watermark.sessionKey]), {
+        ...watermark,
+        tailHashes: [...watermark.tailHashes],
+      });
+      restored += 1;
+    }
+    return restored;
   }
 }

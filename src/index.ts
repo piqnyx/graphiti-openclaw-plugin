@@ -2,10 +2,10 @@ import {
   BufferEngine,
   CHECK_INTERVAL_SEC,
   type AgentSink,
-  type BufferEngineSnapshot,
   type EpisodeJson,
+  type PersistedAgentCaptureState,
 } from "./buffer.js";
-import { CaptureSpool } from "./capture-spool.js";
+import { CaptureSpool, type CaptureSpoolState } from "./capture-spool.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
@@ -75,7 +75,7 @@ function sequenceKey(agentId: string, sessionKey: string): string {
   return JSON.stringify([agentId, sessionKey]);
 }
 
-function captureSnapshotStats(snapshot: BufferEngineSnapshot | undefined): {
+function captureSnapshotStats(snapshot: { agents: PersistedAgentCaptureState[] } | undefined): {
   agents: number;
   activeBuffers: number;
   queuedEntries: number;
@@ -119,7 +119,8 @@ export function register(api: OpenClawPluginApi): void {
   const backendFingerprintByAgent = new Map<string, string>();
 
   const captureSpool = cfg.autoCapture ? new CaptureSpool() : undefined;
-  let restoredCaptureState: BufferEngineSnapshot | undefined;
+  let restoredCaptureState: CaptureSpoolState | undefined;
+  let restoredWatermarks = 0;
   if (captureSpool) {
     try {
       restoredCaptureState = captureSpool.load();
@@ -131,11 +132,15 @@ export function register(api: OpenClawPluginApi): void {
       });
       throw error;
     }
+    if (restoredCaptureState) {
+      restoredWatermarks = transcriptDeltas.restore(restoredCaptureState.sessions);
+    }
     const restored = captureSnapshotStats(restoredCaptureState);
-    if (restored.messages > 0) {
+    if (restored.messages > 0 || restoredWatermarks > 0) {
       logger.info("capture_spool_restored", {
         path: captureSpool.path,
         ...restored,
+        sessionWatermarks: restoredWatermarks,
       });
     }
   }
@@ -527,7 +532,16 @@ export function register(api: OpenClawPluginApi): void {
     sink,
     {
       initialState: restoredCaptureState,
-      onStateChange: captureSpool ? (snapshot) => captureSpool.save(snapshot) : undefined,
+      // Unaccepted batches and the transcript watermarks that describe how far
+      // each session was already captured are one atomic durable unit.
+      onStateChange: captureSpool
+        ? (snapshot) =>
+            captureSpool.save({
+              version: 2,
+              agents: snapshot.agents,
+              sessions: transcriptDeltas.export(),
+            })
+        : undefined,
       notifyError: (agentId, sessionKey, reason, error) => {
         logger.error("capture_flush_failed", {
           agentId,
@@ -751,6 +765,9 @@ export function register(api: OpenClawPluginApi): void {
       const snapshot = extractConversationMessages(Array.isArray(event.messages) ? event.messages : []);
       const delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
       if (delta.length === 0) {
+        // The watermark moved even though nothing new was captured; persist it so
+        // a restart resumes from the observed tail instead of guessing.
+        engine.checkpoint();
         logger.debug("capture_skipped", {
           agentId,
           group_id: agentId,

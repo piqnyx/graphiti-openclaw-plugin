@@ -25,6 +25,7 @@ export type GraphitiPluginConfig = {
   logContent: boolean;
   bufferLimit: number;
   bufferTimeout: number;
+  excludeSessionPatterns: string[];
   agents: Record<string, AgentActors>;
 };
 
@@ -46,6 +47,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logContent: false,
   bufferLimit: 4,
   bufferTimeout: 900,
+  excludeSessionPatterns: [],
   agents: {
     main: { user: "Вит", assistant: "Краб" },
   },
@@ -98,6 +100,28 @@ function nonEmptyName(value: unknown, what: string): string {
   return value.trim();
 }
 
+const MAX_EXCLUDE_PATTERNS = 64;
+const MAX_EXCLUDE_PATTERN_LENGTH = 512;
+
+function excludeSessionPatternsValue(raw: unknown): string[] {
+  if (raw === undefined) return [...DEFAULT_CONFIG.excludeSessionPatterns];
+  if (!Array.isArray(raw)) throw new Error("excludeSessionPatterns must be an array of strings");
+  if (raw.length > MAX_EXCLUDE_PATTERNS) {
+    throw new Error(`excludeSessionPatterns accepts at most ${MAX_EXCLUDE_PATTERNS} patterns`);
+  }
+  return raw.map((pattern, index) => {
+    if (typeof pattern !== "string" || pattern.trim() === "") {
+      throw new Error(`excludeSessionPatterns[${index}] must be a non-empty string`);
+    }
+    if (pattern.length > MAX_EXCLUDE_PATTERN_LENGTH) {
+      throw new Error(
+        `excludeSessionPatterns[${index}] must be at most ${MAX_EXCLUDE_PATTERN_LENGTH} characters`,
+      );
+    }
+    return pattern.trim();
+  });
+}
+
 function agentsValue(raw: unknown): Record<string, AgentActors> {
   if (raw === undefined) return DEFAULT_CONFIG.agents;
   const obj = asObject(raw);
@@ -125,7 +149,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "bufferLimit", "bufferTimeout", "agents",
+    "logContent", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -150,6 +174,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logContent: booleanValue(raw.logContent, DEFAULT_CONFIG.logContent, "logContent"),
     bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
+    excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
     agents: agentsValue(raw.agents),
   };
 }

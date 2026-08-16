@@ -25,6 +25,11 @@
       "logContent": { "type": "boolean" },
       "bufferLimit": { "type": "integer", "minimum": 1, "maximum": 1000 },
       "bufferTimeout": { "type": "integer", "minimum": 30, "maximum": 604800 },
+      "excludeSessionPatterns": {
+        "type": "array",
+        "maxItems": 64,
+        "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+      },
       "agents": {
         "type": "object",
         "additionalProperties": {

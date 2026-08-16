@@ -11,6 +11,7 @@ import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
+import { compileSessionPatterns, matchesSessionPattern } from "./session-filter.js";
 import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION, type SagaState } from "./mcp-client.js";
 import {
   buildRecallBlockDetailed,
@@ -105,6 +106,7 @@ export function register(api: OpenClawPluginApi): void {
   }
 
   const logger = createGraphitiLogger(api.logger, cfg);
+  const excludedSessionPatterns = compileSessionPatterns(cfg.excludeSessionPatterns);
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs, (kind, body) => {
     logger.debugContent(
       kind === "request" ? "mcp_raw_request" : "mcp_raw_response",
@@ -709,6 +711,30 @@ export function register(api: OpenClawPluginApi): void {
           return;
         }
 
+        // A session excluded from memory is excluded from both directions: it
+        // neither writes to Graphiti nor receives injected memory from it.
+        if (isBackgroundRun(ctx ?? {})) {
+          logger.debug("recall_skipped", {
+            agentId,
+            group_id: agentId,
+            reason: "background_run",
+            trigger: ctx?.trigger,
+            sessionKey: ctx?.sessionKey,
+          });
+          return;
+        }
+        const excludedByPattern = matchesSessionPattern(ctx?.sessionKey, excludedSessionPatterns);
+        if (excludedByPattern) {
+          logger.debug("recall_skipped", {
+            agentId,
+            group_id: agentId,
+            sessionKey: ctx?.sessionKey,
+            reason: "excluded_session",
+            pattern: excludedByPattern,
+          });
+          return;
+        }
+
         const currentPrompt = sanitizeConversationText(event.prompt ?? "");
         if (!currentPrompt) {
           logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "empty_query" });
@@ -835,6 +861,16 @@ export function register(api: OpenClawPluginApi): void {
         logger.debug("capture_skipped", { agentId: ctx?.agentId, reason: "slug_generator" });
         return;
       }
+      const excludedByPattern = matchesSessionPattern(ctx?.sessionKey, excludedSessionPatterns);
+      if (excludedByPattern) {
+        logger.debug("capture_skipped", {
+          agentId: ctx?.agentId,
+          sessionKey: ctx?.sessionKey,
+          reason: "excluded_session",
+          pattern: excludedByPattern,
+        });
+        return;
+      }
 
       let agentId: string;
       let sessionKey: string;
@@ -894,6 +930,7 @@ export function register(api: OpenClawPluginApi): void {
     bufferTimeout: cfg.bufferTimeout,
     captureDurableSpool: Boolean(captureSpool),
     captureSpoolPath: captureSpool?.path,
+    excludeSessionPatterns: cfg.excludeSessionPatterns,
     restoredCaptureMessages: captureSnapshotStats(restoredCaptureState).messages,
     agents: Object.entries(cfg.agents).map(([agentId, actors]) =>
       `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,

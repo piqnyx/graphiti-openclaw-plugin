@@ -66,6 +66,29 @@ export class EpisodeSequenceTracker {
     state.pending = undefined;
   }
 
+  /**
+   * Re-adopt an episode identity that was reserved before a restart, so the
+   * replay of an unconfirmed batch reuses the same UUID, name and predecessor
+   * instead of minting a second episode for the same messages.
+   *
+   * Returns false when Graphiti has moved past that batch number or chained a
+   * different predecessor; the caller then falls back to a fresh reservation.
+   */
+  adoptPending(agentId: string, sessionKey: string, prepared: PreparedEpisodeSequence): boolean {
+    const state = this.getState(agentId, sessionKey);
+    if (state.pending) {
+      throw new Error(`cannot adopt an episode identity over a pending batch for ${agentId}/${sessionKey}`);
+    }
+    if (prepared.batchNumber !== state.acceptedBatches + 1) return false;
+    if (prepared.sagaPreviousEpisodeUuid !== state.lastEpisodeUuid) return false;
+
+    state.pending = {
+      ...prepared,
+      previousEpisodeUuids: [...prepared.previousEpisodeUuids],
+    };
+    return true;
+  }
+
   hydrate(agentId: string, sessionKey: string, acceptedBatches: number, lastEpisodeUuid?: string): void {
     if (!Number.isInteger(acceptedBatches) || acceptedBatches < 0) {
       throw new Error("acceptedBatches must be a non-negative integer");

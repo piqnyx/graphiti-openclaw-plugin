@@ -2,6 +2,7 @@ import {
   BufferEngine,
   CHECK_INTERVAL_SEC,
   type AgentSink,
+  type EpisodeIdentity,
   type EpisodeJson,
   type PersistedAgentCaptureState,
 } from "./buffer.js";
@@ -10,7 +11,7 @@ import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
-import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION } from "./mcp-client.js";
+import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION, type SagaState } from "./mcp-client.js";
 import {
   buildRecallBlockDetailed,
   buildRecallQuery,
@@ -396,23 +397,9 @@ export function register(api: OpenClawPluginApi): void {
     }
   };
 
-  const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
-    const key = sequenceKey(agentId, sessionKey);
-    if (hydratedSequences.has(key)) return;
-
+  const fetchSagaState = async (agentId: string, sessionKey: string): Promise<SagaState | undefined> => {
     const saga = await client.getSaga(sessionKey, agentId);
-    if (!saga) {
-      sequences.hydrate(agentId, sessionKey, 0);
-      hydratedSequences.add(key);
-      logger.debug("capture_sequence_hydrated", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        episodeCount: 0,
-        source: "graphiti",
-      });
-      return;
-    }
+    if (!saga) return undefined;
 
     if (saga.groupId !== agentId || saga.name !== sessionKey) {
       throw new Error(
@@ -424,24 +411,123 @@ export function register(api: OpenClawPluginApi): void {
         `Graphiti saga ${agentId}/${sessionKey} has ${saga.episodeCount} episodes but no last_episode_uuid`,
       );
     }
+    return saga;
+  };
 
-    sequences.hydrate(agentId, sessionKey, saga.episodeCount, saga.lastEpisodeUuid);
+  const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
+    const key = sequenceKey(agentId, sessionKey);
+    if (hydratedSequences.has(key)) return;
+
+    const saga = await fetchSagaState(agentId, sessionKey);
+    sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
     hydratedSequences.add(key);
     logger.debug("capture_sequence_hydrated", {
       agentId,
       group_id: agentId,
       saga: sessionKey,
-      episodeCount: saga.episodeCount,
-      lastEpisodeUuid: saga.lastEpisodeUuid,
+      episodeCount: saga?.episodeCount ?? 0,
+      lastEpisodeUuid: saga?.lastEpisodeUuid,
       source: "graphiti",
     });
   };
 
+  /**
+   * A batch restored from the spool was already submitted once, and the answer to
+   * that submission was lost with the previous process. Ask Graphiti which of the
+   * two happened before doing anything else.
+   *
+   * Returns true when the batch is already persisted and must not be sent again.
+   */
+  const reconcileRestoredBatch = async (
+    agentId: string,
+    sessionKey: string,
+    identity: EpisodeIdentity,
+  ): Promise<boolean> => {
+    const key = sequenceKey(agentId, sessionKey);
+    const saga = await fetchSagaState(agentId, sessionKey);
+
+    if (saga?.lastEpisodeUuid === identity.uuid) {
+      // Graphiti holds this exact episode. Continue the chain from it instead of
+      // creating a second episode with the same content.
+      sequences.hydrate(agentId, sessionKey, identity.batchNumber, identity.uuid);
+      hydratedSequences.add(key);
+      logger.info("capture_replay_already_persisted", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        name: identity.name,
+        batchNumber: identity.batchNumber,
+        uuid: identity.uuid,
+        action: "dropped_confirmed_batch",
+      });
+      return true;
+    }
+
+    sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
+    hydratedSequences.add(key);
+
+    const adopted = sequences.adoptPending(agentId, sessionKey, {
+      batchNumber: identity.batchNumber,
+      episodeUuid: identity.uuid,
+      name: identity.name,
+      previousEpisodeUuids: identity.previousEpisodeUuid ? [identity.previousEpisodeUuid] : [],
+      ...(identity.previousEpisodeUuid === undefined
+        ? {}
+        : { sagaPreviousEpisodeUuid: identity.previousEpisodeUuid }),
+    });
+
+    if (adopted) {
+      logger.info("capture_replay_reserved_identity", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        name: identity.name,
+        batchNumber: identity.batchNumber,
+        uuid: identity.uuid,
+        action: "retry_with_same_uuid",
+      });
+    } else {
+      logger.warn("capture_replay_identity_diverged", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        reservedBatchNumber: identity.batchNumber,
+        reservedUuid: identity.uuid,
+        sagaEpisodeCount: saga?.episodeCount ?? 0,
+        sagaLastEpisodeUuid: saga?.lastEpisodeUuid,
+        action: "reserving_new_identity",
+      });
+    }
+    return false;
+  };
+
   const sink: AgentSink = async (agentId, entry, reason) => {
     const sessionKey = entry.buffer.sessionKey;
+
+    if (entry.identityRestored && entry.episode) {
+      const alreadyPersisted = await reconcileRestoredBatch(agentId, sessionKey, entry.episode);
+      entry.identityRestored = false;
+      // Returning without submitting reports the batch as delivered, which is
+      // exactly right: Graphiti already has it.
+      if (alreadyPersisted) return;
+    }
+
     await ensureSequenceHydrated(agentId, sessionKey);
 
     const sequence = sequences.prepare(agentId, sessionKey);
+    // Record what we are about to submit before submitting it. If the answer is
+    // lost with the process, the next start knows which episode to ask about.
+    entry.episode = {
+      uuid: sequence.episodeUuid,
+      name: sequence.name,
+      batchNumber: sequence.batchNumber,
+      ...(sequence.sagaPreviousEpisodeUuid === undefined
+        ? {}
+        : { previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid }),
+      submittedAt: Date.now(),
+    };
+    engine.checkpoint();
+
     const episode: EpisodeJson = entry.buffer.episode;
     const jsonBody = JSON.stringify(episode);
     const referenceTime = new Date(entry.enqueuedAt).toISOString();

@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type {
+  EpisodeIdentity,
   PersistedAgentCaptureState,
   PersistedBuffer,
   PersistedQueueEntry,
@@ -99,6 +100,37 @@ function parsePersistedBuffer(value: unknown): PersistedBuffer {
   };
 }
 
+function parseEpisodeIdentity(value: unknown): EpisodeIdentity {
+  if (!isObject(value)) throw new Error("capture spool queue entry has an invalid episode identity");
+  if (typeof value.uuid !== "string" || value.uuid.trim() === "") {
+    throw new Error("capture spool episode identity has an invalid uuid");
+  }
+  if (typeof value.name !== "string" || value.name.trim() === "") {
+    throw new Error("capture spool episode identity has an invalid name");
+  }
+  if (!Number.isInteger(value.batchNumber) || (value.batchNumber as number) < 1) {
+    throw new Error("capture spool episode identity has an invalid batchNumber");
+  }
+  if (
+    value.previousEpisodeUuid !== undefined &&
+    (typeof value.previousEpisodeUuid !== "string" || value.previousEpisodeUuid.trim() === "")
+  ) {
+    throw new Error("capture spool episode identity has an invalid previousEpisodeUuid");
+  }
+  if (typeof value.submittedAt !== "number" || !Number.isFinite(value.submittedAt)) {
+    throw new Error("capture spool episode identity has an invalid submittedAt");
+  }
+  return {
+    uuid: value.uuid,
+    name: value.name,
+    batchNumber: value.batchNumber as number,
+    ...(value.previousEpisodeUuid === undefined
+      ? {}
+      : { previousEpisodeUuid: value.previousEpisodeUuid as string }),
+    submittedAt: value.submittedAt,
+  };
+}
+
 function parseQueueEntry(value: unknown): PersistedQueueEntry {
   if (!isObject(value)) throw new Error("capture spool contains an invalid queue entry");
   if (value.reason !== "limit" && value.reason !== "timeout") {
@@ -111,6 +143,7 @@ function parseQueueEntry(value: unknown): PersistedQueueEntry {
     buffer: parsePersistedBuffer(value.buffer),
     enqueuedAt: value.enqueuedAt,
     reason: value.reason,
+    ...(value.episode === undefined ? {} : { episode: parseEpisodeIdentity(value.episode) }),
   };
 }
 

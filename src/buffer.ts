@@ -26,10 +26,26 @@ export type Buffer = {
 
 export type FlushReason = "limit" | "timeout";
 
+/**
+ * The Graphiti episode identity reserved for a batch before it is submitted.
+ * Persisting it lets a restarted gateway ask Graphiti whether the batch already
+ * landed instead of replaying it blindly under a fresh UUID.
+ */
+export type EpisodeIdentity = {
+  uuid: string;
+  name: string;
+  batchNumber: number;
+  previousEpisodeUuid?: string;
+  submittedAt: number;
+};
+
 export type QueueEntry = {
   buffer: Buffer;
   enqueuedAt: number;
   reason: FlushReason;
+  episode?: EpisodeIdentity;
+  /** Set only for identities restored from the spool; cleared once reconciled. */
+  identityRestored?: boolean;
 };
 
 export type AgentCaptureState = {
@@ -53,6 +69,7 @@ export type PersistedQueueEntry = {
   buffer: PersistedBuffer;
   enqueuedAt: number;
   reason: FlushReason;
+  episode?: EpisodeIdentity;
 };
 
 export type PersistedAgentCaptureState = {
@@ -253,6 +270,9 @@ export class BufferEngine {
             buffer: restoreBuffer(entry.buffer),
             enqueuedAt: entry.enqueuedAt,
             reason: entry.reason,
+            ...(entry.episode
+              ? { episode: { ...entry.episode }, identityRestored: true }
+              : {}),
           })),
       );
     }
@@ -343,6 +363,7 @@ export class BufferEngine {
         buffer: persistBuffer(entry.buffer),
         enqueuedAt: entry.enqueuedAt,
         reason: entry.reason,
+        ...(entry.episode ? { episode: { ...entry.episode } } : {}),
       }));
       if (activeBuffers.length === 0 && queue.length === 0) continue;
       agents.push({ agentId: state.agentId, activeBuffers, queue });

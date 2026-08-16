@@ -94,3 +94,34 @@ test("episodeNamePrefix uses UUID tail and has a safe fallback", () => {
   );
   assert.equal(episodeNamePrefix("agent:main:telegram chat"), "telegram-chat");
 });
+
+test("a reserved identity is re-adopted only when the saga still expects it", () => {
+  const tracker = new EpisodeSequenceTracker();
+  tracker.hydrate("main", "s1", 3, "uuid-3");
+
+  const reserved = {
+    batchNumber: 4,
+    episodeUuid: "reserved-uuid-4",
+    name: "s1-4",
+    previousEpisodeUuids: ["uuid-3"],
+    sagaPreviousEpisodeUuid: "uuid-3",
+  };
+  assert.equal(tracker.adoptPending("main", "s1", reserved), true);
+  assert.deepEqual(tracker.prepare("main", "s1"), reserved, "the replay reuses the reserved identity");
+
+  const diverged = new EpisodeSequenceTracker();
+  diverged.hydrate("main", "s1", 5, "uuid-5");
+  assert.equal(
+    diverged.adoptPending("main", "s1", reserved),
+    false,
+    "a saga that moved past the reserved batch must not reuse its number",
+  );
+
+  const otherPredecessor = new EpisodeSequenceTracker();
+  otherPredecessor.hydrate("main", "s1", 3, "somebody-elses-uuid-3");
+  assert.equal(
+    otherPredecessor.adoptPending("main", "s1", reserved),
+    false,
+    "a different predecessor means the chain diverged",
+  );
+});

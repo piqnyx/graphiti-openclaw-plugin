@@ -86,6 +86,7 @@ function makeFetchRecorder(t, options = {}) {
       });
     }
     if (payload.params.name === "add_memory") {
+      if (options.failAddMemory) throw new Error("simulated transport failure");
       if (options.failAddMemoryOnce && !options.__failed) {
         options.__failed = true;
         throw new Error("simulated transport failure");
@@ -349,6 +350,74 @@ test("a gateway restart neither replays nor drops the tail of a live session", a
     .filter((call) => call.name === "add_memory")
     .flatMap((call) => JSON.parse(call.arguments.episode_body).messages.map((m) => m.text));
   assert.deepEqual(captured, ["u1", "u2", "a2", "u3", "a3"], "every message exactly once, in order");
+});
+
+/** Leave one submitted-but-unanswered batch in the durable spool, like a stop mid-request. */
+async function spoolUnansweredBatch(t, stateDir) {
+  const calls = makeFetchRecorder(t, { failAddMemory: true });
+  const { hooks } = registerRuntime(stateDir);
+  hooks.get("agent_end")(completedTurn(1), restartCtx);
+  hooks.get("agent_end")(completedTurn(2), restartCtx);
+  await waitFor(() => calls.some((call) => call.name === "add_memory"));
+  await hooks.get("gateway_stop")();
+  return calls.find((call) => call.name === "add_memory").arguments;
+}
+
+const restartSessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
+const restartCtx = { agentId: "main", sessionKey: restartSessionKey, trigger: "user" };
+
+function registerRuntime(stateDir) {
+  const runtime = makeApi(validConfig({ autoRecall: false, bufferLimit: 4 }), stateDir);
+  register(runtime.api);
+  return runtime;
+}
+
+test("a batch Graphiti already persisted is never submitted a second time", async (t) => {
+  const stateDir = join(runtimeStateRoot, "reconcile-persisted");
+  const submitted = await spoolUnansweredBatch(t, stateDir);
+
+  // The request did reach Graphiti before the stop: the saga now ends on that uuid.
+  const calls = makeFetchRecorder(t, {
+    sagaState: { episodeCount: 1, lastEpisodeUuid: submitted.uuid },
+  });
+  const { hooks, logs } = registerRuntime(stateDir);
+  await waitFor(() => logs.some((line) => line.includes("event=capture_replay_already_persisted")));
+
+  assert.deepEqual(
+    calls.filter((call) => call.name === "add_memory"),
+    [],
+    "a confirmed batch is dropped instead of duplicated",
+  );
+
+  // The chain continues from the confirmed episode as batch 2.
+  hooks.get("agent_end")(completedTurn(3), restartCtx);
+  hooks.get("agent_end")(completedTurn(4), restartCtx);
+  await waitFor(() => calls.some((call) => call.name === "add_memory"));
+  const next = calls.find((call) => call.name === "add_memory").arguments;
+  assert.equal(next.name, "6bc2a77c6957-2");
+  assert.equal(next.saga_previous_episode_uuid, submitted.uuid);
+  await hooks.get("gateway_stop")();
+});
+
+test("an unconfirmed batch is replayed with its reserved episode identity", async (t) => {
+  const stateDir = join(runtimeStateRoot, "reconcile-unconfirmed");
+  const submitted = await spoolUnansweredBatch(t, stateDir);
+
+  // The request never reached Graphiti: the saga does not exist at all.
+  const calls = makeFetchRecorder(t);
+  const { hooks, logs } = registerRuntime(stateDir);
+  await waitFor(() => calls.some((call) => call.name === "add_memory"));
+
+  const replay = calls.find((call) => call.name === "add_memory").arguments;
+  assert.equal(replay.uuid, submitted.uuid, "the reserved UUID survives the restart");
+  assert.equal(replay.name, submitted.name);
+  assert.equal(replay.saga_previous_episode_uuid, submitted.saga_previous_episode_uuid);
+  assert.deepEqual(
+    JSON.parse(replay.episode_body).messages,
+    JSON.parse(submitted.episode_body).messages,
+  );
+  assert.ok(logs.some((line) => line.includes("event=capture_replay_reserved_identity")));
+  await hooks.get("gateway_stop")();
 });
 
 test("capture strips Graphiti and OpenViking injections from message deltas", () => {

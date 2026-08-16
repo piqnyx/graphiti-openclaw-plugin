@@ -511,6 +511,45 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             }
           }
 
+          // Everything below comes from the same window of episodes: shape of the
+          // memory, not just its health. Batch size is what tells an operator
+          // whether bufferLimit is set sensibly.
+          const notes = episodes.filter((e) => e.source_description === STORE_SOURCE_DESCRIPTION);
+          const batches = episodes.filter((e) => e.source_description !== STORE_SOURCE_DESCRIPTION);
+          const dialogs = new Set(
+            batches
+              .map((e) => (typeof e.name === "string" ? e.name.replace(/-\d+$/, "") : ""))
+              .filter(Boolean),
+          );
+          const sizes = batches
+            .map((e) => (typeof e.content === "string" ? e.content.length : 0))
+            .filter((size) => size > 0)
+            .sort((a, b) => a - b);
+          const times = episodes
+            .map((e) => (typeof e.created_at === "string" ? Date.parse(e.created_at) : NaN))
+            .filter((time) => Number.isFinite(time));
+
+          details.dialogs = dialogs.size;
+          details.notes = notes.length;
+          if (dialogs.size > 0) {
+            lines.push(
+              `Across this agent: ${batches.length} committed batch(es) from ${dialogs.size} dialog(s)` +
+                (notes.length > 0 ? `, plus ${notes.length} explicit note(s)` : "") + ".",
+            );
+          }
+          if (sizes.length > 0) {
+            const median = sizes[Math.floor(sizes.length / 2)] ?? 0;
+            details.medianBatchChars = median;
+            lines.push(
+              `Typical committed batch is ${median} characters (smallest ${sizes[0]}, largest ${sizes[sizes.length - 1]}).`,
+            );
+          }
+          if (times.length > 1) {
+            const spanHours = Math.round((Math.max(...times) - Math.min(...times)) / 3_600_000);
+            details.spanHours = spanHours;
+            lines.push(`Memory in this window spans about ${spanHours} hour(s).`);
+          }
+
           const newest = episodes[0];
           const createdAt = typeof newest?.created_at === "string" ? Date.parse(newest.created_at) : NaN;
           if (Number.isFinite(createdAt)) {

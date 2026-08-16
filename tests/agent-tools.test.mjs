@@ -265,6 +265,34 @@ test("numbering inspection names the two failures this project has actually had"
   assert.equal(foreign.seen, 1);
 });
 
+test("status describes the shape of memory, not only its health", async (t) => {
+  const hour = 3_600_000;
+  const now = Date.now();
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_saga: () => ({ error: "No saga named 'x' found in group 'main'" }),
+    get_episodes: () => ({
+      episodes: [
+        { name: "aaa-2", content: "x".repeat(9000), created_at: new Date(now).toISOString(), source_description: "OpenClaw conversation batch" },
+        { name: "aaa-1", content: "x".repeat(5000), created_at: new Date(now - 2 * hour).toISOString(), source_description: "OpenClaw conversation batch" },
+        { name: "bbb-1", content: "x".repeat(1000), created_at: new Date(now - 3 * hour).toISOString(), source_description: "OpenClaw conversation batch" },
+        { name: "правило", content: "note", created_at: new Date(now - hour).toISOString(), source_description: "OpenClaw agent note" },
+      ],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  const text = result.content[0].text;
+
+  assert.equal(result.details.dialogs, 2, "two dialogs, counted by episode name prefix");
+  assert.equal(result.details.notes, 1, "an explicit note is not a dialog batch");
+  assert.equal(result.details.medianBatchChars, 5000);
+  assert.equal(result.details.spanHours, 3);
+  assert.match(text, /3 committed batch\(es\) from 2 dialog\(s\), plus 1 explicit note/);
+  assert.match(text, /Typical committed batch is 5000 characters/);
+});
+
 test("status refuses to call a duplicated dialog healthy", async (t) => {
   installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),

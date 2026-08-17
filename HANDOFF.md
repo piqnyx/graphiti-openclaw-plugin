@@ -374,7 +374,9 @@ Fork не vanilla Graphiti. При любом rebase/upstream update отдел�
 4. `get_saga(saga_name, group_id)`;
 5. `get_queue_status(group_id)`;
 6. directed Saga chronology;
-7. `tools/falkor_validate.py` read-only validator.
+7. `tools/falkor_validate.py` read-only validator;
+8. `get_graph_stats(group_id, top_entities)` — размер, топ сущностей по связям, проверки целостности для `graphiti_status`;
+9. `get_episodes_by_ref(uuids, names, group_id)` — эпизоды с текстом по ссылке, без него `graphiti_context` не существует.
 
 ---
 
@@ -650,6 +652,7 @@ agent_tools_unavailable
 tool_status
 tool_recall
 tool_search_entities
+tool_context
 tool_episodes
 tool_store
 tool_refused

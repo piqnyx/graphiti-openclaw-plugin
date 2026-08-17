@@ -60,27 +60,45 @@ export type PendingBatch = {
 export type PendingConfirmationOptions = {
   /** How long to wait after a submission before expecting the episode to exist. */
   graceMs: number;
-  /** How many times one batch may be resubmitted before it is reported as stuck. */
-  maxAttempts: number;
-  /** How many outstanding batches to keep; the oldest are dropped past this. */
-  maxTracked: number;
+  /** The longest a retry may be deferred. Doubling stops here. */
+  maxBackoffMs: number;
+  /** After this many attempts a batch is worth mentioning — not worth abandoning. */
+  attentionAfterAttempts: number;
+  /** How many bytes of outstanding batches to keep before the oldest are dropped. */
+  maxBytes: number;
 };
 
 export const DEFAULT_CONFIRMATION_OPTIONS: PendingConfirmationOptions = {
   // Extraction on a busy backend takes tens of seconds; a grace shorter than that
   // would resubmit work that is merely in progress.
-  graceMs: 120_000,
-  maxAttempts: 5,
-  maxTracked: 200,
+  graceMs: 30_000,
+  // The failure this exists for is an unreachable or rate-limited model, which
+  // comes back in hours. Retrying every thirty seconds through that keeps a
+  // depleted quota pinned and delays the recovery it is waiting for, so the wait
+  // doubles — and stops doubling at an hour, because a backend that returns after
+  // a week should not then be ignored for a day.
+  maxBackoffMs: 3_600_000,
+  attentionAfterAttempts: 5,
+  // Fifty gigabytes of conversation is a quantity these agents cannot produce in
+  // years. The bound exists so that failure is bounded, not to economise: nothing
+  // is given up while there is room, however long the backend stays down.
+  maxBytes: 50 * 1024 * 1024 * 1024,
 };
 
 export type ConfirmationSnapshot = {
   outstanding: number;
-  /** Batches past their grace period, oldest first: what needs resubmitting now. */
+  /** Total size of what is outstanding, for reporting against the bound. */
+  bytes: number;
+  /** Batches whose backoff has elapsed, oldest first: what to resend now. */
   due: PendingBatch[];
-  /** Batches that exhausted their attempts and need a human to look. */
-  stuck: PendingBatch[];
-  /** Batches dropped because the bound was reached, since the process started. */
+  /**
+   * Batches that have been retried enough times to be worth mentioning.
+   *
+   * They keep being retried. This list exists so the status tool can say that
+   * something is not landing, not so anything gets abandoned.
+   */
+  needsAttention: PendingBatch[];
+  /** Batches dropped because the byte bound was reached, since the process started. */
   dropped: number;
   oldestAgeMs?: number;
 };
@@ -103,7 +121,8 @@ export class PendingConfirmationTracker {
       previousEpisodeUuids: [...batch.previousEpisodeUuids],
       submittedAt: batch.submittedAt ?? Date.now(),
       // A resubmission of the same uuid continues its attempt count rather than
-      // starting over, so a batch that can never land is eventually reported.
+      // starting over: the count is what widens the wait and what tells the
+      // status tool that something is not landing.
       attempts: batch.attempts ?? (existing ? existing.attempts + 1 : 0),
     });
     this.enforceBound();
@@ -123,13 +142,19 @@ export class PendingConfirmationTracker {
     return [...this.pending.keys()];
   }
 
+  /** How long to wait before the next attempt on a batch that has failed this often. */
+  backoffFor(attempts: number): number {
+    const doubled = this.options.graceMs * 2 ** Math.max(0, attempts);
+    return Math.min(doubled, this.options.maxBackoffMs);
+  }
+
   snapshot(now = Date.now()): ConfirmationSnapshot {
     const all = [...this.pending.values()].sort((a, b) => a.submittedAt - b.submittedAt);
-    const ripe = all.filter((batch) => now - batch.submittedAt >= this.options.graceMs);
     return {
       outstanding: all.length,
-      due: ripe.filter((batch) => batch.attempts < this.options.maxAttempts),
-      stuck: ripe.filter((batch) => batch.attempts >= this.options.maxAttempts),
+      bytes: all.reduce((sum, batch) => sum + batch.episodeBody.length, 0),
+      due: all.filter((batch) => now - batch.submittedAt >= this.backoffFor(batch.attempts)),
+      needsAttention: all.filter((batch) => batch.attempts >= this.options.attentionAfterAttempts),
       dropped: this.droppedCount,
       ...(all.length > 0 ? { oldestAgeMs: now - (all[0]?.submittedAt ?? now) } : {}),
     };
@@ -166,7 +191,7 @@ export class PendingConfirmationTracker {
   }
 
   private enforceBound(): void {
-    while (this.pending.size > this.options.maxTracked) {
+    while (this.bytes() > this.options.maxBytes && this.pending.size > 0) {
       // Oldest first: the newest batches are the ones still likely to land, and
       // the oldest have had the most chances already.
       const oldest = [...this.pending.values()].sort((a, b) => a.submittedAt - b.submittedAt)[0];
@@ -174,5 +199,11 @@ export class PendingConfirmationTracker {
       this.pending.delete(oldest.uuid);
       this.droppedCount += 1;
     }
+  }
+
+  private bytes(): number {
+    let total = 0;
+    for (const batch of this.pending.values()) total += batch.episodeBody.length;
+    return total;
   }
 }

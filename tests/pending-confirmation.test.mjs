@@ -41,29 +41,55 @@ test("only batches past the grace period are due for resubmission", () => {
   assert.deepEqual(due, ["ripe"]);
 });
 
-test("a batch that never lands is reported rather than retried forever", () => {
-  const tracker = new PendingConfirmationTracker({ graceMs: 0, maxAttempts: 2 });
-  tracker.track(batch("doomed"));
-  tracker.track(batch("doomed"));
-  tracker.track(batch("doomed"));
+test("a batch that keeps failing is reported but never abandoned", () => {
+  const tracker = new PendingConfirmationTracker({ graceMs: 1, attentionAfterAttempts: 2 });
+  tracker.track(batch("doomed", { submittedAt: 0 }));
+  tracker.track(batch("doomed", { submittedAt: 0 }));
+  tracker.track(batch("doomed", { submittedAt: 0 }));
 
   const snapshot = tracker.snapshot();
-  assert.equal(snapshot.due.length, 0);
-  assert.equal(snapshot.stuck.length, 1);
-  assert.equal(snapshot.stuck[0].attempts, 2);
+  // The failure this guards against is a model that comes back in hours. Giving
+  // up on it would throw away exactly what waiting would have saved.
+  assert.equal(snapshot.due.length, 1, "it must still be due for another attempt");
+  assert.equal(snapshot.needsAttention.length, 1, "and the user must be able to hear about it");
+  assert.equal(snapshot.needsAttention[0].attempts, 2);
 });
 
-test("the tracker is bounded, and says how much it dropped", () => {
-  const tracker = new PendingConfirmationTracker({ maxTracked: 2 });
-  const now = Date.now();
-  tracker.track(batch("a", { submittedAt: now - 3_000 }));
-  tracker.track(batch("b", { submittedAt: now - 2_000 }));
-  tracker.track(batch("c", { submittedAt: now - 1_000 }));
+test("the wait doubles with each failure and stops at the ceiling", () => {
+  const tracker = new PendingConfirmationTracker({ graceMs: 30_000, maxBackoffMs: 3_600_000 });
 
-  // An outage must cost a bounded amount of disk. What was given up is counted,
-  // not hidden: the status tool reports it.
+  assert.equal(tracker.backoffFor(0), 30_000);
+  assert.equal(tracker.backoffFor(1), 60_000);
+  assert.equal(tracker.backoffFor(2), 120_000);
+  // Retrying every thirty seconds through a rate limit keeps the quota pinned;
+  // waiting a day after one would ignore a backend that has already returned.
+  assert.equal(tracker.backoffFor(20), 3_600_000);
+});
+
+test("a batch waits out its own backoff before being resent", () => {
+  const tracker = new PendingConfirmationTracker({ graceMs: 30_000 });
+  const now = Date.now();
+  tracker.track(batch("first-try", { uuid: "first-try", submittedAt: now - 40_000, attempts: 0 }));
+  tracker.track(batch("third-try", { uuid: "third-try", submittedAt: now - 40_000, attempts: 3 }));
+
+  const due = tracker.snapshot(now).due.map((entry) => entry.uuid);
+  assert.deepEqual(due, ["first-try"], "a batch retried three times waits four minutes, not thirty seconds");
+});
+
+test("the ledger is bounded by size, and says how much it had to drop", () => {
+  // Fifty gigabytes in practice; a tiny bound here to reach it in three batches.
+  const tracker = new PendingConfirmationTracker({ maxBytes: 40 });
+  const now = Date.now();
+  const body = { episodeBody: "x".repeat(20) };
+  tracker.track(batch("a", { uuid: "a", submittedAt: now - 3_000, ...body }));
+  tracker.track(batch("b", { uuid: "b", submittedAt: now - 2_000, ...body }));
+  tracker.track(batch("c", { uuid: "c", submittedAt: now - 1_000, ...body }));
+
+  // Nothing is given up while there is room, however long the backend is down.
+  // Past the bound the oldest go first, and what was lost is counted, not hidden.
   assert.deepEqual(tracker.outstandingUuids().sort(), ["b", "c"]);
   assert.equal(tracker.snapshot().dropped, 1);
+  assert.equal(tracker.snapshot().bytes, 40);
 });
 
 test("the highest issued number per session survives a restart", () => {

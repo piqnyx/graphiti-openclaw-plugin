@@ -830,8 +830,9 @@ export function register(api: OpenClawPluginApi): void {
         }
       }
 
-      for (const batch of snapshot.stuck) {
-        logger.error("capture_batch_stuck", {
+      // Reported, never abandoned: it will be tried again, just less often.
+      for (const batch of snapshot.needsAttention) {
+        logger.warn("capture_batch_not_landing", {
           agentId: batch.agentId,
           group_id: batch.agentId,
           saga: batch.sessionKey,
@@ -840,7 +841,8 @@ export function register(api: OpenClawPluginApi): void {
           uuid: batch.uuid,
           attempts: batch.attempts,
           ageMs: Date.now() - batch.submittedAt,
-          action: "reported_via_graphiti_status",
+          nextAttemptInMs: pendingConfirmation.backoffFor(batch.attempts),
+          action: "still_retrying",
         });
       }
 

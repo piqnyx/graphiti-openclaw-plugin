@@ -209,18 +209,6 @@ export class GraphitiMcpClient {
    * Entity search. Like searchFacts this is scoped to one group, which the fork
    * resolves to that agent's physical graph.
    */
-  async searchNodes(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
-    const result = await this.callTool("search_nodes", {
-      query,
-      group_ids: groupId,
-      max_nodes: limit,
-    });
-    if (typeof result.error === "string") throw new Error(result.error);
-    return Array.isArray(result.nodes)
-      ? result.nodes.filter((node): node is JsonObject => isObject(node))
-      : [];
-  }
-
   async getEpisodes(groupId: string, limit: number): Promise<JsonObject[]> {
     const result = await this.callTool("get_episodes", {
       group_ids: groupId,
@@ -267,6 +255,41 @@ export class GraphitiMcpClient {
     return Array.isArray(result.episodes)
       ? result.episodes.filter((episode): episode is JsonObject => isObject(episode))
       : [];
+  }
+
+  /**
+   * One search returning facts, entities and episodes, each with its score.
+   *
+   * Replaces the separate fact and node searches: the server runs a single
+   * retrieval pass, and the scores it computes survive the trip, which is what
+   * lets an agent choose what to expand by number rather than by position.
+   */
+  async searchCombined(
+    query: string,
+    groupId: string,
+    limit: number,
+    filters: {
+      validAtAfter?: string;
+      validAtBefore?: string;
+      createdAtAfter?: string;
+    } = {},
+  ): Promise<{ facts: JsonObject[]; entities: JsonObject[]; episodes: JsonObject[] }> {
+    const result = await this.callTool("search_memory_combined", {
+      query,
+      group_id: groupId,
+      limit,
+      valid_at_after: filters.validAtAfter ?? null,
+      valid_at_before: filters.validAtBefore ?? null,
+      created_at_after: filters.createdAtAfter ?? null,
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
+    const list = (value: unknown): JsonObject[] =>
+      Array.isArray(value) ? value.filter((item): item is JsonObject => isObject(item)) : [];
+    return {
+      facts: list(result.facts),
+      entities: list(result.entities),
+      episodes: list(result.episodes),
+    };
   }
 
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {

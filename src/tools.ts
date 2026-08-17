@@ -11,15 +11,19 @@ import type { PluginToolContext, PluginToolDefinition, PluginToolResult } from "
 export const TOOL_PREFIX = "graphiti_";
 
 export const TOOL_NAMES = [
-  "graphiti_recall",
-  "graphiti_search_entities",
-  "graphiti_context",
-  "graphiti_episodes",
+  "graphiti_search",
+  "graphiti_browse",
   "graphiti_note",
   "graphiti_status",
 ] as const;
 
 const MAX_NOTE_CHARS = 32_000;
+/** Per-type result limits for graphiti_search; zero excludes a type entirely. */
+const DEFAULT_SEARCH_LIMIT = 10;
+const MAX_SEARCH_LIMIT = 50;
+/** How many episode anchors accompany each hit. */
+const DEFAULT_ANCHORS = 10;
+const MAX_ANCHORS = 25;
 /** How many recent episodes the status tool inspects when checking numbering. */
 const CHAIN_CHECK_EPISODES = 100;
 /** How many of the most connected entities the status tool names. */
@@ -27,8 +31,8 @@ const TOP_ENTITIES = 10;
 /** Default and maximum size, in characters, of each side of a context window. */
 const DEFAULT_CONTEXT_CHARS = 2_000;
 const MAX_CONTEXT_CHARS = 20_000;
-/** How many batches either side of the match graphiti_context may fetch. */
-const CONTEXT_NEIGHBOURS = 3;
+/** How many batches either side of an anchor graphiti_browse reads. */
+const BROWSE_NEIGHBOURS = 3;
 
 /**
  * Split an episode name into the dialog it belongs to and its batch number.
@@ -162,6 +166,96 @@ function stringParam(params: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Like limitParam, but zero is a legitimate answer: it means "none of this type". */
+function countParam(params: Record<string, unknown>, key: string, fallback: number, max: number): number {
+  const value = params[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(Math.trunc(value), 0), max);
+}
+
+function asStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** Two decimals: the agent compares these numbers, it does not do arithmetic on them. */
+function formatScore(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "?";
+}
+
+/**
+ * Map episode uuids to their names.
+ *
+ * Facts carry uuids, and a uuid is useless to an agent: it cannot be typed back
+ * into graphiti_browse, and it says nothing about which dialog or when. Names
+ * carry both. One lookup covers the whole result set.
+ */
+async function resolveEpisodeNames(
+  client: GraphitiMcpClient,
+  agentId: string,
+  uuids: readonly string[],
+): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  if (uuids.length === 0) return names;
+  const episodes = await client.getEpisodesByRef(agentId, { uuids: [...uuids] });
+  for (const episode of episodes) {
+    const uuid = typeof episode.uuid === "string" ? episode.uuid : "";
+    const name = typeof episode.name === "string" ? episode.name : "";
+    if (uuid && name) names.set(uuid, name);
+  }
+  return names;
+}
+
+/**
+ * Render one episode with the conversation around it.
+ *
+ * Neighbours are found by batch number rather than by timestamp: the chain is
+ * numbered, so the exchange either side of a batch is simply the batches next to
+ * it, and that holds even when several dialogs were recorded in the same minute.
+ */
+async function readAround(
+  client: GraphitiMcpClient,
+  agentId: string,
+  anchor: string,
+  before: number,
+  after: number,
+): Promise<string> {
+  const centre = (await client.getEpisodesByRef(agentId, { names: [anchor] }))[0];
+  if (!centre) return "";
+
+  const centreName = typeof centre.name === "string" ? centre.name : anchor;
+  const position = splitEpisodeName(centreName);
+  let window: Record<string, unknown>[] = [centre];
+  if (position) {
+    const names: string[] = [];
+    for (let step = 1; step <= BROWSE_NEIGHBOURS; step += 1) {
+      if (position.number - step > 0) names.push(`${position.prefix}-${position.number - step}`);
+      names.push(`${position.prefix}-${position.number + step}`);
+    }
+    const neighbours = await client.getEpisodesByRef(agentId, { names });
+    window = [...neighbours, centre];
+  }
+
+  const ordered = window
+    .map((episode) => ({ episode, at: splitEpisodeName(typeof episode.name === "string" ? episode.name : "")?.number ?? 0 }))
+    .sort((a, b) => a.at - b.at)
+    .filter((entry, index, all) => index === 0 || entry.episode.name !== all[index - 1]?.episode.name);
+
+  const centreIndex = Math.max(ordered.findIndex((entry) => entry.episode.name === centreName), 0);
+  const rendered = ordered.map((entry) => renderEpisode(entry.episode));
+  const head = rendered.slice(0, centreIndex).join("\n");
+  const body = rendered[centreIndex] ?? "";
+  const tail = rendered.slice(centreIndex + 1).join("\n");
+
+  const transcript = [
+    head.length > before ? `…${head.slice(head.length - before)}` : head,
+    body,
+    tail.length > after ? `${tail.slice(0, after)}…` : tail,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return transcript ? `── ${centreName} ──\n${transcript}` : "";
+}
+
 function limitParam(params: Record<string, unknown>, key: string, fallback: number, max: number): number {
   const value = params[key];
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -276,295 +370,264 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
 
   return [
     {
-      name: "graphiti_recall",
-      label: "Recall facts (Graphiti)",
+      name: "graphiti_search",
+      label: "Search memory (Graphiti)",
       description:
-        "Search this agent's long-term memory for facts from earlier conversations, including other dialogs. Returns short statements, not raw conversation. " +
-        "Relevant memory is injected automatically before each reply, so use this only when that was not enough: the user asks what you remember, or refers to something from another dialog. " +
-        "Memory never overrides the current conversation. For the wording of the exchange itself use graphiti_context; if nothing is found here, try the OpenViking search tools.",
+        "Search this agent's long-term memory, including earlier dialogs. Returns three kinds of hit, each scored: " +
+        "facts (what is known, worded by the extractor rather than quoted), entities (a person, place or project and what is known about it), " +
+        "and episodes (a stretch of conversation whose own words matched). Every hit lists episode anchors like 8248439450-12 with a count of how often that episode appears in these results — the higher the count, the more of the answer lives there. " +
+        "Relevant memory is injected automatically before each reply, so search when that was not enough. Then pass the anchors to graphiti_browse to read what was actually said. " +
+        "If nothing is found, try the OpenViking search tools.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "What to look for, in the user's own words. Concrete phrasing recalls better than single keywords.",
+            description: "What to look for, in the user's own words. Concrete phrasing matches better than single keywords.",
           },
-          limit: {
-            type: "number",
-            description: `Maximum facts to return. Default ${cfg.recallLimit}, maximum 50.`,
-          },
+          facts: { type: "number", description: `How many facts to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
+          entities: { type: "number", description: `How many entities to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
+          episodes: { type: "number", description: `How many episodes to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
+          anchors: { type: "number", description: `How many episode anchors to show per hit. Default ${DEFAULT_ANCHORS}, maximum ${MAX_ANCHORS}.` },
+          discussed_within_days: { type: "number", description: "Only what was recorded in the last N days — when it was discussed, not when it was true." },
+          valid_from: { type: "string", description: "ISO date. Only facts that were true at or after this point." },
+          valid_to: { type: "string", description: "ISO date. Only facts that were true at or before this point." },
+          include_outdated: { type: "boolean", description: "Include facts that a later one has superseded. Off by default, so answers reflect what memory currently holds true." },
         },
         required: ["query"],
       },
       async execute(_toolCallId, params, ctx) {
-        const resolved = resolve("graphiti_recall", ctx);
+        const resolved = resolve("graphiti_search", ctx);
         if ("refusal" in resolved) return resolved.refusal;
 
         const query = sanitizeConversationText(stringParam(params, "query"));
         if (!query) {
-          return errorResult("graphiti_recall needs a non-empty query.", {
-            tool: "graphiti_recall",
+          return errorResult("graphiti_search needs a non-empty query.", {
+            tool: "graphiti_search",
             reason: "empty_query",
           });
         }
 
-        const limit = limitParam(params, "limit", cfg.recallLimit, 50);
-        try {
-          const facts = await client.searchFacts(query, resolved.agentId, limit);
-          const lines = facts
-            .map((fact) => (typeof fact.fact === "string" ? sanitizeConversationText(fact.fact) : ""))
-            .filter(Boolean);
-          logger.info("tool_recall", {
-            agentId: resolved.agentId,
-            group_id: resolved.agentId,
-            results: lines.length,
-            limit,
+        const wanted = {
+          facts: countParam(params, "facts", DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+          entities: countParam(params, "entities", DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+          episodes: countParam(params, "episodes", DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+        };
+        if (wanted.facts + wanted.entities + wanted.episodes === 0) {
+          return errorResult("graphiti_search was asked for nothing: set at least one of facts, entities or episodes above zero.", {
+            tool: "graphiti_search",
+            reason: "nothing_requested",
           });
-          if (lines.length === 0) {
-            return textResult("No matching facts in memory yet.", {
-              tool: "graphiti_recall",
+        }
+        const anchorLimit = limitParam(params, "anchors", DEFAULT_ANCHORS, MAX_ANCHORS);
+        const includeOutdated = params.include_outdated === true;
+
+        const days = countParam(params, "discussed_within_days", 0, 3_650);
+        const filters = {
+          ...(days > 0 ? { createdAtAfter: new Date(Date.now() - days * 86_400_000).toISOString() } : {}),
+          ...(stringParam(params, "valid_from") ? { validAtAfter: stringParam(params, "valid_from") } : {}),
+          ...(stringParam(params, "valid_to") ? { validAtBefore: stringParam(params, "valid_to") } : {}),
+        };
+
+        try {
+          // One request covers every type; the per-type limits are applied here,
+          // because the server takes a single limit and a caller asking for ten
+          // facts and no entities must not be charged a second round trip.
+          const raw = await client.searchCombined(
+            query,
+            resolved.agentId,
+            Math.max(wanted.facts, wanted.entities, wanted.episodes),
+            filters,
+          );
+
+          const facts = raw.facts
+            .filter((fact) => includeOutdated || !text(fact.invalid_at))
+            .slice(0, wanted.facts);
+          const entities = raw.entities.slice(0, wanted.entities);
+          const episodes = raw.episodes.slice(0, wanted.episodes);
+
+          if (facts.length + entities.length + episodes.length === 0) {
+            return textResult("Nothing in memory matches that. The OpenViking search tools cover material this graph does not.", {
+              tool: "graphiti_search",
               results: 0,
               ok: true,
             });
           }
-          return textResult(lines.map((line) => `- ${line}`).join("\n"), {
-            tool: "graphiti_recall",
-            results: lines.length,
-            ok: true,
-          });
-        } catch (error) {
-          return failed("graphiti_recall", resolved.agentId, error);
-        }
-      },
-    },
 
-    {
-      name: "graphiti_search_entities",
-      label: "Search entities (Graphiti)",
-      description:
-        "Look up people, places, projects and things this agent knows about, with a short summary of each. " +
-        "Use when the question is about who or what something is; for statements and relationships use graphiti_recall. " +
-        "If nothing is found here, try the OpenViking search tools.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Name or description of the entity to look for." },
-          limit: { type: "number", description: "Maximum entities to return. Default 10, maximum 50." },
-        },
-        required: ["query"],
-      },
-      async execute(_toolCallId, params, ctx) {
-        const resolved = resolve("graphiti_search_entities", ctx);
-        if ("refusal" in resolved) return resolved.refusal;
+          // Anchors are episode names, and the count beside each one says how many
+          // of these results point at it: a number the agent can act on without
+          // knowing anything about provenance.
+          const uuidCounts = new Map<string, number>();
+          for (const fact of facts) {
+            for (const uuid of asStrings(fact.episodes)) {
+              uuidCounts.set(uuid, (uuidCounts.get(uuid) ?? 0) + 1);
+            }
+          }
+          const names = await resolveEpisodeNames(client, resolved.agentId, [
+            ...uuidCounts.keys(),
+          ]);
 
-        const query = sanitizeConversationText(stringParam(params, "query"));
-        if (!query) {
-          return errorResult("graphiti_search_entities needs a non-empty query.", {
-            tool: "graphiti_search_entities",
-            reason: "empty_query",
-          });
-        }
+          const anchorsFor = (uuids: string[]): string => {
+            const seen = new Map<string, number>();
+            for (const uuid of uuids) {
+              const name = names.get(uuid);
+              if (!name) continue;
+              seen.set(name, Math.max(seen.get(name) ?? 0, uuidCounts.get(uuid) ?? 1));
+            }
+            const ordered = [...seen.entries()]
+              .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+              .slice(0, anchorLimit);
+            return ordered.length > 0
+              ? `\n  episodes: ${ordered.map(([name, hits]) => `${name} ×${hits}`).join(", ")}`
+              : "";
+          };
 
-        const limit = limitParam(params, "limit", 10, 50);
-        try {
-          const nodes = await client.searchNodes(query, resolved.agentId, limit);
-          const lines = nodes
-            .map((node) => {
-              const name = typeof node.name === "string" ? sanitizeConversationText(node.name) : "";
-              if (!name) return "";
-              const summary = typeof node.summary === "string" ? sanitizeConversationText(node.summary) : "";
-              return summary ? `- ${name}: ${summary}` : `- ${name}`;
-            })
-            .filter(Boolean);
-          logger.info("tool_search_entities", {
+          // An entity has no episodes of its own; the facts touching it do.
+          const entityAnchors = (uuid: string): string[] =>
+            facts
+              .filter((fact) => text(fact.source_node_uuid) === uuid || text(fact.target_node_uuid) === uuid)
+              .flatMap((fact) => asStrings(fact.episodes));
+
+          const lines: string[] = [];
+          for (const fact of facts) {
+            const outdated = text(fact.invalid_at) ? " [outdated]" : "";
+            lines.push(
+              `[fact ${formatScore(fact.score)}]${outdated} ${sanitizeConversationText(text(fact.fact))}` +
+                anchorsFor(asStrings(fact.episodes)),
+            );
+          }
+          for (const entity of entities) {
+            const summary = sanitizeConversationText(text(entity.summary));
+            lines.push(
+              `[entity ${formatScore(entity.score)}] ${text(entity.name)}${summary ? ` — ${summary}` : ""}` +
+                anchorsFor(entityAnchors(text(entity.uuid))),
+            );
+          }
+          for (const episode of episodes) {
+            lines.push(`[episode ${formatScore(episode.score)}] ${text(episode.name)}`);
+          }
+
+          logger.info("tool_search", {
             agentId: resolved.agentId,
             group_id: resolved.agentId,
-            results: lines.length,
-            limit,
+            facts: facts.length,
+            entities: entities.length,
+            episodes: episodes.length,
           });
-          if (lines.length === 0) {
-            return textResult("No matching entities in memory yet.", {
-              tool: "graphiti_search_entities",
-              results: 0,
-              ok: true,
-            });
-          }
           return textResult(lines.join("\n"), {
-            tool: "graphiti_search_entities",
-            results: lines.length,
+            tool: "graphiti_search",
+            facts: facts.length,
+            entities: entities.length,
+            episodes: episodes.length,
             ok: true,
           });
         } catch (error) {
-          return failed("graphiti_search_entities", resolved.agentId, error);
+          return failed("graphiti_search", resolved.agentId, error);
         }
       },
     },
 
     {
-      name: "graphiti_context",
-      label: "Read the conversation behind a fact (Graphiti)",
+      name: "graphiti_browse",
+      label: "Read the conversation behind a hit (Graphiti)",
       description:
-        "Read the actual conversation a memory came from. graphiti_recall answers what is known; this answers how it was said. " +
-        "Give the same query, or an episode name from an earlier call, and how much text to include before and after. " +
-        "If the window is too narrow, call again with larger before/after rather than guessing. " +
-        "Expensive compared with graphiti_recall — reach for it when wording, tone or the surrounding exchange actually matter.",
+        "Read what was actually said. graphiti_search tells you what is known; this shows the wording, in the dialog it came from. " +
+        "Pass the episode anchors from a search — several at once is fine, including anchors from different results — or a query to find one. " +
+        "Widen before/after and call again if the window cut off what you needed. " +
+        "Costlier than a search: reach for it when the exact wording, tone or surrounding exchange matters.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "What to find, in the user's words. Ignored when episode is given." },
-          episode: { type: "string", description: "Episode name to centre on, e.g. 8248439450-12, as reported by a previous call." },
-          before: { type: "number", description: `Characters of conversation before the match. Default ${DEFAULT_CONTEXT_CHARS}, maximum ${MAX_CONTEXT_CHARS}.` },
-          after: { type: "number", description: `Characters after the match. Default ${DEFAULT_CONTEXT_CHARS}, maximum ${MAX_CONTEXT_CHARS}.` },
+          episodes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Episode names from a search, such as 8248439450-12. Several may be given.",
+          },
+          query: { type: "string", description: "Used only when no episodes are given: finds the conversation behind the best match." },
+          before: { type: "number", description: `Characters of conversation before each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
+          after: { type: "number", description: `Characters after each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
         },
       },
       async execute(_toolCallId, params, ctx) {
-        const resolved = resolve("graphiti_context", ctx);
+        const resolved = resolve("graphiti_browse", ctx);
         if ("refusal" in resolved) return resolved.refusal;
 
-        const episodeName = sanitizeConversationText(stringParam(params, "episode")).trim();
+        const asked = Array.isArray(params.episodes)
+          ? params.episodes.filter((name): name is string => typeof name === "string").map((name) => name.trim()).filter(Boolean)
+          : [];
+        const single = sanitizeConversationText(stringParam(params, "episode")).trim();
+        const requested = [...new Set(single ? [...asked, single] : asked)].slice(0, cfg.browseMaxEpisodes);
         const query = sanitizeConversationText(stringParam(params, "query"));
-        if (!episodeName && !query) {
-          return errorResult("graphiti_context needs either a query or an episode name.", {
-            tool: "graphiti_context",
+        if (requested.length === 0 && !query) {
+          return errorResult("graphiti_browse needs either episode names or a query.", {
+            tool: "graphiti_browse",
             reason: "no_anchor",
           });
         }
 
-        const before = limitParam(params, "before", DEFAULT_CONTEXT_CHARS, MAX_CONTEXT_CHARS);
-        const after = limitParam(params, "after", DEFAULT_CONTEXT_CHARS, MAX_CONTEXT_CHARS);
+        const before = limitParam(params, "before", cfg.browseChars, cfg.browseMaxChars);
+        const after = limitParam(params, "after", cfg.browseChars, cfg.browseMaxChars);
 
         try {
-          // Find what to centre on. An episode name is already an anchor; a query
-          // has to be resolved through a fact, which carries the uuids of the
-          // episodes that produced it.
-          let centre: Record<string, unknown> | undefined;
-          if (episodeName) {
-            centre = (await client.getEpisodesByRef(resolved.agentId, { names: [episodeName] }))[0];
-          } else {
-            const facts = await client.searchFacts(query, resolved.agentId, 3);
-            const sourceUuids = facts
-              .flatMap((fact) => (Array.isArray(fact.episodes) ? fact.episodes : []))
-              .filter((uuid): uuid is string => typeof uuid === "string")
-              .slice(0, 5);
-            if (sourceUuids.length === 0) {
-              return textResult(
-                "Nothing in memory matches that, so there is no conversation to show. Try graphiti_recall for related facts, or the OpenViking search tools.",
-                { tool: "graphiti_context", results: 0, ok: true },
-              );
-            }
-            const sources = await client.getEpisodesByRef(resolved.agentId, { uuids: sourceUuids });
-            centre = sources[sources.length - 1];
+          let anchors = requested;
+          if (anchors.length === 0) {
+            // No anchor given: find one the same way a search would, then read
+            // around it. The episode types of a combined search already are
+            // anchors, so a direct hit needs no fact to go through.
+            const found = await client.searchCombined(query, resolved.agentId, 3);
+            const viaEpisode = found.episodes.map((episode) => text(episode.name)).filter(Boolean);
+            const viaFacts = found.facts.flatMap((fact) => asStrings(fact.episodes));
+            const names = viaEpisode.length > 0
+              ? viaEpisode
+              : [...(await resolveEpisodeNames(client, resolved.agentId, viaFacts)).values()];
+            anchors = [...new Set(names)].slice(0, cfg.browseMaxEpisodes);
           }
 
-          if (!centre) {
-            return textResult("That episode is not in this agent's memory.", {
-              tool: "graphiti_context",
+          if (anchors.length === 0) {
+            return textResult(
+              "Nothing in memory matches that, so there is no conversation to show. Try graphiti_search, or the OpenViking search tools.",
+              { tool: "graphiti_browse", results: 0, ok: true },
+            );
+          }
+
+          const sections: string[] = [];
+          let budget = cfg.browseMaxTotalChars;
+          let shown = 0;
+          for (const anchor of anchors) {
+            if (budget <= 0) break;
+            const section = await readAround(client, resolved.agentId, anchor, before, after);
+            if (!section) continue;
+            const trimmed = section.length > budget ? `${section.slice(0, budget)}…` : section;
+            budget -= trimmed.length;
+            shown += 1;
+            sections.push(trimmed);
+          }
+
+          if (sections.length === 0) {
+            return textResult("None of those episodes are in this agent's memory.", {
+              tool: "graphiti_browse",
               results: 0,
               ok: true,
             });
           }
 
-          const centreName = text(centre.name);
-          const position = splitEpisodeName(centreName);
-          let window: Record<string, unknown>[] = [centre];
-          if (position) {
-            // Neighbours are found by batch number: the chain is numbered, so the
-            // conversation either side of a batch is simply the batches around it.
-            const names: string[] = [];
-            for (let step = 1; step <= CONTEXT_NEIGHBOURS; step += 1) {
-              names.push(`${position.prefix}-${position.number - step}`);
-              names.push(`${position.prefix}-${position.number + step}`);
-            }
-            const neighbours = await client.getEpisodesByRef(resolved.agentId, {
-              names: names.filter((name) => !name.endsWith("-0") && !name.includes("--")),
-            });
-            window = [...neighbours, centre];
-          }
-
-          const ordered = window
-            .map((episode) => ({ episode, at: splitEpisodeName(text(episode.name))?.number ?? 0 }))
-            .sort((a, b) => a.at - b.at)
-            .filter((entry, index, all) => index === 0 || text(entry.episode.name) !== text(all[index - 1]?.episode.name));
-
-          const centreIndex = ordered.findIndex((entry) => text(entry.episode.name) === centreName);
-          const rendered = ordered.map((entry) => renderEpisode(entry.episode));
-          const head = rendered.slice(0, Math.max(centreIndex, 0)).join("\n");
-          const body = rendered[Math.max(centreIndex, 0)] ?? "";
-          const tail = rendered.slice(Math.max(centreIndex, 0) + 1).join("\n");
-
-          const transcript = [
-            head.length > before ? `…${head.slice(head.length - before)}` : head,
-            body,
-            tail.length > after ? `${tail.slice(0, after)}…` : tail,
-          ]
-            .filter(Boolean)
-            .join("\n");
-
-          logger.info("tool_context", {
+          const truncated = shown < anchors.length;
+          logger.info("tool_browse", {
             agentId: resolved.agentId,
             group_id: resolved.agentId,
-            episode: centreName,
-            episodes: ordered.length,
-            chars: transcript.length,
+            requested: anchors.length,
+            shown,
+            chars: cfg.browseMaxTotalChars - budget,
           });
-
           return textResult(
-            `Conversation around ${centreName} (${ordered.length} batch(es)). ` +
-              `Call again with episode="${centreName}" and larger before/after for more.\n\n${transcript}`,
-            { tool: "graphiti_context", episode: centreName, results: ordered.length, ok: true },
+            sections.join("\n\n") +
+              (truncated
+                ? `\n\n(${anchors.length - shown} more episode(s) not shown: the reply hit its size limit. Ask for fewer at a time, or a smaller before/after.)`
+                : ""),
+            { tool: "graphiti_browse", requested: anchors.length, shown, ok: true },
           );
         } catch (error) {
-          return failed("graphiti_context", resolved.agentId, error);
-        }
-      },
-    },
-
-    {
-      name: "graphiti_episodes",
-      label: "Recent episodes (Graphiti)",
-      description:
-        "List the most recent conversation batches committed to memory, newest first. Use to check whether something was recorded. " +
-        "Bookkeeping only: for what was learned use graphiti_recall, to reread an exchange use graphiti_context.",
-      parameters: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "How many recent episodes to list. Default 10, maximum 50." },
-        },
-      },
-      async execute(_toolCallId, params, ctx) {
-        const resolved = resolve("graphiti_episodes", ctx);
-        if ("refusal" in resolved) return resolved.refusal;
-
-        const limit = limitParam(params, "limit", 10, 50);
-        try {
-          const episodes = await client.getEpisodes(resolved.agentId, limit);
-          const lines = episodes.map((episode) => {
-            const name = typeof episode.name === "string" ? episode.name : "(unnamed)";
-            const at = typeof episode.valid_at === "string" ? episode.valid_at
-              : typeof episode.created_at === "string" ? episode.created_at
-              : "";
-            return at ? `- ${name} (${at})` : `- ${name}`;
-          });
-          logger.info("tool_episodes", {
-            agentId: resolved.agentId,
-            group_id: resolved.agentId,
-            results: lines.length,
-            limit,
-          });
-          if (lines.length === 0) {
-            return textResult("No episodes recorded for this agent yet.", {
-              tool: "graphiti_episodes",
-              results: 0,
-              ok: true,
-            });
-          }
-          return textResult(lines.join("\n"), {
-            tool: "graphiti_episodes",
-            results: lines.length,
-            ok: true,
-          });
-        } catch (error) {
-          return failed("graphiti_episodes", resolved.agentId, error);
+          return failed("graphiti_browse", resolved.agentId, error);
         }
       },
     },

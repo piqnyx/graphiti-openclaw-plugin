@@ -18,6 +18,17 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - The default `excludeSessionPatterns` now cover OpenClaw's own setup probes (`:setup-inference:`, `incognito-probe`). A model-setup probe is a machine verifying a configuration, not a conversation, and one of them wrote a whole saga into a live graph before this was noticed.
 - A dialog with nothing committed yet no longer reports "batch number 0 is missing". The numbering check ran its range from zero when it had seen no episodes, so every brand-new dialog accused itself of having lost a batch.
 
+## 0.2.0 - 2026-08-17
+
+### Changed (breaking: tool names)
+
+- Six agent tools become four. `graphiti_recall` and `graphiti_search_entities` merge into `graphiti_search`; `graphiti_context` becomes `graphiti_browse`; `graphiti_episodes` is gone, since its only real use was supplying an episode name that search now returns itself. Update the agent's allowlist to `graphiti_search`, `graphiti_browse`, `graphiti_note`, `graphiti_status`.
+- `graphiti_search` returns facts, entities and episodes from one retrieval pass, each with the reranker's score. Episodes are a result type of their own, matched on the words of the conversation, so a query can reach the dialog without going through a fact. Requires the fork tool `search_memory_combined`.
+- Every hit lists episode anchors such as `8248439450-12` with a count of how many results point at that episode — a number the agent can act on without knowing anything about provenance. Entity anchors are derived from the facts touching the entity, since an entity carries no provenance of its own.
+- Facts superseded by a newer one are hidden unless `include_outdated` asks for them: such a fact is not false, but repeating it as current knowledge is.
+- Per-type limits (`facts`, `entities`, `episodes`), zero excluding a type. Time filters distinguish when a fact was true (`valid_from`/`valid_to`) from when it was recorded (`discussed_within_days`).
+- `graphiti_browse` expands several anchors in one call, including anchors from different hits. Its budgets are configuration — `browseChars`, `browseMaxChars`, `browseMaxEpisodes`, `browseMaxTotalChars` — and what does not fit is reported as omitted rather than dropped in silence.
+
 ## 0.1.1 - 2026-08-17
 
 ### Fixed

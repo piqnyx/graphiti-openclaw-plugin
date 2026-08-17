@@ -23,7 +23,7 @@ Tests in this repository exist to catch real regressions in memory routing, capt
 - **derived episode identity** — the same batch prepared twice yields the same UUID, and any change of agent, saga, batch number or body yields a different one;
 - **single capture pipeline** — repeated `register()` calls share one engine and one spool owner; a restart with unsent messages flushes the restored batch exactly once, and a stopped pipeline is replaced rather than inherited;
 - **tool isolation** — every `graphiti_*` tool derives its group from the invocation context, refuses a run without a resolvable agent, and never throws a backend failure at the agent;
-- **note separation** — `graphiti_store` writes no saga, so an agent note cannot fork a dialog's episode chain;
+- **note delivery** — `graphiti_note` hands its text to the capture pipeline, so a note joins the dialog it was made in and its saga rather than standing beside them;
 - **MCP shape** — caller UUID, `group_id`, `saga`, predecessor fields and `reference_time` match the fork contract;
 - **recall safety** — query sanitization happens before search and injected XML cannot be broken by fact text;
 - **logging privacy** — raw message/request content appears only with explicit debug content logging.

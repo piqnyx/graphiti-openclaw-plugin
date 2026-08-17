@@ -11,10 +11,8 @@
   },
   "contracts": {
     "tools": [
-      "graphiti_recall",
-      "graphiti_search_entities",
-      "graphiti_context",
-      "graphiti_episodes",
+      "graphiti_search",
+      "graphiti_browse",
       "graphiti_note",
       "graphiti_status"
     ]
@@ -127,6 +125,30 @@
             }
           }
         }
+      },
+      "browseChars": {
+        "type": "integer",
+        "minimum": 128,
+        "maximum": 200000,
+        "description": "Characters of conversation graphiti_browse reads on each side of an anchor by default."
+      },
+      "browseMaxChars": {
+        "type": "integer",
+        "minimum": 128,
+        "maximum": 200000,
+        "description": "Ceiling on before/after in one graphiti_browse call."
+      },
+      "browseMaxEpisodes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "description": "How many anchors graphiti_browse will expand in one call."
+      },
+      "browseMaxTotalChars": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 1000000,
+        "description": "Total size of one graphiti_browse reply. What does not fit is reported as omitted rather than silently dropped."
       }
     }
   }

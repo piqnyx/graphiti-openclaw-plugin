@@ -95,32 +95,34 @@ test("agentTools=false registers nothing", (t) => {
   assert.equal(tools.size, 0);
 });
 
-test("recall is scoped to the calling agent's group", async (t) => {
+test("search is scoped to the calling agent's group", async (t) => {
   const calls = installFetch(t, {
-    search_memory_facts: (args) => ({
-      facts: args.group_ids === "igor"
-        ? [{ fact: "Игорь чинил забор" }]
-        : [{ fact: "Вит живёт в фургоне" }],
+    search_memory_combined: (args) => ({
+      facts: args.group_id === "igor"
+        ? [{ uuid: "f2", fact: "Игорь чинил забор", score: 0.6, episodes: [] }]
+        : [{ uuid: "f1", fact: "Вит живёт в фургоне", score: 0.9, episodes: [] }],
+      entities: [],
+      episodes: [],
     }),
   });
   const { tools } = makeRuntime();
 
-  const asMain = await call(tools, "graphiti_recall", { query: "где живёт" },
+  const asMain = await call(tools, "graphiti_search", { query: "где живёт" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
-  const asIgor = await call(tools, "graphiti_recall", { query: "где живёт" },
+  const asIgor = await call(tools, "graphiti_search", { query: "где живёт" },
     { agentId: "igor", sessionKey: "agent:igor:telegram:2" });
 
   assert.match(asMain.content[0].text, /фургоне/);
   assert.doesNotMatch(asMain.content[0].text, /забор/);
   assert.match(asIgor.content[0].text, /забор/);
-  assert.deepEqual(calls.map((c) => c.arguments.group_ids), ["main", "igor"]);
+  assert.deepEqual(calls.map((c) => c.arguments.group_id), ["main", "igor"]);
 });
 
 test("a tool called without a resolvable agent refuses instead of guessing", async (t) => {
   installFetch(t);
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_recall", { query: "что угодно" }, { sessionKey: "agent:?:x" });
+  const result = await call(tools, "graphiti_search", { query: "что угодно" }, { sessionKey: "agent:?:x" });
   assert.equal(result.details.ok, false);
   assert.equal(result.details.reason, "invalid_agent_id");
   assert.match(result.content[0].text, /agent identity/i);
@@ -255,13 +257,13 @@ test("status reports a blocked backend instead of pretending memory works", asyn
 
 test("a backend failure is reported, never thrown at the agent", async (t) => {
   installFetch(t, {
-    search_memory_facts: () => {
+    search_memory_combined: () => {
       throw new Error("boom");
     },
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_recall", { query: "что-нибудь" },
+  const result = await call(tools, "graphiti_search", { query: "что-нибудь" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
   assert.equal(result.details.ok, false);
   assert.match(result.content[0].text, /failed/i);
@@ -391,10 +393,12 @@ test("an episode that is not the expected JSON is shown as it stands", () => {
   assert.equal(rendered, "[legacy-1]\nplain text episode");
 });
 
-test("context resolves a query through a fact to the conversation around it", async (t) => {
+test("browse resolves a query to the conversation around the best match", async (t) => {
   const calls = installFetch(t, {
-    search_memory_facts: () => ({
-      facts: [{ fact: "Вит завёл бульдога Басю", episodes: ["episode-12"] }],
+    search_memory_combined: () => ({
+      facts: [{ uuid: "f1", fact: "Вит завёл бульдога Басю", score: 0.7, episodes: ["episode-12"] }],
+      entities: [],
+      episodes: [],
     }),
     get_episodes_by_ref: (args) => {
       const body = (name, line) => ({
@@ -405,65 +409,71 @@ test("context resolves a query through a fact to the conversation around it", as
           messages: [{ role: "user", text: line }],
         }),
       });
-      if (args.uuids.includes("episode-12")) return { episodes: [body("8248439450-12", "про собаку")] };
-      return {
-        episodes: [body("8248439450-11", "раньше"), body("8248439450-13", "позже")],
-      };
+      if ((args.uuids ?? []).includes("episode-12")) return { episodes: [body("8248439450-12", "про собаку")] };
+      if ((args.names ?? []).includes("8248439450-12")) return { episodes: [body("8248439450-12", "про собаку")] };
+      return { episodes: [body("8248439450-11", "раньше"), body("8248439450-13", "позже")] };
     },
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { query: "собака Бася" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
-  const text = result.content[0].text;
+  const result = await call(tools, "graphiti_browse", { query: "собака" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
-  // Every lookup stays inside the calling agent's own graph.
-  for (const params of calls) {
-    if (params.name === "get_episodes_by_ref") assert.equal(params.arguments.group_id, "main");
-  }
-  assert.equal(result.details.episode, "8248439450-12");
-  // Batches arrive in conversational order, not in the order they were fetched.
-  assert.ok(text.indexOf("раньше") < text.indexOf("про собаку"));
-  assert.ok(text.indexOf("про собаку") < text.indexOf("позже"));
-  // The reply tells the model how to widen the window without guessing.
-  assert.match(text, /episode="8248439450-12"/);
+  const text = result.content[0].text;
+  assert.match(text, /про собаку/);
+  // The neighbours either side make the exchange readable, not just the batch.
+  assert.match(text, /раньше/);
+  assert.match(text, /позже/);
+  assert.ok(calls.some((c) => c.name === "search_memory_combined"));
 });
 
-test("context centred on a named episode never searches for facts", async (t) => {
+test("browse expands several anchors in one call and never searches for them", async (t) => {
   const calls = installFetch(t, {
-    get_episodes_by_ref: () => ({
-      episodes: [{ uuid: "u", name: "8248439450-4", content: JSON.stringify({
-        participants: { user: "Вит", assistant: "Краб" },
-        messages: [{ role: "assistant", text: "вот этот кусок" }],
-      }) }],
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) => ({
+        uuid: `u-${name}`,
+        name,
+        content: JSON.stringify({
+          participants: { user: "Вит", assistant: "Краб" },
+          messages: [{ role: "user", text: `строка ${name}` }],
+        }),
+      })),
     }),
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { episode: "8248439450-4" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  const result = await call(tools, "graphiti_browse",
+    { episodes: ["8248439450-12", "8248439450-40"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
-  assert.ok(!calls.some((params) => params.name === "search_memory_facts"));
-  assert.match(result.content[0].text, /вот этот кусок/);
+  const text = result.content[0].text;
+  assert.match(text, /8248439450-12/);
+  assert.match(text, /8248439450-40/);
+  // Anchors are already answers: searching again would be wasted work.
+  assert.ok(!calls.some((c) => c.name === "search_memory_combined"));
+  assert.equal(result.details.shown, 2);
 });
 
-test("context says so plainly when memory holds nothing to expand", async (t) => {
-  installFetch(t, { search_memory_facts: () => ({ facts: [] }) });
+test("browse says so plainly when memory holds nothing to expand", async (t) => {
+  installFetch(t, {
+    search_memory_combined: () => ({ facts: [], entities: [], episodes: [] }),
+  });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { query: "чего там нет" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
-
+  const result = await call(tools, "graphiti_browse", { query: "ничего такого" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
   assert.equal(result.details.results, 0);
-  assert.match(result.content[0].text, /OpenViking/);
+  assert.match(result.content[0].text, /Nothing in memory matches/);
 });
 
-test("context refuses a call with neither a query nor an episode", async (t) => {
+test("browse refuses a call with neither a query nor an anchor", async (t) => {
   installFetch(t);
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
-
+  const result = await call(tools, "graphiti_browse", {},
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
   assert.equal(result.details.reason, "no_anchor");
 });
-
 test("status reports graph shape and names the integrity problems it finds", async (t) => {
   installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
@@ -583,4 +593,107 @@ test("a dialog with nothing committed is not accused of losing a batch", () => {
   // Nor when the window holds only other dialogs' episodes.
   const others = inspectEpisodeNumbering("agent:main:telegram:1", [{ name: "9999-1" }]);
   assert.deepEqual(others.gaps, []);
+});
+
+test("search returns every type with its score, and anchors carry a count", async (t) => {
+  installFetch(t, {
+    search_memory_combined: () => ({
+      facts: [
+        { uuid: "f1", fact: "Вит любит манго", score: 0.54, episodes: ["u1", "u2"], source_node_uuid: "n1", target_node_uuid: "n9" },
+        { uuid: "f2", fact: "Вит живёт в Григолети", score: 0.41, episodes: ["u1"], source_node_uuid: "n1", target_node_uuid: "n8" },
+      ],
+      entities: [{ uuid: "n1", name: "Вит", score: 0.48, summary: "хозяин Краба" }],
+      episodes: [{ uuid: "u2", name: "8248439450-9", score: 0.37 }],
+    }),
+    get_episodes_by_ref: () => ({
+      episodes: [
+        { uuid: "u1", name: "8248439450-17" },
+        { uuid: "u2", name: "8248439450-9" },
+      ],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_search", { query: "манго" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  const text = result.content[0].text;
+
+  assert.match(text, /\[fact 0\.54\] Вит любит манго/);
+  assert.match(text, /\[entity 0\.48\] Вит — хозяин Краба/);
+  assert.match(text, /\[episode 0\.37\] 8248439450-9/);
+  // The count is what the agent acts on: two of these results point at -17,
+  // one at -9, so -17 is where the answer lives.
+  assert.match(text, /8248439450-17 ×2/);
+  // An entity has no episodes of its own; the facts touching it supply them.
+  assert.match(text.split("[entity")[1], /episodes: 8248439450-17/);
+});
+
+test("a superseded fact is hidden unless it is asked for", async (t) => {
+  const handlers = {
+    search_memory_combined: () => ({
+      facts: [
+        { uuid: "f1", fact: "Вит живёт в Григолети", score: 0.9, episodes: [] },
+        { uuid: "f2", fact: "Вит живёт в Кишинёве", score: 0.8, episodes: [], invalid_at: "2026-08-01T00:00:00Z" },
+      ],
+      entities: [],
+      episodes: [],
+    }),
+  };
+  installFetch(t, handlers);
+  const { tools } = makeRuntime();
+  const ctx = { agentId: "main", sessionKey: "agent:main:telegram:1" };
+
+  const current = await call(tools, "graphiti_search", { query: "где живёт" }, ctx);
+  assert.doesNotMatch(current.content[0].text, /Кишинёве/);
+
+  // The old fact is not false, it is past: asked for explicitly, it comes back
+  // labelled rather than silently mixed in with what still holds.
+  const history = await call(tools, "graphiti_search", { query: "где живёт", include_outdated: true }, ctx);
+  assert.match(history.content[0].text, /\[outdated\] Вит живёт в Кишинёве/);
+});
+
+test("a type asked for zero times is not returned at all", async (t) => {
+  installFetch(t, {
+    search_memory_combined: () => ({
+      facts: [{ uuid: "f1", fact: "факт", score: 0.5, episodes: [] }],
+      entities: [{ uuid: "n1", name: "Оля", score: 0.4 }],
+      episodes: [{ uuid: "u1", name: "8248439450-1", score: 0.3 }],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_search",
+    { query: "x", entities: 0, episodes: 0 },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+
+  assert.match(result.content[0].text, /\[fact/);
+  assert.doesNotMatch(result.content[0].text, /\[entity/);
+  assert.doesNotMatch(result.content[0].text, /\[episode/);
+  assert.equal(result.details.entities, 0);
+});
+
+test("asking for nothing at all is refused rather than answered emptily", async (t) => {
+  const calls = installFetch(t);
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_search",
+    { query: "x", facts: 0, entities: 0, episodes: 0 },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+
+  assert.equal(result.details.reason, "nothing_requested");
+  assert.deepEqual(calls, [], "a request for nothing must not reach the backend");
+});
+
+test("discussed_within_days filters on when it was recorded, not when it was true", async (t) => {
+  const calls = installFetch(t, {
+    search_memory_combined: () => ({ facts: [], entities: [], episodes: [] }),
+  });
+  const { tools } = makeRuntime();
+
+  await call(tools, "graphiti_search", { query: "x", discussed_within_days: 7 },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+
+  const args = calls.find((c) => c.name === "search_memory_combined").arguments;
+  assert.ok(args.created_at_after, "the recency filter is about when it was recorded");
+  assert.equal(args.valid_at_after, null, "and must not be confused with when it was true");
 });

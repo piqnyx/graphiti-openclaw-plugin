@@ -376,7 +376,8 @@ Fork не vanilla Graphiti. При любом rebase/upstream update отдел�
 6. directed Saga chronology;
 7. `tools/falkor_validate.py` read-only validator;
 8. `get_graph_stats(group_id, top_entities)` — размер, топ сущностей по связям, проверки целостности для `graphiti_status`;
-9. `get_episodes_by_ref(uuids, names, group_id)` — эпизоды с текстом по ссылке, без него `graphiti_context` не существует.
+9. `get_episodes_by_ref(uuids, names, group_id)` — эпизоды с текстом по ссылке; без него нет ни `graphiti_browse`, ни якорей в `graphiti_search`.
+10. `search_memory_combined(query, group_id, limit, ...)` — факты, сущности и эпизоды одним проходом со скорами реранкера; upstream их выбрасывает.
 
 ---
 
@@ -650,10 +651,8 @@ recall_skipped
 agent_tools_registered
 agent_tools_unavailable
 tool_status
-tool_recall
-tool_search_entities
-tool_context
-tool_episodes
+tool_search
+tool_browse
 tool_store
 tool_refused
 tool_failed

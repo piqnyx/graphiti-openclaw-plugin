@@ -32,16 +32,18 @@ Enabled by `agentTools` (default true) and registered only if the host exposes a
 
 | Tool | What it does | When the agent should reach for it |
 |---|---|---|
-| `graphiti_recall` | Searches the agent's memory for facts | Automatic recall was not enough: the user asks what you remember, or refers to another dialog |
-| `graphiti_search_entities` | Searches known people, places, projects | The question is about an entity rather than a statement |
-| `graphiti_context` | Reads the conversation a memory came from | The wording, tone or surrounding exchange matters, not just the fact |
-| `graphiti_episodes` | Lists recently committed conversation batches | Checking what has actually reached memory |
+| `graphiti_search` | Searches memory for facts, entities and episodes at once, each scored, each with episode anchors | Automatic recall was not enough: the user asks what you remember, or refers to another dialog |
+| `graphiti_browse` | Reads the conversation behind one or more anchors | The wording, tone or surrounding exchange matters, not just the fact |
 | `graphiti_note` | Records one lasting fact into the conversation | The user explicitly asks to remember something lasting |
 | `graphiti_status` | Reports backend health, graph size and integrity checks | Memory looks stale or empty and the agent needs to say why |
 
-`graphiti_recall` and `graphiti_context` are two steps of one move: the first answers what is known, the second shows how it was said. A fact records the uuids of the episodes that produced it, and episode names carry a batch number, so the batches either side of a match are the surrounding conversation. `graphiti_context` reports the episode it centred on, so the agent can call again with a wider window instead of guessing.
+`graphiti_search` and `graphiti_browse` are two steps of one move: the first answers what is known, the second shows how it was said.
 
-Both search tools point at the OpenViking tools when they find nothing, and the OpenViking search tools point back here, so a blank in one store is not mistaken for a blank in memory.
+Every hit carries the reranker's score and a list of episode anchors such as `8248439450-12`, each with a count of how many results point at it — the higher the count, the more of the answer lives in that episode. Those anchors are what `graphiti_browse` takes, several at a time, including anchors from different hits. Episodes are a result type in their own right, matched on the words of the conversation itself, so a query can reach the dialog without going through a fact at all.
+
+Facts superseded by newer ones are hidden unless `include_outdated` asks for them, so an answer reflects what memory currently holds true. Per-type limits let the agent ask for only what it needs; zero excludes a type.
+
+`graphiti_search` points at the OpenViking tools when it finds nothing, and the OpenViking search tools point back here, so a blank in one store is not mistaken for a blank in memory.
 
 Every tool resolves the agent from its invocation context and passes it as the Graphiti group, so a tool call cannot cross into another agent's graph. A session matched by `excludeSessionPatterns` cannot use the tools at all: a session that is not recorded must not query or write memory either.
 

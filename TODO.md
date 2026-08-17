@@ -20,7 +20,7 @@
 
 ## Agent-visible tools
 
-Реализованы: `graphiti_recall`, `graphiti_search_entities`, `graphiti_episodes`, `graphiti_store`, `graphiti_status` (см. TECHNICAL_SPEC 8.3).
+Реализованы: `graphiti_search`, `graphiti_browse`, `graphiti_note`, `graphiti_status` (см. TECHNICAL_SPEC 8.3).
 
 Остаётся `graphiti_forget`. Блокирующее условие сейчас техническое: MCP `delete_episode` / `delete_entity_edge` не принимают `group_id` и работают по базе по умолчанию, а не по графу агента. Пока в форке нет group-scoped удаления, безопасного destructive tool не построить.
 

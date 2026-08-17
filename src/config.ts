@@ -29,6 +29,10 @@ export type GraphitiPluginConfig = {
   bufferTimeout: number;
   excludeSessionPatterns: string[];
   agentTools: boolean;
+  browseChars: number;
+  browseMaxChars: number;
+  browseMaxEpisodes: number;
+  browseMaxTotalChars: number;
   agents: Record<string, AgentActors>;
 };
 
@@ -56,6 +60,13 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   // Defaults reproduce the background/slug-generator filtering that used to be
   // hardcoded. They are ordinary config: override or extend them freely.
   agentTools: true,
+  // Generous on purpose: reading the real conversation is the expensive half of
+  // remembering well, and the host manages the context budget. The ceilings are
+  // there to stop an absurd request, not to economise.
+  browseChars: 16_000,
+  browseMaxChars: 32_000,
+  browseMaxEpisodes: 10,
+  browseMaxTotalChars: 120_000,
   excludeSessionPatterns: [
     ":cron:",
     ":heartbeat:",
@@ -179,7 +190,8 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools", "agents",
+    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools",
+    "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
   ]);
 
   for (const key of Object.keys(raw)) {
@@ -207,6 +219,10 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
     agentTools: booleanValue(raw.agentTools, DEFAULT_CONFIG.agentTools, "agentTools"),
+    browseChars: integerValue(raw.browseChars, DEFAULT_CONFIG.browseChars, "browseChars", 128, 200_000),
+    browseMaxChars: integerValue(raw.browseMaxChars, DEFAULT_CONFIG.browseMaxChars, "browseMaxChars", 128, 200_000),
+    browseMaxEpisodes: integerValue(raw.browseMaxEpisodes, DEFAULT_CONFIG.browseMaxEpisodes, "browseMaxEpisodes", 1, 50),
+    browseMaxTotalChars: integerValue(raw.browseMaxTotalChars, DEFAULT_CONFIG.browseMaxTotalChars, "browseMaxTotalChars", 1_000, 1_000_000),
     agents: agentsValue(raw.agents),
   };
 }

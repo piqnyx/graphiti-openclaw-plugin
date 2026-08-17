@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileSessionPatterns, matchSessionExclusion } from "../dist/session-filter.js";
+import { DEFAULT_CONFIG } from "../dist/config.js";
 import { parseConfig } from "../dist/config.js";
 import { register } from "../dist/index.js";
 
@@ -191,4 +192,19 @@ test("capturing for an agent missing from the config is reported once", async ()
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("the shipped defaults exclude OpenClaw's own setup probes", () => {
+  const patterns = compileSessionPatterns(DEFAULT_CONFIG.excludeSessionPatterns);
+
+  // Seen in a live graph: a model-setup probe wrote its own saga, because the
+  // defaults only knew about cron, heartbeats and subagents.
+  const probe = "agent:main:setup-inference:incognito-probe-setup-inference-044674ec-d610-49e5-816b-daf90ef954e7";
+  assert.ok(matchSessionExclusion({ sessionKey: probe }, patterns), "a setup probe is not a conversation");
+
+  // A real dialog is untouched by the new patterns.
+  assert.equal(
+    matchSessionExclusion({ sessionKey: "agent:main:telegram:direct:8248439450" }, patterns),
+    undefined,
+  );
 });

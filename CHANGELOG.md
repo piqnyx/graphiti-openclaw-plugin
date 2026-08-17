@@ -11,6 +11,7 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Fixed
 
+- The default `excludeSessionPatterns` now cover OpenClaw's own setup probes (`:setup-inference:`, `incognito-probe`). A model-setup probe is a machine verifying a configuration, not a conversation, and one of them wrote a whole saga into a live graph before this was noticed.
 - A dialog with nothing committed yet no longer reports "batch number 0 is missing". The numbering check ran its range from zero when it had seen no episodes, so every brand-new dialog accused itself of having lost a batch.
 
 ## 0.1.1 - 2026-08-17

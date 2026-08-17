@@ -62,7 +62,7 @@ There is deliberately no destructive tool. The Graphiti MCP delete endpoints tak
 | `autoRecall` | `true` | Inject relevant memory before each reply |
 | `agentTools` | `true` | Register the `graphiti_*` tools |
 | `agents` | `{main: …}` | Maps `agentId` to the canonical participant names written into every episode. An unlisted agent is still captured, under default names, and is reported once in the log |
-| `excludeSessionPatterns` | cron/heartbeat/subagent/slug | Regular expressions tested against the session key **and** the run trigger. A match excludes the session from capture, recall and tools alike. Overriding the list replaces the whole policy |
+| `excludeSessionPatterns` | cron/heartbeat/subagent/slug/setup probes | Regular expressions tested against the session key **and** the run trigger. A match excludes the session from capture, recall and tools alike. Overriding the list replaces the whole policy |
 | `bufferLimit` | `4` | Messages per batch. Larger batches extract richer entities and call the LLM less often; the ceiling is what your Graphiti LLM backend digests reliably |
 | `bufferTimeout` | `900` | Seconds of silence after which a partial batch is committed anyway. Minimum 30 |
 | `requestTimeoutMs` | `45000` | MCP request timeout, also the budget for the recall hook |

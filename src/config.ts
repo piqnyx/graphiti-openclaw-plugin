@@ -63,6 +63,12 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
     "^cron$",
     "^heartbeat$",
     "^\\*\\*\\*$",
+    // OpenClaw's own probes: a model/setup check is a machine talking to itself
+    // to verify a configuration, not a conversation. One of these wrote a whole
+    // saga into a live graph before it was noticed, which is exactly the damage
+    // this list exists to prevent.
+    ":setup-inference:",
+    "incognito-probe",
   ],
   agents: {
     main: { user: "Вит", assistant: "Краб" },

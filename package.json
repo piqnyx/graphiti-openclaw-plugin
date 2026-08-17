@@ -1,6 +1,6 @@
 {
   "name": "graphiti-openclaw-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "displayName": "Graphiti Companion",
   "description": "Slot-less OpenClaw companion plugin for per-agent Graphiti auto-capture and auto-recall",
   "type": "module",

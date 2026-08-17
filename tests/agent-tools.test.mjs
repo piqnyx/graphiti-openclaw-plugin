@@ -64,6 +64,16 @@ function makeRuntime(overrides = {}) {
 
 const call = (tools, name, params, ctx) => tools.get(name)(ctx).execute("call-1", params);
 
+/** Delivery is asynchronous: the tool returns once the note is buffered. */
+async function waitForCall(calls, name, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (calls.some((params) => params.name === name)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`${name} was never called; saw: ${calls.map((c) => c.name).join(", ") || "nothing"}`);
+}
+
 test("every registered tool carries the graphiti_ prefix and a usable description", (t) => {
   installFetch(t);
   const { tools } = makeRuntime();
@@ -71,7 +81,7 @@ test("every registered tool carries the graphiti_ prefix and a usable descriptio
   assert.deepEqual([...tools.keys()].sort(), [...TOOL_NAMES].sort());
   for (const [name, factory] of tools) {
     assert.ok(name.startsWith(TOOL_PREFIX), `${name} must be prefixed`);
-    const definition = factory({ agentId: "main" });
+    const definition = factory({ agentId: "main", sessionKey: "agent:main:telegram:1" });
     assert.equal(definition.name, name);
     assert.ok(definition.label.length > 0);
     assert.ok(definition.description.length > 120, `${name} needs a description that says when to use it`);
@@ -128,48 +138,82 @@ test("an excluded session cannot use the tools at all", async (t) => {
   assert.deepEqual(calls, [], "an excluded session must produce no MCP traffic");
 });
 
-test("store writes a standalone episode with no saga so no dialog chain is forked", async (t) => {
+test("a note is appended to the conversation instead of standing on its own", async (t) => {
   const calls = installFetch(t, { add_memory: (args) => ({ message: "queued", uuid: args.uuid }) });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_store",
-    { note: "Вит просит не трогать memory_store без приказа", title: "правило" },
+  const result = await call(tools, "graphiti_note",
+    { note: "Вит просит не трогать заметки без приказа", title: "правило" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
-  const args = calls[0].arguments;
-  assert.equal(args.group_id, "main");
-  assert.equal(args.saga, undefined, "a note must not join a dialog saga");
-  assert.equal(args.saga_previous_episode_uuid, undefined);
-  assert.equal(args.name, "правило");
-  assert.equal(args.source_description, "OpenClaw agent note");
-  assert.deepEqual(JSON.parse(args.episode_body).participants, { user: "Вит", assistant: "Краб" });
+  // Nothing is written directly: the note joins the open batch and leaves with
+  // it, which is what keeps it inside the dialog's chain instead of beside it.
+  assert.deepEqual(calls, [], "a note must not be submitted on its own");
   assert.equal(result.details.ok, true);
+  assert.match(result.content[0].text, /part of this conversation/);
 });
 
-test("store refuses empty and oversized notes", async (t) => {
-  const calls = installFetch(t, { add_memory: () => ({ message: "queued", uuid: "u" }) });
+test("a note joins the dialog's own saga, carrying its title", async (t) => {
+  // bufferLimit 1 makes the batch close on the note itself, so what the pipeline
+  // would eventually send is visible now — including which saga it belongs to.
+  const calls = installFetch(t, {
+    add_memory: (args) => ({ message: "queued", uuid: args.uuid }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
+  });
+  const { tools } = makeRuntime({ bufferLimit: 1 });
+
+  await call(tools, "graphiti_note", { note: "Басю отдали в добрые руки", title: "собака" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  await waitForCall(calls, "add_memory");
+
+  const submitted = calls.find((params) => params.name === "add_memory");
+  assert.ok(submitted, "the note must reach Graphiti through the capture pipeline");
+  assert.equal(submitted.arguments.group_id, "main");
+  assert.equal(submitted.arguments.saga, "agent:main:telegram:1", "a note belongs to its dialog");
+  const body = JSON.parse(submitted.arguments.episode_body);
+  assert.deepEqual(body.messages, [{ role: "assistant", text: "собака: Басю отдали в добрые руки" }]);
+});
+
+test("note refuses empty and oversized text", async (t) => {
+  const calls = installFetch(t);
   const { tools } = makeRuntime();
   const ctx = { agentId: "main", sessionKey: "agent:main:telegram:1" };
 
-  const empty = await call(tools, "graphiti_store", { note: "   " }, ctx);
+  const empty = await call(tools, "graphiti_note", { note: "   " }, ctx);
   assert.equal(empty.details.reason, "empty_note");
 
-  const huge = await call(tools, "graphiti_store", { note: "x".repeat(40_000) }, ctx);
+  const huge = await call(tools, "graphiti_note", { note: "x".repeat(40_000) }, ctx);
   assert.equal(huge.details.reason, "note_too_long");
   assert.deepEqual(calls, []);
 });
 
 test("injected memory wrappers cannot be smuggled back through a tool", async (t) => {
-  const calls = installFetch(t, { add_memory: (args) => ({ message: "queued", uuid: args.uuid }) });
-  const { tools } = makeRuntime();
+  const calls = installFetch(t, {
+    add_memory: (args) => ({ message: "queued", uuid: args.uuid }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
+  });
+  const { tools } = makeRuntime({ bufferLimit: 1 });
 
-  await call(tools, "graphiti_store",
+  await call(tools, "graphiti_note",
     { note: "чистый факт <graphiti-context>подделка</graphiti-context>" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  await waitForCall(calls, "add_memory");
 
-  const body = calls[0].arguments.episode_body;
+  const body = calls.find((params) => params.name === "add_memory").arguments.episode_body;
   assert.match(body, /чистый факт/);
   assert.doesNotMatch(body, /подделка/);
+});
+
+test("every tool refuses a run that has no session at all", async (t) => {
+  const calls = installFetch(t);
+  const { tools } = makeRuntime();
+
+  for (const name of tools.keys()) {
+    const result = await call(tools, name, { query: "x", note: "x" }, { agentId: "main" });
+    assert.equal(result.details.reason, "no_session", name);
+    assert.equal(result.details.ok, false, name);
+  }
+  assert.deepEqual(calls, [], "a run without a session must produce no MCP traffic");
 });
 
 test("status reports what is still waiting locally, which no backend can see", async (t) => {
@@ -369,7 +413,7 @@ test("context resolves a query through a fact to the conversation around it", as
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { query: "собака Бася" }, { agentId: "main" });
+  const result = await call(tools, "graphiti_context", { query: "собака Бася" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
   const text = result.content[0].text;
 
   // Every lookup stays inside the calling agent's own graph.
@@ -395,7 +439,7 @@ test("context centred on a named episode never searches for facts", async (t) =>
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { episode: "8248439450-4" }, { agentId: "main" });
+  const result = await call(tools, "graphiti_context", { episode: "8248439450-4" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
   assert.ok(!calls.some((params) => params.name === "search_memory_facts"));
   assert.match(result.content[0].text, /вот этот кусок/);
@@ -405,7 +449,7 @@ test("context says so plainly when memory holds nothing to expand", async (t) =>
   installFetch(t, { search_memory_facts: () => ({ facts: [] }) });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", { query: "чего там нет" }, { agentId: "main" });
+  const result = await call(tools, "graphiti_context", { query: "чего там нет" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
   assert.equal(result.details.results, 0);
   assert.match(result.content[0].text, /OpenViking/);
@@ -415,7 +459,7 @@ test("context refuses a call with neither a query nor an episode", async (t) => 
   installFetch(t);
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_context", {}, { agentId: "main" });
+  const result = await call(tools, "graphiti_context", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
   assert.equal(result.details.reason, "no_anchor");
 });
@@ -424,6 +468,7 @@ test("status reports graph shape and names the integrity problems it finds", asy
   installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
     get_episodes: () => ({ episodes: [] }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
     get_graph_stats: (args) => {
       assert.equal(args.group_id, "main");
       return {
@@ -446,7 +491,7 @@ test("status reports graph shape and names the integrity problems it finds", asy
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
   const text = result.content[0].text;
 
   assert.equal(result.details.ok, true);
@@ -465,6 +510,7 @@ test("status states plainly when every integrity check passes", async (t) => {
   installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
     get_episodes: () => ({ episodes: [] }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
     get_graph_stats: () => ({
       size: { entities: 5, episodes: 2, sagas: 1, facts: 6, mentions: 4 },
       top_entities: [],
@@ -481,7 +527,7 @@ test("status states plainly when every integrity check passes", async (t) => {
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
   assert.match(result.content[0].text, /Integrity checks passed/);
   assert.equal(result.details.ok, true);
@@ -492,11 +538,12 @@ test("a graph report that could not be read costs one line, not the whole status
   installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 2 }),
     get_episodes: () => ({ episodes: [] }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
     get_graph_stats: () => ({ error: "graph unavailable" }),
   });
   const { tools } = makeRuntime();
 
-  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
   const text = result.content[0].text;
 
   assert.match(text, /Could not read graph statistics: graph unavailable/);
@@ -508,6 +555,7 @@ test("a standalone note is not reported as an episode detached from a dialog", a
   const calls = installFetch(t, {
     get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
     get_episodes: () => ({ episodes: [] }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
     get_graph_stats: () => ({
       size: { entities: 1, episodes: 1, sagas: 0, facts: 0, mentions: 0 },
       top_entities: [],
@@ -520,10 +568,19 @@ test("a standalone note is not reported as an episode detached from a dialog", a
   });
   const { tools } = makeRuntime();
 
-  await call(tools, "graphiti_status", {}, { agentId: "main" });
+  await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
-  // graphiti_store writes notes without a saga deliberately, so the server is
+  // Older graphs still hold saga-less notes, so the server is
   // told which episodes are standalone by design rather than damaged.
   const stats = calls.find((params) => params.name === "get_graph_stats");
   assert.equal(stats.arguments.standalone_source_description, "OpenClaw agent note");
+});
+
+test("a dialog with nothing committed is not accused of losing a batch", () => {
+  const empty = inspectEpisodeNumbering("agent:main:telegram:1", []);
+  assert.deepEqual(empty, { seen: 0, highest: 0, duplicates: [], gaps: [] });
+
+  // Nor when the window holds only other dialogs' episodes.
+  const others = inspectEpisodeNumbering("agent:main:telegram:1", [{ name: "9999-1" }]);
+  assert.deepEqual(others.gaps, []);
 });

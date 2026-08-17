@@ -36,7 +36,7 @@ Enabled by `agentTools` (default true) and registered only if the host exposes a
 | `graphiti_search_entities` | Searches known people, places, projects | The question is about an entity rather than a statement |
 | `graphiti_context` | Reads the conversation a memory came from | The wording, tone or surrounding exchange matters, not just the fact |
 | `graphiti_episodes` | Lists recently committed conversation batches | Checking what has actually reached memory |
-| `graphiti_store` | Writes one durable note | The user explicitly asks to remember something lasting |
+| `graphiti_note` | Records one lasting fact into the conversation | The user explicitly asks to remember something lasting |
 | `graphiti_status` | Reports backend health, graph size and integrity checks | Memory looks stale or empty and the agent needs to say why |
 
 `graphiti_recall` and `graphiti_context` are two steps of one move: the first answers what is known, the second shows how it was said. A fact records the uuids of the episodes that produced it, and episode names carry a batch number, so the batches either side of a match are the surrounding conversation. `graphiti_context` reports the episode it centred on, so the agent can call again with a wider window instead of guessing.
@@ -45,7 +45,11 @@ Both search tools point at the OpenViking tools when they find nothing, and the 
 
 Every tool resolves the agent from its invocation context and passes it as the Graphiti group, so a tool call cannot cross into another agent's graph. A session matched by `excludeSessionPatterns` cannot use the tools at all: a session that is not recorded must not query or write memory either.
 
-`graphiti_store` writes a standalone episode with no saga. A saga is the chronology of one dialog, maintained batch by batch by the capture pipeline; injecting a note into that chain would fork its predecessor links.
+`graphiti_note` appends the note to the open batch of the conversation it was made in, exactly as a message is appended, and it leaves with that batch on the ordinary schedule. This is what keeps a note attached: it belongs to a dialog, sits in that dialog's chain, and is searchable once the batch is committed.
+
+Writing the episode directly instead would fork the chain. A saga is the chronology of one dialog and the capture pipeline owns it, holding the last episode of the chain in memory; an episode written around the pipeline would leave that memory stale, and the next batch would point at a predecessor that is no longer last. Letting the pipeline do the writing removes the race rather than timing around it.
+
+Every tool, read-only ones included, refuses a run with no session: memory belongs to a conversation, and a call from outside one has no dialog to read from and nowhere to write to.
 
 There is deliberately no destructive tool. The Graphiti MCP delete endpoints take no group id and run against the driver's default database rather than the agent's graph, so exposing them to an agent could not be made isolation-safe. See `TODO.md` for what would have to be true first.
 

@@ -776,6 +776,14 @@ export function register(api: OpenClawPluginApi): void {
       excludedSessionPatterns,
       // Only this process knows what has been captured but not yet submitted;
       // the backend cannot report a batch it has never seen.
+      // A note goes through the same door as a message. The pipeline owns the
+      // saga chain, so letting it do the writing is what keeps a note from
+      // forking that chain; checkpointing afterwards puts the note in the spool
+      // so a restart before the batch is committed does not lose it.
+      captureNote: (agentId, sessionKey, note) => {
+        engine.addMessages(agentId, sessionKey, [{ role: "assistant", text: note }]);
+        engine.checkpoint();
+      },
       localCaptureState: (agentId) => {
         const agent = engine.snapshot().agents.find((entry) => entry.agentId === agentId);
         const buffers = agent?.activeBuffers ?? [];

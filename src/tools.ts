@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { GraphitiPluginConfig } from "./config.js";
 import { episodeNamePrefix } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
@@ -16,11 +15,11 @@ export const TOOL_NAMES = [
   "graphiti_search_entities",
   "graphiti_context",
   "graphiti_episodes",
-  "graphiti_store",
+  "graphiti_note",
   "graphiti_status",
 ] as const;
 
-const MAX_STORE_CHARS = 32_000;
+const MAX_NOTE_CHARS = 32_000;
 /** How many recent episodes the status tool inspects when checking numbering. */
 const CHAIN_CHECK_EPISODES = 100;
 /** How many of the most connected entities the status tool names. */
@@ -124,6 +123,11 @@ export function inspectEpisodeNumbering(
     if (Number.isInteger(parsed) && parsed > 0) numbers.push(parsed);
   }
 
+  // A dialog with nothing committed yet has no numbering to inspect. Without
+  // this the range below runs from 0 to 0 and reports batch 0 as missing, so
+  // every brand-new dialog accused itself of having lost a batch.
+  if (numbers.length === 0) return { seen: 0, highest: 0, duplicates: [], gaps: [] };
+
   const counts = new Map<number, number>();
   for (const value of numbers) counts.set(value, (counts.get(value) ?? 0) + 1);
   const highest = numbers.length > 0 ? Math.max(...numbers) : 0;
@@ -135,7 +139,15 @@ export function inspectEpisodeNumbering(
   }
   return { seen: numbers.length, highest, duplicates, gaps };
 }
-const STORE_SOURCE_DESCRIPTION = "OpenClaw agent note";
+/**
+ * The source description of notes written by the old standalone path.
+ *
+ * Notes are now appended to the conversation, so nothing new carries this. It
+ * stays because graphs written before that change still hold such episodes, and
+ * they are legitimately saga-less: the status tool must keep counting them
+ * separately and must keep telling the server not to report them as detached.
+ */
+const LEGACY_NOTE_SOURCE_DESCRIPTION = "OpenClaw agent note";
 
 function textResult(text: string, details: Record<string, unknown>): PluginToolResult {
   return { content: [{ type: "text", text }], details };
@@ -171,6 +183,17 @@ export type ToolDependencies = {
   logger: GraphitiLogger;
   excludedSessionPatterns: readonly RegExp[];
   localCaptureState: (agentId: string) => LocalCaptureState;
+  /**
+   * Append a note to this session's open batch, exactly as a message is appended.
+   *
+   * The note travels the ordinary capture path instead of being written around
+   * it. That is what keeps it attached: it lands in the dialog it was made in,
+   * takes its place in that dialog's chain, and cannot fork the chain, because
+   * the pipeline that owns the chain is the one doing the writing. Writing an
+   * episode directly would leave the pipeline's idea of the last episode stale,
+   * and the next batch would point at a predecessor that is no longer last.
+   */
+  captureNote: (agentId: string, sessionKey: string, note: string) => void;
 };
 
 /**
@@ -187,12 +210,12 @@ export type ToolDependencies = {
  * agent's graph, so exposing them to an agent could not be made isolation-safe.
  */
 export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinition[] {
-  const { cfg, client, logger, excludedSessionPatterns, localCaptureState } = deps;
+  const { cfg, client, logger, excludedSessionPatterns, localCaptureState, captureNote } = deps;
 
   const resolve = (
     toolName: string,
     ctx: PluginToolContext | undefined,
-  ): { agentId: string } | { refusal: PluginToolResult } => {
+  ): { agentId: string; sessionKey: string } | { refusal: PluginToolResult } => {
     let agentId: string;
     try {
       agentId = requireAgentId(ctx?.agentId);
@@ -206,6 +229,21 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         refusal: errorResult(
           "Graphiti memory is unavailable here: this run has no resolvable agent identity.",
           { tool: toolName, reason: "invalid_agent_id" },
+        ),
+      };
+    }
+
+    // Memory belongs to a conversation. A call arriving with no session is not
+    // a conversation — it has no dialog to read from and nowhere to write to —
+    // so it is refused outright, read-only tools included, rather than quietly
+    // answering from, or writing into, a context nobody can point at.
+    const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+    if (!sessionKey) {
+      logger.warn("tool_refused", { tool: toolName, agentId, reason: "no_session" });
+      return {
+        refusal: errorResult(
+          `${toolName} works only inside a conversation, and this run has no session.`,
+          { tool: toolName, reason: "no_session" },
         ),
       };
     }
@@ -227,7 +265,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       };
     }
 
-    return { agentId };
+    return { agentId, sessionKey };
   };
 
   const failed = (toolName: string, agentId: string, error: unknown): PluginToolResult => {
@@ -532,14 +570,14 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
     },
 
     {
-      name: "graphiti_store",
-      label: "Store a note (Graphiti)",
+      name: "graphiti_note",
+      label: "Note something to remember (Graphiti)",
       description:
-        "Write one durable note into this agent's long-term memory, outside the normal conversation capture. " +
-        "The conversation is already captured automatically, so do NOT use this to save things that were just said. " +
-        "Use it only when the user explicitly asks you to remember something, or states a lasting preference, rule or fact " +
-        "that must survive even if this dialog is never committed. Write the note as a self-contained statement " +
-        "that will still make sense months later, with names spelled out rather than pronouns.",
+        "Record one lasting fact as a note in this conversation, so it is remembered even if nothing else from the dialog is. " +
+        "The conversation is captured automatically, so do NOT use this for things that were merely said. " +
+        "Use it when the user asks you to remember something, or states a lasting preference, rule or fact. " +
+        "Write it as a self-contained statement that still makes sense months later, with names spelled out rather than pronouns. " +
+        "It is stored with the surrounding conversation and becomes searchable when that batch is committed.",
       parameters: {
         type: "object",
         properties: {
@@ -549,67 +587,50 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           },
           title: {
             type: "string",
-            description: "Optional short label for this note, used as the episode name.",
+            description: "Optional short label, prepended to the note.",
           },
         },
         required: ["note"],
       },
       async execute(_toolCallId, params, ctx) {
-        const resolved = resolve("graphiti_store", ctx);
+        const resolved = resolve("graphiti_note", ctx);
         if ("refusal" in resolved) return resolved.refusal;
 
         const note = sanitizeConversationText(stringParam(params, "note"));
         if (!note) {
-          return errorResult("graphiti_store needs a non-empty note.", {
-            tool: "graphiti_store",
+          return errorResult("graphiti_note needs a non-empty note.", {
+            tool: "graphiti_note",
             reason: "empty_note",
           });
         }
-        if (note.length > MAX_STORE_CHARS) {
+        if (note.length > MAX_NOTE_CHARS) {
           return errorResult(
-            `That note is ${note.length} characters; graphiti_store accepts at most ${MAX_STORE_CHARS}. Store the essential statement instead of the full text.`,
-            { tool: "graphiti_store", reason: "note_too_long", chars: note.length },
+            `That note is ${note.length} characters; graphiti_note accepts at most ${MAX_NOTE_CHARS}. Record the essential statement instead of the full text.`,
+            { tool: "graphiti_note", reason: "note_too_long", chars: note.length },
           );
         }
 
-        const actors = cfg.agents[resolved.agentId];
         const title = sanitizeConversationText(stringParam(params, "title")).slice(0, 80);
-        const uuid = randomUUID();
-        // Notes deliberately carry no saga: a saga is the chronology of one
-        // dialog, maintained batch by batch by the capture pipeline. Injecting a
-        // note into that chain would fork its predecessor links.
-        const body = JSON.stringify({
-          participants: {
-            user: actors?.user ?? "User",
-            assistant: actors?.assistant ?? "Assistant",
-          },
-          messages: [{ role: "assistant", text: note }],
-        });
+        const body = title ? `${title}: ${note}` : note;
 
         try {
-          const result = await client.addMemory({
-            uuid,
-            name: title || `note-${uuid.slice(0, 8)}`,
-            jsonBody: body,
-            groupId: resolved.agentId,
-            referenceTime: new Date().toISOString(),
-            previousEpisodeUuids: [],
-            sourceDescription: STORE_SOURCE_DESCRIPTION,
-          });
-          if (typeof result.error === "string") throw new Error(result.error);
-
-          logger.info("tool_store", {
+          // Handed to the capture pipeline as an ordinary message. It leaves with
+          // the batch it joined, on the same schedule as the conversation around
+          // it — a note is not worth a premature commit, and forcing one would
+          // put it in a batch of its own for no gain.
+          captureNote(resolved.agentId, resolved.sessionKey, body);
+          logger.info("tool_note", {
             agentId: resolved.agentId,
             group_id: resolved.agentId,
-            uuid,
-            chars: note.length,
+            sessionKey: resolved.sessionKey,
+            chars: body.length,
           });
           return textResult(
-            "Stored. It will be searchable once Graphiti finishes extracting it, usually within a minute.",
-            { tool: "graphiti_store", uuid, ok: true },
+            "Noted. It is part of this conversation now and becomes searchable once the current batch is committed.",
+            { tool: "graphiti_note", chars: body.length, ok: true },
           );
         } catch (error) {
-          return failed("graphiti_store", resolved.agentId, error);
+          return failed("graphiti_note", resolved.agentId, error);
         }
       },
     },
@@ -719,8 +740,8 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           // Everything below comes from the same window of episodes: shape of the
           // memory, not just its health. Batch size is what tells an operator
           // whether bufferLimit is set sensibly.
-          const notes = episodes.filter((e) => e.source_description === STORE_SOURCE_DESCRIPTION);
-          const batches = episodes.filter((e) => e.source_description !== STORE_SOURCE_DESCRIPTION);
+          const notes = episodes.filter((e) => e.source_description === LEGACY_NOTE_SOURCE_DESCRIPTION);
+          const batches = episodes.filter((e) => e.source_description !== LEGACY_NOTE_SOURCE_DESCRIPTION);
           const dialogs = new Set(
             batches
               .map((e) => (typeof e.name === "string" ? e.name.replace(/-\d+$/, "") : ""))
@@ -778,7 +799,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           const stats = await client.getGraphStats(
             resolved.agentId,
             TOP_ENTITIES,
-            STORE_SOURCE_DESCRIPTION,
+            LEGACY_NOTE_SOURCE_DESCRIPTION,
           );
           const size = isRecord(stats.size) ? stats.size : {};
           details.graphSize = size;

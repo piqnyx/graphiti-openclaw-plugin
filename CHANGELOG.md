@@ -2,6 +2,17 @@
 
 All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
+## 0.2.0 - 2026-08-17
+
+### Changed
+
+- `graphiti_store` is now `graphiti_note`, and it no longer writes a standalone episode. The note is appended to the open batch of the conversation it was made in and leaves with it, so it belongs to a dialog, takes its place in that dialog's chain, and cannot fork the chain — the pipeline that owns the chain does the writing. Update the OpenClaw allowlist: `graphiti_store` no longer exists.
+- Every tool, read-only ones included, refuses a run with no session. Memory belongs to a conversation; a call from outside one has no dialog to read from and nowhere to write to.
+
+### Fixed
+
+- A dialog with nothing committed yet no longer reports "batch number 0 is missing". The numbering check ran its range from zero when it had seen no episodes, so every brand-new dialog accused itself of having lost a batch.
+
 ## 0.1.1 - 2026-08-17
 
 ### Fixed

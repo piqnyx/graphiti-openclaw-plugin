@@ -4,7 +4,10 @@
   "description": "Graphiti companion plugin for OpenClaw",
   "activation": {
     "onStartup": true,
-    "onCapabilities": ["hook", "tool"]
+    "onCapabilities": [
+      "hook",
+      "tool"
+    ]
   },
   "contracts": {
     "tools": [
@@ -12,7 +15,7 @@
       "graphiti_search_entities",
       "graphiti_context",
       "graphiti_episodes",
-      "graphiti_store",
+      "graphiti_note",
       "graphiti_status"
     ]
   },
@@ -20,22 +23,76 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "baseUrl": { "type": "string" },
-      "autoCapture": { "type": "boolean" },
-      "autoRecall": { "type": "boolean" },
-      "requestTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
-      "recallLimit": { "type": "integer", "minimum": 1, "maximum": 100 },
-      "recallQueryMaxChars": { "type": "integer", "minimum": 32, "maximum": 32000 },
-      "recallMaxInjectedChars": { "type": "integer", "minimum": 128, "maximum": 64000 },
-      "recallUseHistory": { "type": "boolean" },
-      "recallHistoryMaxMessages": { "type": "integer", "minimum": 1, "maximum": 100 },
-      "recallHistoryMaxChars": { "type": "integer", "minimum": 128, "maximum": 32000 },
-      "logOperations": { "type": "boolean" },
-      "logLevel": { "type": "string", "enum": ["error", "warn", "info", "debug"] },
-      "logContent": { "type": "boolean" },
-      "logModelInput": { "type": "boolean" },
-      "bufferLimit": { "type": "integer", "minimum": 1, "maximum": 1000 },
-      "bufferTimeout": { "type": "integer", "minimum": 30, "maximum": 604800 },
+      "baseUrl": {
+        "type": "string"
+      },
+      "autoCapture": {
+        "type": "boolean"
+      },
+      "autoRecall": {
+        "type": "boolean"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 300000
+      },
+      "recallLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "recallQueryMaxChars": {
+        "type": "integer",
+        "minimum": 32,
+        "maximum": 32000
+      },
+      "recallMaxInjectedChars": {
+        "type": "integer",
+        "minimum": 128,
+        "maximum": 64000
+      },
+      "recallUseHistory": {
+        "type": "boolean"
+      },
+      "recallHistoryMaxMessages": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "recallHistoryMaxChars": {
+        "type": "integer",
+        "minimum": 128,
+        "maximum": 32000
+      },
+      "logOperations": {
+        "type": "boolean"
+      },
+      "logLevel": {
+        "type": "string",
+        "enum": [
+          "error",
+          "warn",
+          "info",
+          "debug"
+        ]
+      },
+      "logContent": {
+        "type": "boolean"
+      },
+      "logModelInput": {
+        "type": "boolean"
+      },
+      "bufferLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      },
+      "bufferTimeout": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 604800
+      },
       "agentTools": {
         "type": "boolean",
         "description": "Register the graphiti_* tools so agents can query and write memory on demand. Which agent may call which tool is still governed by the OpenClaw per-agent tool allowlist."
@@ -43,7 +100,11 @@
       "excludeSessionPatterns": {
         "type": "array",
         "maxItems": 64,
-        "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
         "description": "Regular expressions tested against the OpenClaw session key and the run trigger. A match excludes the session from both capture and recall. Replaces the previously hardcoded cron/heartbeat/subagent/slug-generator filtering; overriding this list overrides that too."
       },
       "agents": {
@@ -51,10 +112,19 @@
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["user", "assistant"],
+          "required": [
+            "user",
+            "assistant"
+          ],
           "properties": {
-            "user": { "type": "string", "minLength": 1 },
-            "assistant": { "type": "string", "minLength": 1 }
+            "user": {
+              "type": "string",
+              "minLength": 1
+            },
+            "assistant": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         }
       }

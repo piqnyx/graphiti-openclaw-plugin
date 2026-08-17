@@ -13,6 +13,23 @@ const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\
  * let extraction mint entities out of it.
  */
 const TRANSCRIPT_PREFIX_RE = /^\s*\[[^\]\n]{0,160}transcript[^\]\n]{0,160}\]\s*:\s*/i;
+/**
+ * TTS directives the model writes into its own reply.
+ *
+ * OpenClaw lets a reply carry `[[tts:speakerVoiceId=… speed=…]]` to steer the
+ * voice, and `[[tts:text]]…[[/tts:text]]` to give wording that belongs only to
+ * the audio. The gateway strips these before the channel renders them, but
+ * capture reads the model's raw output, so they arrive here intact — and stored
+ * as-is they become entities: extraction has no way to know that `eleven_v3` is
+ * a voice model rather than a thing worth remembering.
+ *
+ * The parameter form is machinery and goes entirely. The text form is speech the
+ * assistant actually uttered, so only its markers go and the words stay — the
+ * same rule already applied to transcription markers.
+ */
+const TTS_DIRECTIVE_RE = /\[\[tts:(?!text\]\])[^\]]*\]\]/gi;
+const TTS_TEXT_MARKER_RE = /\[\[\/?tts:text\]\]/gi;
+const AUDIO_AS_VOICE_RE = /\[\[audio_as_voice\]\]/gi;
 const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
@@ -71,6 +88,12 @@ export function sanitizeConversationText(text: string): string {
     stripInjectedContexts(text)
       .replace(CONVERSATION_METADATA_RE, "\n")
       .replace(SENDER_METADATA_RE, "\n")
+      // Removed outright rather than replaced by a space: a directive already
+      // sits on its own or next to one, and substituting would leave a double
+      // space in the middle of the sentence it was attached to.
+      .replace(TTS_DIRECTIVE_RE, "")
+      .replace(TTS_TEXT_MARKER_RE, "")
+      .replace(AUDIO_AS_VOICE_RE, "")
       .replace(LEADING_TIMESTAMP_RE, ""),
   )
     .replace(/\u0000/g, "")

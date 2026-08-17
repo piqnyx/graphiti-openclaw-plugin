@@ -127,6 +127,12 @@
             }
           }
         }
+      },
+      "communityRebuildHours": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 8760,
+        "description": "How often the scheduled community rebuild runs, in hours. Only used to tell you in graphiti_status when the next rebuild is due; 0 means no schedule is configured and the status reports the age of the summaries instead."
       }
     }
   }

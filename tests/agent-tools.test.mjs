@@ -613,7 +613,9 @@ test("status reports the communities and how stale they are", async (t) => {
   const result = await call(tools, "graphiti_status", {}, { agentId: "main", sessionKey: "agent:main:web:1" });
   const text = result.content[0].text;
 
-  assert.match(text, /Communities: 2 built at 2026-08-17T04:00:00\+00:00, 7 episode\(s\) recorded since/);
+  // The age is relative to now, so it is matched loosely on purpose: pinning it
+  // would make the test fail with the passage of time rather than with a defect.
+  assert.match(text, /Communities: 2 built at 2026-08-17T04:00:00\+00:00 \(.*ago\), 7 episode\(s\) recorded since/);
   assert.match(text, /Дом и переезды \(14 members\): Вит живёт в Григолети\./);
   // A community with no summary still earns its line: its size is information.
   assert.match(text, /Работа \(6 members\)/);

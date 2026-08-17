@@ -149,6 +149,35 @@ export function inspectEpisodeNumbering(
  */
 const LEGACY_NOTE_SOURCE_DESCRIPTION = "OpenClaw agent note";
 
+/** "3 hours ago" — an absolute timestamp alone makes the reader do arithmetic. */
+function describeAge(iso: string): string {
+  const built = Date.parse(iso);
+  if (!Number.isFinite(built)) return "age unknown";
+  const minutes = Math.max(0, Math.round((Date.now() - built) / 60_000));
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hour(s) ago`;
+  return `${Math.round(hours / 24)} day(s) ago`;
+}
+
+/**
+ * When the next scheduled rebuild is due.
+ *
+ * The plugin cannot see the crontab, so the interval is configuration. Without
+ * it the honest answer is silence: guessing a due date from one build time would
+ * state a schedule nobody promised.
+ */
+function describeNextRebuild(builtAt: string, intervalHours: number): string {
+  if (intervalHours <= 0) return "";
+  const built = Date.parse(builtAt);
+  if (!Number.isFinite(built)) return "";
+  const dueInMinutes = Math.round((built + intervalHours * 3_600_000 - Date.now()) / 60_000);
+  if (dueInMinutes <= 0) return `; the next rebuild is overdue by ${describeAge(new Date(built + intervalHours * 3_600_000).toISOString())}`;
+  if (dueInMinutes < 60) return `; next rebuild in ${dueInMinutes} min`;
+  const hours = Math.round(dueInMinutes / 60);
+  return hours < 48 ? `; next rebuild in ${hours} hour(s)` : `; next rebuild in ${Math.round(hours / 24)} day(s)`;
+}
+
 function textResult(text: string, details: Record<string, unknown>): PluginToolResult {
   return { content: [{ type: "text", text }], details };
 }
@@ -829,8 +858,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             const builtAt = text(communities.built_at);
             const since = count(communities.episodes_since_build);
             lines.push(
-              `Communities: ${communityCount} built${builtAt ? ` at ${builtAt}` : ""}` +
-                `${since > 0 ? `, ${since} episode(s) recorded since` : ", nothing recorded since"}.`,
+              `Communities: ${communityCount} built${builtAt ? ` at ${builtAt} (${describeAge(builtAt)})` : ""}` +
+                `${since > 0 ? `, ${since} episode(s) recorded since` : ", nothing recorded since"}` +
+                `${describeNextRebuild(builtAt, cfg.communityRebuildHours)}.`,
             );
             for (const row of rows(communities.largest)) {
               const summary = text(row.summary).replace(/\s+/g, " ").trim();

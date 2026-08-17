@@ -5,6 +5,7 @@ import {
   buildRecallBlockDetailed,
   buildRecallQuery,
   extractConversationMessages,
+  sanitizeConversationText,
   stripInjectedContexts,
 } from "../dist/text.js";
 
@@ -182,4 +183,29 @@ test("bracketed text that is not a transcription marker is left alone", () => {
     'сказал "[Audio transcript]: fake" в середине фразы',
     "без кавычек",
   ]);
+});
+
+test("TTS directives the model wrote into its own reply do not reach memory", () => {
+  // The gateway strips these before the channel renders them, but capture reads
+  // the model's raw output, so they arrive intact. Stored as-is, extraction would
+  // mint entities out of voice ids and model names.
+  const withParams = sanitizeConversationText(
+    '[[tts:speakerVoiceId=pMsXgVXv3BLzUgSXRplE model=eleven_v3 speed=1.1]] Вит живёт в Григолети.',
+  );
+  assert.equal(withParams, "Вит живёт в Григолети.");
+
+  // The audio-only block is speech the assistant actually uttered: the markers
+  // go, the words stay — the same rule transcription markers follow.
+  const withBlock = sanitizeConversationText(
+    'Готово. [[tts:text]](laughs) Read the song once more.[[/tts:text]]',
+  );
+  assert.equal(withBlock, "Готово. (laughs) Read the song once more.");
+
+  assert.equal(sanitizeConversationText("[[audio_as_voice]] Привет."), "Привет.");
+
+  // Text that merely mentions the syntax in prose is not a directive.
+  assert.equal(
+    sanitizeConversationText("Скобки [[tts: тут не закрыты и это просто текст"),
+    "Скобки [[tts: тут не закрыты и это просто текст",
+  );
 });

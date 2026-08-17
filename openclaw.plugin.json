@@ -10,6 +10,7 @@
     "tools": [
       "graphiti_recall",
       "graphiti_search_entities",
+      "graphiti_context",
       "graphiti_episodes",
       "graphiti_store",
       "graphiti_status"

@@ -34,9 +34,14 @@ Enabled by `agentTools` (default true) and registered only if the host exposes a
 |---|---|---|
 | `graphiti_recall` | Searches the agent's memory for facts | Automatic recall was not enough: the user asks what you remember, or refers to another dialog |
 | `graphiti_search_entities` | Searches known people, places, projects | The question is about an entity rather than a statement |
+| `graphiti_context` | Reads the conversation a memory came from | The wording, tone or surrounding exchange matters, not just the fact |
 | `graphiti_episodes` | Lists recently committed conversation batches | Checking what has actually reached memory |
 | `graphiti_store` | Writes one durable note | The user explicitly asks to remember something lasting |
-| `graphiti_status` | Reports backend health and this dialog's episode count | Memory looks stale or empty and the agent needs to say why |
+| `graphiti_status` | Reports backend health, graph size and integrity checks | Memory looks stale or empty and the agent needs to say why |
+
+`graphiti_recall` and `graphiti_context` are two steps of one move: the first answers what is known, the second shows how it was said. A fact records the uuids of the episodes that produced it, and episode names carry a batch number, so the batches either side of a match are the surrounding conversation. `graphiti_context` reports the episode it centred on, so the agent can call again with a wider window instead of guessing.
+
+Both search tools point at the OpenViking tools when they find nothing, and the OpenViking search tools point back here, so a blank in one store is not mistaken for a blank in memory.
 
 Every tool resolves the agent from its invocation context and passes it as the Graphiti group, so a tool call cannot cross into another agent's graph. A session matched by `excludeSessionPatterns` cannot use the tools at all: a session that is not recorded must not query or write memory either.
 

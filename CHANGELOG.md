@@ -12,8 +12,6 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 ### Added
 
 - TTS directives the model writes into its own reply (`[[tts:…]]`, `[[tts:text]]…[[/tts:text]]`, `[[audio_as_voice]]`) are stripped before capture. The gateway removes them from the visible text, but capture reads the model's raw output, so voice ids and model names were reaching extraction as if they were facts.
-- `communityRebuildHours` config key. Set it to the interval of the scheduled rebuild and `graphiti_status` reports when the next one is due; left at 0 it reports only how old the summaries are, rather than inventing a schedule it cannot see.
-- `graphiti_status` reports communities: how many, when they were last built, how many episodes have been recorded since, and the largest with their summaries. Building them is a scheduled job (`tools/rebuild_communities.py` in the fork), never part of a request — summarising a cluster calls an LLM per community, and a diagnostic must answer immediately.
 
 ### Fixed
 

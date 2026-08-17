@@ -64,6 +64,7 @@ test("capture spool atomically round-trips pending state and removes empty check
         batchNumber: 31,
         episodeBody: '{"messages":[]}',
         previousEpisodeUuids: ["u-30"],
+        referenceTime: "2026-08-17T10:00:00.000Z",
         submittedAt: 900,
         attempts: 1,
       },
@@ -231,7 +232,8 @@ test("a pending batch survives a restart, and a malformed one is dropped", (t) =
   const spool = tempSpool(t);
   const good = {
     agentId: "main", sessionKey: "s1", uuid: "u-22", name: "8248439450-22", batchNumber: 22,
-    episodeBody: '{"messages":[]}', previousEpisodeUuids: [], submittedAt: 1, attempts: 0,
+    episodeBody: '{"messages":[]}', previousEpisodeUuids: [],
+    referenceTime: "2026-08-17T10:00:00.000Z", submittedAt: 1, attempts: 0,
   };
   spool.save({ version: 3, agents: [], sessions: [], pending: [good, { uuid: "" }, { nonsense: true }] });
 

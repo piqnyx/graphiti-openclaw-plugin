@@ -44,6 +44,15 @@ export type PendingBatch = {
   /** The episode body, kept so the batch can be submitted again unchanged. */
   episodeBody: string;
   previousEpisodeUuids: string[];
+  /**
+   * Kept so a resubmission is byte-identical to the original.
+   *
+   * Regenerating the reference time on retry would move the episode in the
+   * conversation's timeline every time the backend was slow, and the predecessor
+   * link is what keeps the chain intact — neither may be invented at retry time.
+   */
+  referenceTime: string;
+  sagaPreviousEpisodeUuid?: string;
   submittedAt: number;
   attempts: number;
 };

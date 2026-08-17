@@ -254,6 +254,7 @@ function validPendingBatch(value: unknown): value is PendingBatch {
     typeof value.sessionKey === "string" &&
     typeof value.name === "string" &&
     typeof value.episodeBody === "string" &&
+    typeof value.referenceTime === "string" &&
     typeof value.batchNumber === "number" &&
     Number.isInteger(value.batchNumber) &&
     typeof value.submittedAt === "number" &&

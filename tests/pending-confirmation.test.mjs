@@ -11,6 +11,7 @@ const batch = (uuid, over = {}) => ({
   batchNumber: over.batchNumber ?? 1,
   episodeBody: '{"messages":[]}',
   previousEpisodeUuids: [],
+  referenceTime: "2026-08-17T10:00:00.000Z",
   ...over,
 });
 

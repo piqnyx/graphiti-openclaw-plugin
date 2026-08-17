@@ -679,6 +679,8 @@ export function register(api: OpenClawPluginApi): void {
         batchNumber: sequence.batchNumber,
         episodeBody: jsonBody,
         previousEpisodeUuids: sequence.previousEpisodeUuids,
+        referenceTime,
+        ...(sequence.sagaPreviousEpisodeUuid ? { sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid } : {}),
       });
       engine.checkpoint();
 
@@ -751,6 +753,100 @@ export function register(api: OpenClawPluginApi): void {
       },
     );
 
+    /**
+     * Ask the graph which handed-over batches actually landed, and resend the rest.
+     *
+     * This is the half that acceptance never gave us. Graphiti says "queued"
+     * immediately and does the work later; if extraction fails — a model that is
+     * unreachable, a reply truncated at the token ceiling, a schema the model
+     * echoed instead of filling — nothing ever tells the plugin. The episode
+     * simply never appears. So the plugin looks.
+     *
+     * Resending is safe because the uuid is derived from the batch content and
+     * the server merges on it: the same batch twice lands on the same node. It is
+     * also cheap to be wrong about, since a batch merely slow to process is
+     * confirmed on the next pass rather than duplicated.
+     */
+    const confirmPendingBatches = async (): Promise<void> => {
+      const outstanding = pendingConfirmation.outstandingUuids();
+      if (outstanding.length === 0) return;
+
+      const byAgent = new Map<string, string[]>();
+      for (const batch of pendingConfirmation.export()) {
+        byAgent.set(batch.agentId, [...(byAgent.get(batch.agentId) ?? []), batch.uuid]);
+      }
+
+      let confirmed = 0;
+      for (const [agentId, uuids] of byAgent) {
+        try {
+          const episodes = await client.getEpisodesByRef(agentId, { uuids });
+          const present = episodes
+            .map((episode) => (typeof episode.uuid === "string" ? episode.uuid : ""))
+            .filter(Boolean);
+          confirmed += pendingConfirmation.confirm(present);
+        } catch (error) {
+          // The backend is unreachable: nothing is confirmed and nothing is
+          // resent this pass. Everything stays outstanding, which is the point.
+          logger.debug("capture_confirmation_check_failed", {
+            agentId,
+            group_id: agentId,
+            error: errorText(error),
+          });
+        }
+      }
+
+      const snapshot = pendingConfirmation.snapshot();
+      for (const batch of snapshot.due) {
+        try {
+          await client.addMemory({
+            uuid: batch.uuid,
+            name: batch.name,
+            jsonBody: batch.episodeBody,
+            groupId: batch.agentId,
+            saga: batch.sessionKey,
+            referenceTime: batch.referenceTime,
+            previousEpisodeUuids: batch.previousEpisodeUuids,
+            ...(batch.sagaPreviousEpisodeUuid ? { sagaPreviousEpisodeUuid: batch.sagaPreviousEpisodeUuid } : {}),
+          });
+          pendingConfirmation.track(batch);
+          logger.info("capture_resubmitted", {
+            agentId: batch.agentId,
+            group_id: batch.agentId,
+            saga: batch.sessionKey,
+            name: batch.name,
+            batchNumber: batch.batchNumber,
+            uuid: batch.uuid,
+            attempt: batch.attempts + 1,
+            reason: "episode_absent_after_grace",
+          });
+        } catch (error) {
+          logger.warn("capture_resubmit_failed", {
+            agentId: batch.agentId,
+            group_id: batch.agentId,
+            name: batch.name,
+            uuid: batch.uuid,
+            error: errorText(error),
+          });
+        }
+      }
+
+      for (const batch of snapshot.stuck) {
+        logger.error("capture_batch_stuck", {
+          agentId: batch.agentId,
+          group_id: batch.agentId,
+          saga: batch.sessionKey,
+          name: batch.name,
+          batchNumber: batch.batchNumber,
+          uuid: batch.uuid,
+          attempts: batch.attempts,
+          ageMs: Date.now() - batch.submittedAt,
+          action: "reported_via_graphiti_status",
+        });
+      }
+
+      if (confirmed > 0 || snapshot.due.length > 0) engine.checkpoint();
+    };
+
     let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
     if (cfg.autoCapture) {
       engine.resumeRestored();
@@ -758,6 +854,7 @@ export function register(api: OpenClawPluginApi): void {
       // One poller per process, not one per registration.
       queueHealthTimer = setInterval(() => {
         void pollBackendQueueStatus();
+        void confirmPendingBatches();
       }, CHECK_INTERVAL_SEC * 1000);
       queueHealthTimer.unref?.();
     }

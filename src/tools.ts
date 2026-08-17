@@ -952,11 +952,25 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           for (const row of rows(integrity.sagas_with_broken_chain)) {
             graphProblems.push(`dialog ${text(row.saga)} has ${count(row.heads)} chain starts, so its NEXT_EPISODE chain is broken`);
           }
+          // A fork is invisible to the numbering check, because both branches
+          // carry legitimate, different names — only the edges give it away.
+          for (const row of rows(integrity.forked_episodes)) {
+            graphProblems.push(`episode ${text(row.name)} has ${count(row.successors)} successors, so the chain forks there`);
+          }
           if (count(integrity.episodes_without_saga) > 0) {
             graphProblems.push(`${count(integrity.episodes_without_saga)} episode(s) belong to no dialog`);
           }
           if (count(integrity.facts_without_provenance) > 0) {
             graphProblems.push(`${count(integrity.facts_without_provenance)} fact(s) name no source episode`);
+          }
+          // Stated, not counted as a problem: an episode taken out of the chain
+          // on purpose is a repair, and repeating it as damage every time would
+          // teach the reader to ignore this section.
+          if (count(integrity.parked_episodes) > 0) {
+            details.parkedEpisodes = count(integrity.parked_episodes);
+            lines.push(
+              `${count(integrity.parked_episodes)} episode(s) are parked outside the chain on purpose; their text is kept and searchable.`,
+            );
           }
           if (graphProblems.length > 0) {
             flagProblem("graph_integrity");

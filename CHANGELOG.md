@@ -6,6 +6,7 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Fixed
 
+- `graphiti_status` reports forked chains — an episode with two successors, which the numbering check cannot see because both branches carry legitimate names — and states parked episodes as deliberate rather than counting them as damage. Requires the fork at `17b15e7` or later.
 - An episode renamed out of the numbering — such as a duplicate parked as `-22-orphan` — is no longer read as a batch. `parseInt` stops at the first non-digit, so it read `22-orphan` as batch 22 and reported the dialog as having committed 22 twice, and counted the orphan's whole name as a second dialog. Both were defects invented by the repair, not found in the graph.
 
 ### Added (durability)

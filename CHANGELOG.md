@@ -27,7 +27,10 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Added (agent tools)
 
-- `graphiti_recall`, `graphiti_search_entities`, `graphiti_episodes`, `graphiti_store` and `graphiti_status`, registered when the host exposes a tool API and `agentTools` is enabled.
+- `graphiti_recall`, `graphiti_search_entities`, `graphiti_context`, `graphiti_episodes`, `graphiti_store` and `graphiti_status`, registered when the host exposes a tool API and `agentTools` is enabled.
+- `graphiti_context` reads the conversation behind a fact, resolving either a query through the fact's source episodes or a named episode directly, and widening the window on request. Requires the fork tool `get_episodes_by_ref`.
+- `graphiti_status` reports graph size, the most connected entities, memory age and integrity checks — duplicated episode names, episodes with no dialog, broken `NEXT_EPISODE` chains, facts with no source episode, isolated entities. Requires the fork tool `get_graph_stats`; an unavailable report costs one line rather than the whole status.
+- Search tool descriptions point at the OpenViking tools when nothing is found, matching the reciprocal hint in that plugin.
 - Each tool resolves its agent from the invocation context and passes it as the Graphiti group; an excluded session cannot call them at all.
 - `graphiti_store` writes standalone episodes with no saga, so agent notes cannot fork a dialog's episode chain.
 - README documents every configuration key and every tool, including why no destructive tool is offered.

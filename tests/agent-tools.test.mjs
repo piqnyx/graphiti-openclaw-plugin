@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
-import { TOOL_NAMES, TOOL_PREFIX, inspectEpisodeNumbering } from "../dist/tools.js";
+import { TOOL_NAMES, TOOL_PREFIX, inspectEpisodeNumbering, renderEpisode, splitEpisodeName } from "../dist/tools.js";
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-tools-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
@@ -311,4 +311,188 @@ test("status refuses to call a duplicated dialog healthy", async (t) => {
 
   assert.equal(result.details.ok, false);
   assert.match(result.content[0].text, /batch number\(s\) 2 appear more than once/);
+});
+
+test("an episode name splits into its dialog and batch number", () => {
+  assert.deepEqual(splitEpisodeName("8248439450-12"), { prefix: "8248439450", number: 12 });
+  // Dialog keys contain dashes themselves, so only the final group is the number.
+  assert.deepEqual(splitEpisodeName("agent:main:telegram-7-3"), { prefix: "agent:main:telegram-7", number: 3 });
+  assert.equal(splitEpisodeName("note-abc12345"), undefined);
+  assert.equal(splitEpisodeName("8248439450-0"), undefined);
+});
+
+test("a stored episode renders as dialogue under the participants' real names", () => {
+  const rendered = renderEpisode({
+    name: "8248439450-12",
+    content: JSON.stringify({
+      participants: { user: "Вит", assistant: "Краб" },
+      messages: [
+        { role: "user", text: "у нас была собака?" },
+        { role: "assistant", text: "Бася, английский бульдог." },
+      ],
+    }),
+  });
+
+  assert.match(rendered, /\[8248439450-12\]/);
+  assert.match(rendered, /Вит: у нас была собака\?/);
+  assert.match(rendered, /Краб: Бася, английский бульдог\./);
+});
+
+test("an episode that is not the expected JSON is shown as it stands", () => {
+  const rendered = renderEpisode({ name: "legacy-1", content: "plain text episode" });
+  assert.equal(rendered, "[legacy-1]\nplain text episode");
+});
+
+test("context resolves a query through a fact to the conversation around it", async (t) => {
+  const calls = installFetch(t, {
+    search_memory_facts: () => ({
+      facts: [{ fact: "Вит завёл бульдога Басю", episodes: ["episode-12"] }],
+    }),
+    get_episodes_by_ref: (args) => {
+      const body = (name, line) => ({
+        uuid: `u-${name}`,
+        name,
+        content: JSON.stringify({
+          participants: { user: "Вит", assistant: "Краб" },
+          messages: [{ role: "user", text: line }],
+        }),
+      });
+      if (args.uuids.includes("episode-12")) return { episodes: [body("8248439450-12", "про собаку")] };
+      return {
+        episodes: [body("8248439450-11", "раньше"), body("8248439450-13", "позже")],
+      };
+    },
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_context", { query: "собака Бася" }, { agentId: "main" });
+  const text = result.content[0].text;
+
+  // Every lookup stays inside the calling agent's own graph.
+  for (const params of calls) {
+    if (params.name === "get_episodes_by_ref") assert.equal(params.arguments.group_id, "main");
+  }
+  assert.equal(result.details.episode, "8248439450-12");
+  // Batches arrive in conversational order, not in the order they were fetched.
+  assert.ok(text.indexOf("раньше") < text.indexOf("про собаку"));
+  assert.ok(text.indexOf("про собаку") < text.indexOf("позже"));
+  // The reply tells the model how to widen the window without guessing.
+  assert.match(text, /episode="8248439450-12"/);
+});
+
+test("context centred on a named episode never searches for facts", async (t) => {
+  const calls = installFetch(t, {
+    get_episodes_by_ref: () => ({
+      episodes: [{ uuid: "u", name: "8248439450-4", content: JSON.stringify({
+        participants: { user: "Вит", assistant: "Краб" },
+        messages: [{ role: "assistant", text: "вот этот кусок" }],
+      }) }],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_context", { episode: "8248439450-4" }, { agentId: "main" });
+
+  assert.ok(!calls.some((params) => params.name === "search_memory_facts"));
+  assert.match(result.content[0].text, /вот этот кусок/);
+});
+
+test("context says so plainly when memory holds nothing to expand", async (t) => {
+  installFetch(t, { search_memory_facts: () => ({ facts: [] }) });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_context", { query: "чего там нет" }, { agentId: "main" });
+
+  assert.equal(result.details.results, 0);
+  assert.match(result.content[0].text, /OpenViking/);
+});
+
+test("context refuses a call with neither a query nor an episode", async (t) => {
+  installFetch(t);
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_context", {}, { agentId: "main" });
+
+  assert.equal(result.details.reason, "no_anchor");
+});
+
+test("status reports graph shape and names the integrity problems it finds", async (t) => {
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_episodes: () => ({ episodes: [] }),
+    get_graph_stats: (args) => {
+      assert.equal(args.group_id, "main");
+      return {
+        group_id: "main",
+        size: { entities: 100, episodes: 13, sagas: 2, facts: 228, mentions: 90 },
+        top_entities: [{ name: "Вит", degree: 57 }, { name: "Бася", degree: 4 }],
+        oldest_episode: { name: "a", created_at: "2026-08-16" },
+        newest_episode: { name: "b", created_at: "2026-08-17" },
+        integrity: {
+          duplicate_episode_names: [{ name: "8248439450-7", copies: 2 }],
+          episodes_without_saga: 3,
+          episodes_without_entities: 1,
+          sagas_with_broken_chain: [{ saga: "telegram-1", heads: 2 }],
+          facts_without_provenance: 5,
+          isolated_entities: 2,
+        },
+        query_errors: [],
+      };
+    },
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+  const text = result.content[0].text;
+
+  assert.equal(result.details.ok, false);
+  assert.match(text, /100 entities, 228 facts/);
+  assert.match(text, /Most connected: Вит \(57\), Бася \(4\)/);
+  assert.match(text, /8248439450-7 exists 2 times/);
+  assert.match(text, /telegram-1 has 2 chain starts/);
+  assert.match(text, /3 episode\(s\) belong to no dialog/);
+  assert.match(text, /5 fact\(s\) name no source episode/);
+  assert.match(text, /Extraction yield: 1 episode\(s\) produced no entities/);
+});
+
+test("status states plainly when every integrity check passes", async (t) => {
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_episodes: () => ({ episodes: [] }),
+    get_graph_stats: () => ({
+      size: { entities: 5, episodes: 2, sagas: 1, facts: 6, mentions: 4 },
+      top_entities: [],
+      integrity: {
+        duplicate_episode_names: [],
+        episodes_without_saga: 0,
+        episodes_without_entities: 0,
+        sagas_with_broken_chain: [],
+        facts_without_provenance: 0,
+        isolated_entities: 0,
+      },
+      query_errors: [],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+
+  assert.match(result.content[0].text, /Integrity checks passed/);
+  assert.equal(result.details.ok, true);
+});
+
+test("a graph report that could not be read costs one line, not the whole status", async (t) => {
+  installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 2 }),
+    get_episodes: () => ({ episodes: [] }),
+    get_graph_stats: () => ({ error: "graph unavailable" }),
+  });
+  const { tools } = makeRuntime();
+
+  const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
+  const text = result.content[0].text;
+
+  assert.match(text, /Could not read graph statistics: graph unavailable/);
+  assert.match(text, /Memory backend is healthy/);
+  assert.match(text, /Settings: commit every/);
 });

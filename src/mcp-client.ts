@@ -232,6 +232,38 @@ export class GraphitiMcpClient {
       : [];
   }
 
+  /**
+   * Graph size, shape and integrity, from the fork's read-only diagnostics tool.
+   *
+   * The report is returned as received: it is a bag of independently gathered
+   * sections, and one unavailable section must not cost us the others, so shape
+   * validation belongs where the report is rendered rather than here.
+   */
+  async getGraphStats(groupId: string, topEntities: number): Promise<JsonObject> {
+    const result = await this.callTool("get_graph_stats", {
+      group_id: groupId,
+      top_entities: topEntities,
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
+    return result;
+  }
+
+  /** Fetch specific episodes, with their text, by uuid or by name. */
+  async getEpisodesByRef(
+    groupId: string,
+    refs: { uuids?: string[]; names?: string[] },
+  ): Promise<JsonObject[]> {
+    const result = await this.callTool("get_episodes_by_ref", {
+      group_id: groupId,
+      uuids: refs.uuids ?? [],
+      names: refs.names ?? [],
+    });
+    if (typeof result.error === "string") throw new Error(result.error);
+    return Array.isArray(result.episodes)
+      ? result.episodes.filter((episode): episode is JsonObject => isObject(episode))
+      : [];
+  }
+
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
     const result = await this.callTool("search_memory_facts", {
       query,

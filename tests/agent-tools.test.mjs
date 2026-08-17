@@ -738,3 +738,23 @@ test("status reports batches handed over but not yet stored, and ones that keep 
   // as broken, or the word stops meaning anything.
   assert.equal(result.details.healthy, true);
 });
+
+test("an episode renamed out of the numbering is not read as a batch", () => {
+  // A duplicate was renamed to `-22-orphan` by hand to take it out of the
+  // sequence. parseInt stops at the dash and read it as batch 22, so the dialog
+  // was reported as having committed 22 twice — a defect invented by the repair.
+  const inspected = inspectEpisodeNumbering("agent:main:telegram:direct:8248439450", [
+    { name: "8248439450-21" },
+    { name: "8248439450-22" },
+    { name: "8248439450-22-orphan" },
+    { name: "8248439450-23" },
+  ]);
+
+  assert.deepEqual(inspected.duplicates, []);
+  assert.deepEqual(inspected.gaps, []);
+  assert.equal(inspected.seen, 3);
+
+  // And it belongs to no dialog: its whole name is not a prefix.
+  assert.equal(splitEpisodeName("8248439450-22-orphan"), undefined);
+  assert.equal(splitEpisodeName("8248439450-22").prefix, "8248439450");
+});

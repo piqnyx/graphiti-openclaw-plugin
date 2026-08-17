@@ -4,6 +4,10 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ## 0.4.0 - 2026-08-17
 
+### Fixed
+
+- An episode renamed out of the numbering — such as a duplicate parked as `-22-orphan` — is no longer read as a batch. `parseInt` stops at the first non-digit, so it read `22-orphan` as batch 22 and reported the dialog as having committed 22 twice, and counted the orphan's whole name as a second dialog. Both were defects invented by the repair, not found in the graph.
+
 ### Added (durability)
 
 - Batches Graphiti accepted are kept until their episode is seen in the graph, and resent until it is. Acceptance only means the backend took the batch; extraction happens later, and when it fails — an unreachable model, a reply truncated at the token ceiling — nothing tells the plugin and the episode never appears. Retries are unbounded with a wait that doubles from 30 seconds to an hour, and the ledger is bounded by size (50 GB) rather than by attempts, because the failure this survives is a backend that comes back in hours.

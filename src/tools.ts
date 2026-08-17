@@ -123,8 +123,14 @@ export function inspectEpisodeNumbering(
   for (const episode of episodes) {
     const name = typeof episode.name === "string" ? episode.name : "";
     if (!name.startsWith(prefix)) continue;
-    const parsed = Number.parseInt(name.slice(prefix.length), 10);
-    if (Number.isInteger(parsed) && parsed > 0) numbers.push(parsed);
+    // Strictly digits after the prefix. parseInt stops at the first non-digit,
+    // so it read "22-orphan" — an episode deliberately renamed out of the
+    // numbering — as batch 22, and reported the dialog as having committed 22
+    // twice. A name that is not `<prefix>-<number>` is not part of the sequence.
+    const suffix = name.slice(prefix.length);
+    if (!/^\d+$/.test(suffix)) continue;
+    const parsed = Number.parseInt(suffix, 10);
+    if (parsed > 0) numbers.push(parsed);
   }
 
   // A dialog with nothing committed yet has no numbering to inspect. Without
@@ -859,10 +865,13 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           // whether bufferLimit is set sensibly.
           const notes = episodes.filter((e) => e.source_description === LEGACY_NOTE_SOURCE_DESCRIPTION);
           const batches = episodes.filter((e) => e.source_description !== LEGACY_NOTE_SOURCE_DESCRIPTION);
+          // Counted through the same strict parse: an episode whose name does not
+          // end in a batch number belongs to no dialog's sequence, and treating
+          // its whole name as a prefix invented a second dialog that never existed.
           const dialogs = new Set(
             batches
-              .map((e) => (typeof e.name === "string" ? e.name.replace(/-\d+$/, "") : ""))
-              .filter(Boolean),
+              .map((e) => (typeof e.name === "string" ? splitEpisodeName(e.name)?.prefix : undefined))
+              .filter((prefix): prefix is string => Boolean(prefix)),
           );
           const sizes = batches
             .map((e) => (typeof e.content === "string" ? e.content.length : 0))

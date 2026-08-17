@@ -309,7 +309,11 @@ test("status refuses to call a duplicated dialog healthy", async (t) => {
   const result = await call(tools, "graphiti_status", {},
     { agentId: "main", sessionKey: "agent:main:telegram:1" });
 
-  assert.equal(result.details.ok, false);
+  // A finding is not a failed call: ok reports that the tool ran, healthy
+  // reports what it found. Conflating them rendered every defect as an error.
+  assert.equal(result.details.ok, true);
+  assert.equal(result.details.healthy, false);
+  assert.deepEqual(result.details.problems, ["duplicate_batches"]);
   assert.match(result.content[0].text, /batch number\(s\) 2 appear more than once/);
 });
 
@@ -445,7 +449,9 @@ test("status reports graph shape and names the integrity problems it finds", asy
   const result = await call(tools, "graphiti_status", {}, { agentId: "main" });
   const text = result.content[0].text;
 
-  assert.equal(result.details.ok, false);
+  assert.equal(result.details.ok, true);
+  assert.equal(result.details.healthy, false);
+  assert.deepEqual(result.details.problems, ["graph_integrity"]);
   assert.match(text, /100 entities, 228 facts/);
   assert.match(text, /Most connected: Вит \(57\), Бася \(4\)/);
   assert.match(text, /8248439450-7 exists 2 times/);
@@ -479,6 +485,7 @@ test("status states plainly when every integrity check passes", async (t) => {
 
   assert.match(result.content[0].text, /Integrity checks passed/);
   assert.equal(result.details.ok, true);
+  assert.equal(result.details.healthy, true);
 });
 
 test("a graph report that could not be read costs one line, not the whole status", async (t) => {
@@ -495,4 +502,28 @@ test("a graph report that could not be read costs one line, not the whole status
   assert.match(text, /Could not read graph statistics: graph unavailable/);
   assert.match(text, /Memory backend is healthy/);
   assert.match(text, /Settings: commit every/);
+});
+
+test("a standalone note is not reported as an episode detached from a dialog", async (t) => {
+  const calls = installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_episodes: () => ({ episodes: [] }),
+    get_graph_stats: () => ({
+      size: { entities: 1, episodes: 1, sagas: 0, facts: 0, mentions: 0 },
+      top_entities: [],
+      integrity: {
+        duplicate_episode_names: [], episodes_without_saga: 0, episodes_without_entities: 0,
+        sagas_with_broken_chain: [], facts_without_provenance: 0, isolated_entities: 0,
+      },
+      query_errors: [],
+    }),
+  });
+  const { tools } = makeRuntime();
+
+  await call(tools, "graphiti_status", {}, { agentId: "main" });
+
+  // graphiti_store writes notes without a saga deliberately, so the server is
+  // told which episodes are standalone by design rather than damaged.
+  const stats = calls.find((params) => params.name === "get_graph_stats");
+  assert.equal(stats.arguments.standalone_source_description, "OpenClaw agent note");
 });

@@ -626,7 +626,16 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         if ("refusal" in resolved) return resolved.refusal;
 
         const lines: string[] = [];
-        const details: Record<string, unknown> = { tool: "graphiti_status", ok: true };
+        // `ok` says whether the tool ran, not whether the graph is spotless.
+        // Conflating the two made every finding render as a failed tool call:
+        // a diagnostic that reports a defect has done its job, not failed at it.
+        const details: Record<string, unknown> = { tool: "graphiti_status", ok: true, healthy: true };
+        const problems: string[] = [];
+        const flagProblem = (what: string) => {
+          problems.push(what);
+          details.healthy = false;
+          details.problems = problems;
+        };
         try {
           const status = await client.getQueueStatus(resolved.agentId);
           details.blocked = status.blocked;
@@ -639,7 +648,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         } catch (error) {
           details.backendError = error instanceof Error ? error.message : String(error);
           lines.push(`Memory backend did not answer: ${details.backendError}`);
-          details.ok = false;
+          flagProblem("backend_unreachable");
         }
 
         const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
@@ -689,13 +698,13 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               lines.push(
                 `PROBLEM: batch number(s) ${chain.duplicates.join(", ")} appear more than once in this dialog. The same messages were committed twice.`,
               );
-              details.ok = false;
+              flagProblem("duplicate_batches");
             }
             if (chain.gaps.length > 0) {
               lines.push(
                 `PROBLEM: batch number(s) ${chain.gaps.join(", ")} are missing from this dialog. Those messages never reached memory.`,
               );
-              details.ok = false;
+              flagProblem("missing_batches");
             }
             if (chain.seen > 0 && chain.duplicates.length === 0 && chain.gaps.length === 0) {
               lines.push(`Batch numbering is continuous: ${chain.seen} batch(es), 1 through ${chain.highest}, none repeated.`);
@@ -764,7 +773,13 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         // the graph itself, which is where the failures nothing else can detect
         // live — detached episodes, broken chains, facts with no source.
         try {
-          const stats = await client.getGraphStats(resolved.agentId, TOP_ENTITIES);
+          // Notes are written without a saga on purpose, so they must not be counted
+          // as episodes detached from a dialog: that is the design, not damage.
+          const stats = await client.getGraphStats(
+            resolved.agentId,
+            TOP_ENTITIES,
+            STORE_SOURCE_DESCRIPTION,
+          );
           const size = isRecord(stats.size) ? stats.size : {};
           details.graphSize = size;
           lines.push(
@@ -783,22 +798,22 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
 
           const integrity = isRecord(stats.integrity) ? stats.integrity : {};
           details.integrity = integrity;
-          const problems: string[] = [];
+          const graphProblems: string[] = [];
           for (const row of rows(integrity.duplicate_episode_names)) {
-            problems.push(`episode name ${text(row.name)} exists ${count(row.copies)} times`);
+            graphProblems.push(`episode name ${text(row.name)} exists ${count(row.copies)} times`);
           }
           for (const row of rows(integrity.sagas_with_broken_chain)) {
-            problems.push(`dialog ${text(row.saga)} has ${count(row.heads)} chain starts, so its NEXT_EPISODE chain is broken`);
+            graphProblems.push(`dialog ${text(row.saga)} has ${count(row.heads)} chain starts, so its NEXT_EPISODE chain is broken`);
           }
           if (count(integrity.episodes_without_saga) > 0) {
-            problems.push(`${count(integrity.episodes_without_saga)} episode(s) belong to no dialog`);
+            graphProblems.push(`${count(integrity.episodes_without_saga)} episode(s) belong to no dialog`);
           }
           if (count(integrity.facts_without_provenance) > 0) {
-            problems.push(`${count(integrity.facts_without_provenance)} fact(s) name no source episode`);
+            graphProblems.push(`${count(integrity.facts_without_provenance)} fact(s) name no source episode`);
           }
-          if (problems.length > 0) {
-            details.ok = false;
-            lines.push(`PROBLEM: ${problems.join("; ")}.`);
+          if (graphProblems.length > 0) {
+            flagProblem("graph_integrity");
+            lines.push(`PROBLEM: ${graphProblems.join("; ")}.`);
           } else {
             lines.push("Integrity checks passed: no duplicate episode names, no broken chains, no orphaned episodes, every fact has a source.");
           }

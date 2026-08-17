@@ -2,6 +2,13 @@
 
 All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
+## 0.1.1 - 2026-08-17
+
+### Fixed
+
+- `graphiti_status` no longer reports itself as a failed tool call when it finds a defect. `ok` now says whether the tool ran; `healthy` and `problems` say what it found. A diagnostic that reports damage has done its job, not failed at it.
+- A note written by `graphiti_store` is no longer counted as an episode detached from a dialog. Notes carry no saga by design, and every one of them was being reported as orphaned; the note's `source_description` is now passed to `get_graph_stats`, which excludes it.
+
 ## 0.1.0 - 2026-08-17
 
 ### Added

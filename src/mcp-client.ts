@@ -239,10 +239,15 @@ export class GraphitiMcpClient {
    * sections, and one unavailable section must not cost us the others, so shape
    * validation belongs where the report is rendered rather than here.
    */
-  async getGraphStats(groupId: string, topEntities: number): Promise<JsonObject> {
+  async getGraphStats(
+    groupId: string,
+    topEntities: number,
+    standaloneSourceDescription?: string,
+  ): Promise<JsonObject> {
     const result = await this.callTool("get_graph_stats", {
       group_id: groupId,
       top_entities: topEntities,
+      standalone_source_description: standaloneSourceDescription ?? null,
     });
     if (typeof result.error === "string") throw new Error(result.error);
     return result;

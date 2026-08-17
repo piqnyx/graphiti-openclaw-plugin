@@ -9,6 +9,10 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - `graphiti_store` is now `graphiti_note`, and it no longer writes a standalone episode. The note is appended to the open batch of the conversation it was made in and leaves with it, so it belongs to a dialog, takes its place in that dialog's chain, and cannot fork the chain — the pipeline that owns the chain does the writing. Update the OpenClaw allowlist: `graphiti_store` no longer exists.
 - Every tool, read-only ones included, refuses a run with no session. Memory belongs to a conversation; a call from outside one has no dialog to read from and nowhere to write to.
 
+### Added
+
+- `graphiti_status` reports communities: how many, when they were last built, how many episodes have been recorded since, and the largest with their summaries. Building them is a scheduled job (`tools/rebuild_communities.py` in the fork), never part of a request — summarising a cluster calls an LLM per community, and a diagnostic must answer immediately.
+
 ### Fixed
 
 - The default `excludeSessionPatterns` now cover OpenClaw's own setup probes (`:setup-inference:`, `incognito-probe`). A model-setup probe is a machine verifying a configuration, not a conversation, and one of them wrote a whole saga into a live graph before this was noticed.

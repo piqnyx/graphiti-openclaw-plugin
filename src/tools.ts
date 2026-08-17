@@ -573,10 +573,12 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_note",
       label: "Note something to remember (Graphiti)",
       description:
-        "Record one lasting fact as a note in this conversation, so it is remembered even if nothing else from the dialog is. " +
+        "Record one lasting fact as a note in this conversation. Two uses: storing something new the user asks you to " +
+        "remember (a preference, rule, or fact), and correcting something memory already has wrong. " +
         "The conversation is captured automatically, so do NOT use this for things that were merely said. " +
-        "Use it when the user asks you to remember something, or states a lasting preference, rule or fact. " +
-        "Write it as a self-contained statement that still makes sense months later, with names spelled out rather than pronouns. " +
+        "Write the note as a self-contained statement that still makes sense months later, with names spelled out " +
+        "rather than pronouns. When correcting, state the correct version AND say plainly what was wrong, in the same " +
+        "sentence — that contradiction is what lets memory retire the old fact instead of keeping both. " +
         "It is stored with the surrounding conversation and becomes searchable when that batch is committed.",
       parameters: {
         type: "object",
@@ -816,6 +818,32 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           const oldest = isRecord(stats.oldest_episode) ? text(stats.oldest_episode.created_at) : "";
           const newestAt = isRecord(stats.newest_episode) ? text(stats.newest_episode.created_at) : "";
           if (oldest && newestAt) lines.push(`Memory runs from ${oldest} to ${newestAt}.`);
+
+          // Communities are built by a scheduled run, so the useful question is
+          // not only what they say but how far behind they are: a summary built
+          // before a hundred new episodes describes a graph that no longer exists.
+          const communities = isRecord(stats.communities) ? stats.communities : {};
+          const communityCount = count(communities.count);
+          details.communities = communities;
+          if (communityCount > 0) {
+            const builtAt = text(communities.built_at);
+            const since = count(communities.episodes_since_build);
+            lines.push(
+              `Communities: ${communityCount} built${builtAt ? ` at ${builtAt}` : ""}` +
+                `${since > 0 ? `, ${since} episode(s) recorded since` : ", nothing recorded since"}.`,
+            );
+            for (const row of rows(communities.largest)) {
+              const summary = text(row.summary).replace(/\s+/g, " ").trim();
+              lines.push(
+                `  - ${text(row.name) || "unnamed"} (${count(row.members)} members)` +
+                  `${summary ? `: ${summary}` : ""}`,
+              );
+            }
+          } else {
+            lines.push(
+              "Communities: none built yet. They are produced by the scheduled rebuild, not by this tool.",
+            );
+          }
 
           const integrity = isRecord(stats.integrity) ? stats.integrity : {};
           details.integrity = integrity;

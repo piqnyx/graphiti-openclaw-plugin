@@ -697,3 +697,44 @@ test("discussed_within_days filters on when it was recorded, not when it was tru
   assert.ok(args.created_at_after, "the recency filter is about when it was recorded");
   assert.equal(args.valid_at_after, null, "and must not be confused with when it was true");
 });
+
+test("status reports batches handed over but not yet stored, and ones that keep failing", async (t) => {
+  const installedCalls = installFetch(t, {
+    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
+    get_episodes: () => ({ episodes: [] }),
+    get_graph_stats: () => ({
+      size: { entities: 1, episodes: 1, sagas: 1, facts: 0, mentions: 0 },
+      top_entities: [],
+      integrity: {
+        duplicate_episode_names: [], episodes_without_saga: 0, episodes_without_entities: 0,
+        sagas_with_broken_chain: [], facts_without_provenance: 0, isolated_entities: 0,
+      },
+      query_errors: [],
+    }),
+    add_memory: (args) => ({ message: "queued", uuid: args.uuid }),
+    get_episodes_by_ref: () => ({ episodes: [] }),
+    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
+  });
+  const calls = installedCalls;
+  const { tools } = makeRuntime({ bufferLimit: 2 });
+
+  // Two messages with bufferLimit 2 close one batch, which is submitted and then
+  // waits: the stub never shows the episode in the graph.
+  const ctx = { agentId: "main", sessionKey: "agent:main:telegram:1" };
+  await call(tools, "graphiti_note", { note: "первая заметка" }, ctx);
+  await call(tools, "graphiti_note", { note: "вторая заметка" }, ctx);
+
+  await waitForCall(calls, "add_memory");
+
+  const result = await call(tools, "graphiti_status", {}, ctx);
+  const text = result.content[0].text;
+
+  // The backend's queue empties whether the work succeeded or not, so this is
+  // the only place a batch lost to a failed extraction is visible at all.
+  assert.match(text, /batch\(es\) handed to the backend are not in the graph yet/);
+  assert.match(text, /nothing is lost while the backend is unwell/);
+  assert.equal(result.details.awaitingConfirmation, 1);
+  // Waiting is not a defect: a backend that is merely slow must not be reported
+  // as broken, or the word stops meaning anything.
+  assert.equal(result.details.healthy, true);
+});

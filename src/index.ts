@@ -108,6 +108,7 @@ export function register(api: OpenClawPluginApi): void {
     captureSpool: CaptureSpool | undefined;
     engine: BufferEngine;
     statusHost: StatusHost;
+    pendingConfirmation: PendingConfirmationTracker;
     queueHealthTimer: ReturnType<typeof setInterval> | undefined;
     restoredCaptureState: CaptureSpoolState | undefined;
     lastSessionByAgent: Map<string, string>;
@@ -866,6 +867,7 @@ export function register(api: OpenClawPluginApi): void {
       client,
       transcriptDeltas,
       captureSpool,
+      pendingConfirmation,
       engine,
       statusHost,
       queueHealthTimer,
@@ -892,6 +894,7 @@ export function register(api: OpenClawPluginApi): void {
     transcriptDeltas,
     captureSpool,
     engine,
+    pendingConfirmation,
     restoredCaptureState,
     lastSessionByAgent,
     unconfiguredAgentsReported,
@@ -942,7 +945,17 @@ export function register(api: OpenClawPluginApi): void {
         const agent = engine.snapshot().agents.find((entry) => entry.agentId === agentId);
         const buffers = agent?.activeBuffers ?? [];
         const lastActivity = buffers.map((buffer) => buffer.lastActivityAt);
+        const confirmation = pendingConfirmation.snapshot();
+        const mine = pendingConfirmation.export().filter((batch) => batch.agentId === agentId);
+        const oldestAwaiting = mine.length > 0 ? Math.min(...mine.map((batch) => batch.submittedAt)) : undefined;
         return {
+          awaitingConfirmation: mine.length,
+          awaitingBytes: mine.reduce((sum, batch) => sum + batch.episodeBody.length, 0),
+          ...(oldestAwaiting !== undefined ? { oldestAwaitingMs: Date.now() - oldestAwaiting } : {}),
+          notLanding: confirmation.needsAttention
+            .filter((batch) => batch.agentId === agentId)
+            .map((batch) => ({ name: batch.name, attempts: batch.attempts, ageMs: Date.now() - batch.submittedAt })),
+          droppedForSpace: confirmation.dropped,
           bufferedMessages: buffers.reduce((sum, buffer) => sum + buffer.messages.length, 0),
           queuedBatches: agent?.queue.length ?? 0,
           ...(lastActivity.length > 0

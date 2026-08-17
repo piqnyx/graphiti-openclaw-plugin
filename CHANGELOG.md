@@ -11,6 +11,10 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
 ### Added
 
+- Batches Graphiti accepted are kept until their episode is seen in the graph, and resent until it is. Acceptance only means the backend took the batch; extraction happens later, and when it fails — an unreachable model, a reply truncated at the token ceiling — nothing tells the plugin and the episode never appears. Retries are unbounded with a wait that doubles from 30 seconds to an hour, and the ledger is bounded by size (50 GB) rather than by attempts, because the failure this survives is a backend that comes back in hours.
+- Batch numbers are never reused: a restart resumes from the larger of what the backend has processed and what this process already issued. Trusting the backend alone gave one dialog two different episodes named `-22` while the first was still queued.
+- `graphiti_status` reports what is waiting for confirmation, how old the oldest is, what keeps failing to land, and anything dropped for space.
+
 - TTS directives the model writes into its own reply (`[[tts:…]]`, `[[tts:text]]…[[/tts:text]]`, `[[audio_as_voice]]`) are stripped before capture. The gateway removes them from the visible text, but capture reads the model's raw output, so voice ids and model names were reaching extraction as if they were facts.
 
 ### Fixed

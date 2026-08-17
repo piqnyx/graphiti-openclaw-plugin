@@ -153,6 +153,14 @@ export function inspectEpisodeNumbering(
  */
 const LEGACY_NOTE_SOURCE_DESCRIPTION = "OpenClaw agent note";
 
+/** "3 hours" — a duration a person reads without converting anything. */
+function describeDuration(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} hour(s)` : `${Math.round(hours / 24)} day(s)`;
+}
+
 function textResult(text: string, details: Record<string, unknown>): PluginToolResult {
   return { content: [{ type: "text", text }], details };
 }
@@ -269,6 +277,21 @@ export type LocalCaptureState = {
   /** Age of the least recently touched buffer, or undefined when nothing is buffered. */
   oldestBufferAgeMs?: number;
   spoolPath?: string;
+  /**
+   * Batches Graphiti accepted but has not yet been seen to store.
+   *
+   * The backend reports its own queue, and that queue empties whether or not the
+   * work succeeded — so a batch lost to a failed extraction shows up nowhere on
+   * the server side. This is the only place that difference is visible, which is
+   * why it belongs in a status the user can simply ask for.
+   */
+  awaitingConfirmation: number;
+  oldestAwaitingMs?: number;
+  awaitingBytes: number;
+  /** Batches retried enough times to be worth mentioning; they are still retried. */
+  notLanding: { name: string; attempts: number; ageMs: number }[];
+  /** Batches given up only because the ledger hit its size bound. */
+  droppedForSpace: number;
 };
 
 export type ToolDependencies = {
@@ -764,6 +787,36 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               (untilFlush > 0 ? ` (${untilFlush} more, or ${Math.round(cfg.bufferTimeout / 60)} min of silence, triggers the next commit)` : "") +
               (local.queuedBatches > 0 ? `, plus ${local.queuedBatches} batch(es) queued for delivery` : "") + ".",
         );
+
+        // Handed over is not stored. The backend's own queue empties whether the
+        // work succeeded or not, so a batch lost to a failed extraction appears
+        // nowhere on the server side — only here.
+        details.awaitingConfirmation = local.awaitingConfirmation;
+        if (local.awaitingConfirmation > 0) {
+          const age = local.oldestAwaitingMs ? `, oldest ${describeDuration(local.oldestAwaitingMs)}` : "";
+          lines.push(
+            `${local.awaitingConfirmation} batch(es) handed to the backend are not in the graph yet${age}. ` +
+              "They are kept and retried until they land, so nothing is lost while the backend is unwell.",
+          );
+        }
+        if (local.notLanding.length > 0) {
+          details.notLanding = local.notLanding;
+          flagProblem("batches_not_landing");
+          lines.push(
+            `PROBLEM: ${local.notLanding.length} batch(es) keep failing to land: ` +
+              local.notLanding
+                .map((batch) => `${batch.name} (${batch.attempts} attempts, ${describeDuration(batch.ageMs)})`)
+                .join(", ") +
+              ". They are still being retried, with a widening pause; if this persists the backend is rejecting them for a reason worth finding.",
+          );
+        }
+        if (local.droppedForSpace > 0) {
+          details.droppedForSpace = local.droppedForSpace;
+          flagProblem("dropped_for_space");
+          lines.push(
+            `PROBLEM: ${local.droppedForSpace} batch(es) were dropped because the local store hit its size limit. Those messages are gone.`,
+          );
+        }
 
         if (local.oldestBufferAgeMs !== undefined && local.oldestBufferAgeMs > cfg.bufferTimeout * 1000 * 1.5) {
           details.staleBuffer = true;

@@ -41,7 +41,9 @@ Enabled by `agentTools` (default true) and registered only if the host exposes a
 
 Every hit carries the reranker's score and a list of episode anchors such as `8248439450-12`, each with a count of how many results point at it — the higher the count, the more of the answer lives in that episode. Those anchors are what `graphiti_browse` takes, several at a time, including anchors from different hits. Episodes are a result type in their own right, matched on the words of the conversation itself, so a query can reach the dialog without going through a fact at all.
 
-Facts superseded by newer ones are hidden unless `include_outdated` asks for them, so an answer reflects what memory currently holds true. Per-type limits let the agent ask for only what it needs; zero excludes a type.
+Facts superseded by newer ones are hidden unless `include_outdated` asks for them, so an answer reflects what memory currently holds true. Per-type limits (`facts`, `entities`, `episodes`) let the agent ask for only what it needs; zero excludes a type.
+
+Two time filters answer two different questions and are deliberately not merged. `discussed_within_days` bounds when something was recorded — "what did we go over last week". `valid_from` and `valid_to` bound when a fact was true — "where did he live in 2024". Using one for the other gives a confidently wrong answer.
 
 `graphiti_search` points at the OpenViking tools when it finds nothing, and the OpenViking search tools point back here, so a blank in one store is not mistaken for a blank in memory.
 
@@ -74,6 +76,10 @@ There is deliberately no destructive tool. The Graphiti MCP delete endpoints tak
 | `recallUseHistory` | `true` | Enrich the recall query with recent conversation |
 | `recallHistoryMaxMessages` | `6` | Messages of history used for that enrichment |
 | `recallHistoryMaxChars` | `4000` | Character budget for the history portion |
+| `browseChars` | `16000` | Characters `graphiti_browse` reads on each side of an anchor by default |
+| `browseMaxChars` | `32000` | Ceiling on `before`/`after` in one call |
+| `browseMaxEpisodes` | `10` | How many anchors one call will expand |
+| `browseMaxTotalChars` | `120000` | Size of one browse reply. What does not fit is reported as omitted, never dropped silently |
 | `logOperations` | `true` | Emit operational info/debug events |
 | `logLevel` | `info` | `error`, `warn`, `info` or `debug` |
 | `logContent` | `false` | Also log message bodies and payloads. Diagnostics only: it writes conversations to the journal |

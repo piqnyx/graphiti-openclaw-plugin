@@ -373,26 +373,27 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_search",
       label: "Search memory (Graphiti)",
       description:
-        "Search this agent's long-term memory, including earlier dialogs. Returns three kinds of hit, each scored: " +
-        "facts (what is known, worded by the extractor rather than quoted), entities (a person, place or project and what is known about it), " +
-        "and episodes (a stretch of conversation whose own words matched). Every hit lists episode anchors like 8248439450-12 with a count of how often that episode appears in these results — the higher the count, the more of the answer lives there. " +
-        "Relevant memory is injected automatically before each reply, so search when that was not enough. Then pass the anchors to graphiti_browse to read what was actually said. " +
-        "If nothing is found, try the OpenViking search tools.",
+        "Search this agent's memory across all its dialogs. Three kinds of hit, each with a score: " +
+        "[fact] what is known, in the extractor's words rather than quoted; [entity] a person, place or project; " +
+        "[episode] a piece of conversation that matched. " +
+        "Each hit lists episode anchors like 8248439450-12; the number beside one is how many hits point at it, so the biggest number is where the answer lives. " +
+        "Pass anchors to graphiti_browse to read what was actually said. " +
+        "Memory is injected automatically before each reply — search when that was not enough. Found nothing? Try the OpenViking search tools.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "What to look for, in the user's own words. Concrete phrasing matches better than single keywords.",
+            description: "What to look for, in the user's words. A phrase matches better than one keyword.",
           },
           facts: { type: "number", description: `How many facts to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
           entities: { type: "number", description: `How many entities to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
           episodes: { type: "number", description: `How many episodes to return. Default ${DEFAULT_SEARCH_LIMIT}, 0 to skip them, maximum ${MAX_SEARCH_LIMIT}.` },
-          anchors: { type: "number", description: `How many episode anchors to show per hit. Default ${DEFAULT_ANCHORS}, maximum ${MAX_ANCHORS}.` },
-          discussed_within_days: { type: "number", description: "Only what was recorded in the last N days — when it was discussed, not when it was true." },
+          anchors: { type: "number", description: `Anchors shown per hit. Default ${DEFAULT_ANCHORS}, maximum ${MAX_ANCHORS}.` },
+          discussed_within_days: { type: "number", description: "Only what was recorded in the last N days: when it was discussed, not when it was true." },
           valid_from: { type: "string", description: "ISO date. Only facts that were true at or after this point." },
           valid_to: { type: "string", description: "ISO date. Only facts that were true at or before this point." },
-          include_outdated: { type: "boolean", description: "Include facts that a later one has superseded. Off by default, so answers reflect what memory currently holds true." },
+          include_outdated: { type: "boolean", description: "Also return facts a later one replaced, marked [outdated]. Off by default." },
         },
         required: ["query"],
       },
@@ -531,10 +532,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_browse",
       label: "Read the conversation behind a hit (Graphiti)",
       description:
-        "Read what was actually said. graphiti_search tells you what is known; this shows the wording, in the dialog it came from. " +
-        "Pass the episode anchors from a search — several at once is fine, including anchors from different results — or a query to find one. " +
-        "Widen before/after and call again if the window cut off what you needed. " +
-        "Costlier than a search: reach for it when the exact wording, tone or surrounding exchange matters.",
+        "Read what was actually said, in the dialog it was said in. graphiti_search gives the anchors; this reads around them — pass several at once, from different hits if you like. " +
+        "Cut off mid-thought? Call again with bigger before/after. " +
+        "Costlier than searching: use it when the exact wording, tone or surrounding exchange matters.",
       parameters: {
         type: "object",
         properties: {
@@ -543,7 +543,8 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             items: { type: "string" },
             description: "Episode names from a search, such as 8248439450-12. Several may be given.",
           },
-          query: { type: "string", description: "Used only when no episodes are given: finds the conversation behind the best match." },
+          episode: { type: "string", description: "A single anchor, if you have only one." },
+          query: { type: "string", description: "Used only when no anchors are given: finds the conversation behind the best match." },
           before: { type: "number", description: `Characters of conversation before each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
           after: { type: "number", description: `Characters after each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
         },
@@ -636,13 +637,11 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_note",
       label: "Note something to remember (Graphiti)",
       description:
-        "Record one lasting fact as a note in this conversation. Two uses: storing something new the user asks you to " +
-        "remember (a preference, rule, or fact), and correcting something memory already has wrong. " +
-        "The conversation is captured automatically, so do NOT use this for things that were merely said. " +
-        "Write the note as a self-contained statement that still makes sense months later, with names spelled out " +
-        "rather than pronouns. When correcting, state the correct version AND say plainly what was wrong, in the same " +
-        "sentence — that contradiction is what lets memory retire the old fact instead of keeping both. " +
-        "It is stored with the surrounding conversation and becomes searchable when that batch is committed.",
+        "Record one lasting fact, or correct one memory has wrong. The conversation is captured automatically, " +
+        "so do NOT use this for things merely said — only when the user asks you to remember, or states a lasting " +
+        "preference or rule. Write it so it still makes sense months later: full names, no pronouns. " +
+        "Correcting? Give the right version and say what was wrong in the same sentence — that contradiction is what " +
+        "retires the old fact instead of keeping both. It joins this conversation and is searchable once the batch commits.",
       parameters: {
         type: "object",
         properties: {

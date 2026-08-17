@@ -2,26 +2,14 @@
 
 All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
-## 0.2.0 - 2026-08-17
+## 0.4.0 - 2026-08-17
 
-### Changed
-
-- `graphiti_store` is now `graphiti_note`, and it no longer writes a standalone episode. The note is appended to the open batch of the conversation it was made in and leaves with it, so it belongs to a dialog, takes its place in that dialog's chain, and cannot fork the chain — the pipeline that owns the chain does the writing. Update the OpenClaw allowlist: `graphiti_store` no longer exists.
-- Every tool, read-only ones included, refuses a run with no session. Memory belongs to a conversation; a call from outside one has no dialog to read from and nowhere to write to.
-
-### Added
+### Added (durability)
 
 - Batches Graphiti accepted are kept until their episode is seen in the graph, and resent until it is. Acceptance only means the backend took the batch; extraction happens later, and when it fails — an unreachable model, a reply truncated at the token ceiling — nothing tells the plugin and the episode never appears. Retries are unbounded with a wait that doubles from 30 seconds to an hour, and the ledger is bounded by size (50 GB) rather than by attempts, because the failure this survives is a backend that comes back in hours.
 - Batch numbers are never reused: a restart resumes from the larger of what the backend has processed and what this process already issued. Trusting the backend alone gave one dialog two different episodes named `-22` while the first was still queued.
 - `graphiti_status` reports what is waiting for confirmation, how old the oldest is, what keeps failing to land, and anything dropped for space.
 
-- TTS directives the model writes into its own reply (`[[tts:…]]`, `[[tts:text]]…[[/tts:text]]`, `[[audio_as_voice]]`) are stripped before capture. The gateway removes them from the visible text, but capture reads the model's raw output, so voice ids and model names were reaching extraction as if they were facts.
-
-### Fixed
-
-- The gateway's runtime context block (`<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>` … `<<<END_OPENCLAW_INTERNAL_CONTEXT>>>`) is stripped before capture. It carries the chat id, the sender's name and username, session identifiers and the recent traffic of *other* sessions; captured verbatim it put another conversation into this agent's episode, and extraction then built entities and facts out of it. Seen live in agent `red`.
-- The default `excludeSessionPatterns` now cover OpenClaw's own setup probes (`:setup-inference:`, `incognito-probe`). A model-setup probe is a machine verifying a configuration, not a conversation, and one of them wrote a whole saga into a live graph before this was noticed.
-- A dialog with nothing committed yet no longer reports "batch number 0 is missing". The numbering check ran its range from zero when it had seen no episodes, so every brand-new dialog accused itself of having lost a batch.
 
 ## 0.3.0 - 2026-08-17
 
@@ -33,6 +21,23 @@ All notable changes to `graphiti-openclaw-plugin` are tracked here.
 - Facts superseded by a newer one are hidden unless `include_outdated` asks for them: such a fact is not false, but repeating it as current knowledge is.
 - Per-type limits (`facts`, `entities`, `episodes`), zero excluding a type. Time filters distinguish when a fact was true (`valid_from`/`valid_to`) from when it was recorded (`discussed_within_days`).
 - `graphiti_browse` expands several anchors in one call, including anchors from different hits. Its budgets are configuration — `browseChars`, `browseMaxChars`, `browseMaxEpisodes`, `browseMaxTotalChars` — and what does not fit is reported as omitted rather than dropped in silence.
+
+## 0.2.0 - 2026-08-17
+
+### Changed
+
+- `graphiti_store` is now `graphiti_note`, and it no longer writes a standalone episode. The note is appended to the open batch of the conversation it was made in and leaves with it, so it belongs to a dialog, takes its place in that dialog's chain, and cannot fork the chain — the pipeline that owns the chain does the writing. Update the OpenClaw allowlist: `graphiti_store` no longer exists.
+- Every tool, read-only ones included, refuses a run with no session. Memory belongs to a conversation; a call from outside one has no dialog to read from and nowhere to write to.
+
+### Added
+
+- TTS directives the model writes into its own reply (`[[tts:…]]`, `[[tts:text]]…[[/tts:text]]`, `[[audio_as_voice]]`) are stripped before capture. The gateway removes them from the visible text, but capture reads the model's raw output, so voice ids and model names were reaching extraction as if they were facts.
+
+### Fixed
+
+- The gateway's runtime context block (`<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>` … `<<<END_OPENCLAW_INTERNAL_CONTEXT>>>`) is stripped before capture. It carries the chat id, the sender's name and username, session identifiers and the recent traffic of *other* sessions; captured verbatim it put another conversation into this agent's episode, and extraction then built entities and facts out of it. Seen live in agent `red`.
+- The default `excludeSessionPatterns` now cover OpenClaw's own setup probes (`:setup-inference:`, `incognito-probe`). A model-setup probe is a machine verifying a configuration, not a conversation, and one of them wrote a whole saga into a live graph before this was noticed.
+- A dialog with nothing committed yet no longer reports "batch number 0 is missing". The numbering check ran its range from zero when it had seen no episodes, so every brand-new dialog accused itself of having lost a batch.
 
 ## 0.1.1 - 2026-08-17
 

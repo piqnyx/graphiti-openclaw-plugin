@@ -20,6 +20,10 @@ Two automatic paths and one manual one.
 
 **Capture.** After every agent run the plugin diffs the transcript, keeps only new `user`/`assistant` messages, and buffers them per dialog. A batch is submitted to Graphiti when it reaches `bufferLimit` messages or the dialog goes quiet for `bufferTimeout` seconds. Each dialog becomes one Graphiti saga; each batch becomes one episode in it, chained to its predecessor. Unsent batches survive a gateway restart in a durable spool.
 
+**Delivery.** Graphiti answers "queued" as soon as it takes a batch and extracts entities afterwards, so acceptance is not storage: when extraction fails — an unreachable model, a truncated reply — nothing reports it and the episode never appears. A batch therefore stays on a durable ledger until its episode is found in the graph, and is resent until it is. Retries are unbounded with a wait doubling from 30 seconds to an hour, because the failure this survives is a backend that returns in hours and giving up would lose exactly what waiting saves. Resending is safe because the episode uuid is derived from the batch content and the server merges on it. The ledger is bounded by size (50 GB by default), and both what is waiting and anything dropped for space are reported by `graphiti_status`.
+
+Batch numbers are never reused. After a restart the sequence resumes from the larger of what the backend has processed and what this process already issued: the backend's count lags acceptance, and trusting it alone once gave one dialog two different episodes with the same name.
+
 **Recall.** Before each reply the plugin searches the agent's memory with the current prompt plus a bounded slice of recent conversation, and prepends the results as a `<graphiti-context>` block. Injected memory is explicitly marked as memory, not instructions.
 
 **Tools.** Agents can also query and write memory on demand — see below.

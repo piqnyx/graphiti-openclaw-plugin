@@ -71,7 +71,11 @@ export type PendingConfirmationOptions = {
 export const DEFAULT_CONFIRMATION_OPTIONS: PendingConfirmationOptions = {
   // Extraction on a busy backend takes tens of seconds; a grace shorter than that
   // would resubmit work that is merely in progress.
-  graceMs: 30_000,
+  // Extraction of one batch runs an LLM over the whole conversation and takes
+  // tens of seconds on a healthy backend, minutes on a busy one. Thirty seconds
+  // was long enough to look reasonable and short enough to resend work that was
+  // merely in progress.
+  graceMs: 120_000,
   // The failure this exists for is an unreachable or rate-limited model, which
   // comes back in hours. Retrying every thirty seconds through that keeps a
   // depleted quota pinned and delays the recovery it is waiting for, so the wait
@@ -126,6 +130,21 @@ export class PendingConfirmationTracker {
       attempts: batch.attempts ?? (existing ? existing.attempts + 1 : 0),
     });
     this.enforceBound();
+  }
+
+  /**
+   * Record that a batch was sent again: one more attempt, and the clock restarts.
+   *
+   * Reusing track() for this looked equivalent and was not. A batch taken from a
+   * snapshot already carries its attempt count and submission time, so track()
+   * kept both — the count never grew, the backoff never widened, and the same
+   * batch was resent every thirty seconds for as long as it stayed unconfirmed,
+   * loading the backend precisely while it was trying to process it.
+   */
+  resubmitted(uuid: string, now = Date.now()): void {
+    const batch = this.pending.get(uuid);
+    if (!batch) return;
+    this.pending.set(uuid, { ...batch, attempts: batch.attempts + 1, submittedAt: now });
   }
 
   /** Forget batches whose episodes are now in the graph. */

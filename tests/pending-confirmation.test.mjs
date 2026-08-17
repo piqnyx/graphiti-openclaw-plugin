@@ -107,3 +107,26 @@ test("the highest issued number per session survives a restart", () => {
   assert.equal(highest.get(sequenceKey("main", "agent:main:telegram:1")), 23);
   assert.equal(highest.get(sequenceKey("main", "agent:main:web:9")), 4);
 });
+
+test("a resubmission counts as an attempt and restarts the clock", () => {
+  const tracker = new PendingConfirmationTracker({ graceMs: 120_000 });
+  const now = Date.now();
+  tracker.track(batch("u-1", { submittedAt: now - 130_000 }));
+
+  assert.equal(tracker.snapshot(now).due.length, 1, "past its grace, so it is due");
+
+  tracker.resubmitted("u-1", now);
+
+  // Seen live: resubmitting through track() kept the batch's own attempts and
+  // submittedAt, so the count never grew, the wait never widened, and the same
+  // batch went out every thirty seconds while the backend was trying to process
+  // it — hammering the one thing being waited on.
+  const after = tracker.snapshot(now);
+  assert.equal(after.due.length, 0, "the clock must restart, not stay expired");
+  assert.equal(after.outstanding, 1);
+  assert.equal(tracker.export()[0].attempts, 1);
+
+  // And the next wait is longer than the first.
+  assert.equal(tracker.snapshot(now + 130_000).due.length, 0, "240s backoff after one attempt");
+  assert.equal(tracker.snapshot(now + 250_000).due.length, 1);
+});

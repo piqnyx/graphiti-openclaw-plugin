@@ -809,7 +809,7 @@ export function register(api: OpenClawPluginApi): void {
             previousEpisodeUuids: batch.previousEpisodeUuids,
             ...(batch.sagaPreviousEpisodeUuid ? { sagaPreviousEpisodeUuid: batch.sagaPreviousEpisodeUuid } : {}),
           });
-          pendingConfirmation.track(batch);
+          pendingConfirmation.resubmitted(batch.uuid);
           logger.info("capture_resubmitted", {
             agentId: batch.agentId,
             group_id: batch.agentId,

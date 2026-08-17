@@ -209,3 +209,43 @@ test("TTS directives the model wrote into its own reply do not reach memory", ()
     "Скобки [[tts: тут не закрыты и это просто текст",
   );
 });
+
+test("the gateway's own runtime context never reaches memory", () => {
+  // Taken from a live capture: the block carries the chat id, the sender's
+  // identity, session ids, and the recent traffic of OTHER sessions. Stored
+  // verbatim it puts another conversation into this agent's episode.
+  const captured = [
+    "OpenClaw runtime context for the active user request in this turn.",
+    "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>",
+    'Conversation info: ⟦openclaw:ctx⟧ ```json {"chat_id":"telegram:1817786487","sender":{"username":"lux_datorr"}} ```',
+    "#session:436aacb7 OpenClaw: Это хреново, горло — штука коварная.",
+    "#session:b720425f OpenClaw: Солярка на машину — это реально, но есть нюансы.",
+    "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+    "Да, скорее всего умеют.",
+    "Да, скорее всего умеют.",
+  ].join("\n");
+
+  const clean = sanitizeConversationText(captured);
+
+  assert.equal(clean, "Да, скорее всего умеют.");
+  for (const leak of ["telegram:1817786487", "lux_datorr", "session:436aacb7", "Солярка", "chat_id"]) {
+    assert.ok(!clean.includes(leak), `${leak} must not survive sanitization`);
+  }
+});
+
+test("a truncated context block does not leak the part that arrived", () => {
+  // No closing marker: the message was cut. What is left is still the gateway's
+  // internal state, so it goes too.
+  const clean = sanitizeConversationText(
+    "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nConversation info: chat_id telegram:999\n#session:aaa OpenClaw: чужое",
+  );
+  assert.equal(clean, "");
+});
+
+test("a genuine repetition inside a message is preserved", () => {
+  // The duplicate collapse is deliberately narrow: only the whole text repeated
+  // exactly once, which is what the gateway produces — not any repeated line.
+  const text = "да\nда\nда";
+  assert.equal(sanitizeConversationText(text), text);
+  assert.equal(sanitizeConversationText("тест\nтест\nхвост"), "тест\nтест\nхвост");
+});

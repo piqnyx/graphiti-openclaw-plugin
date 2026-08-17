@@ -3,6 +3,31 @@
 const GRAPHITI_CONTEXT_RE = /<graphiti-context\b[^>]*>[\s\S]*?<\/graphiti-context>/gi;
 const OPENVIKING_CONTEXT_RE = /<openviking-context\b[^>]*>[\s\S]*?<\/openviking-context>/gi;
 const OPENVIKING_MEMORIES_RE = /<relevant-memories\b[^>]*>[\s\S]*?<\/relevant-memories>/gi;
+/**
+ * The gateway's own runtime context, wrapped in explicit markers.
+ *
+ * OpenClaw prepends a block to the user's message carrying the chat id, the
+ * sender's name and username, session identifiers, and — the reason this matters
+ * — the recent traffic of *other* sessions. Captured verbatim it puts another
+ * conversation's content into this agent's episode, and extraction then mints
+ * entities and facts out of it.
+ *
+ * The block announces its own end, and the user's actual message is whatever
+ * follows that marker — so everything up to and including it goes, preamble and
+ * all. Cutting only between the markers left the gateway's own opening sentence
+ * behind, which is boilerplate the graph has no use for either.
+ *
+ * A block with no closing marker means the message was truncated mid-context;
+ * what arrived is still internal state, so it goes to the end of the text.
+ */
+const OPENCLAW_INTERNAL_CONTEXT_RE = /^[\s\S]*?<<<END_OPENCLAW_INTERNAL_CONTEXT>>>/;
+const OPENCLAW_UNCLOSED_CONTEXT_RE = /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>[\s\S]*$/;
+/**
+ * OpenClaw repeats the current message after the context block, so stripping the
+ * block leaves the same text twice. Only an exact whole-text duplicate is
+ * collapsed — anything less certain would risk eating a genuine repetition.
+ */
+const WHOLE_TEXT_DUPLICATE_RE = /^([\s\S]+)\n\1$/;
 const CONVERSATION_METADATA_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata)\s*(?:\([^)]+\))?\s*:\s*```(?:json)?[\s\S]*?```/gi;
 const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\S]*?```/gi;
@@ -86,6 +111,8 @@ function stripTranscriptWrapper(text: string): string {
 export function sanitizeConversationText(text: string): string {
   return stripTranscriptWrapper(
     stripInjectedContexts(text)
+      .replace(OPENCLAW_INTERNAL_CONTEXT_RE, "")
+      .replace(OPENCLAW_UNCLOSED_CONTEXT_RE, "")
       .replace(CONVERSATION_METADATA_RE, "\n")
       .replace(SENDER_METADATA_RE, "\n")
       // Removed outright rather than replaced by a space: a directive already
@@ -99,7 +126,8 @@ export function sanitizeConversationText(text: string): string {
     .replace(/\u0000/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .trim()
+    .replace(WHOLE_TEXT_DUPLICATE_RE, "$1");
 }
 
 export function textFromContent(content: unknown): string {

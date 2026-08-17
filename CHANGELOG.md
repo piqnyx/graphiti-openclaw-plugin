@@ -2,7 +2,7 @@
 
 All notable changes to `graphiti-openclaw-plugin` are tracked here.
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-08-17
 
 ### Added
 

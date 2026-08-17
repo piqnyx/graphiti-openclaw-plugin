@@ -18,16 +18,26 @@ import type {
   PersistedBuffer,
   PersistedQueueEntry,
 } from "./buffer.js";
+import type { PendingBatch } from "./pending-confirmation.js";
 import type { SessionWatermark } from "./transcript-delta.js";
 
-/** Durable capture state: unaccepted batches plus per-session transcript watermarks. */
+/**
+ * Durable capture state.
+ *
+ * Three things that must survive a restart together: batches not yet handed to
+ * Graphiti, batches handed over but not yet seen in the graph, and how far each
+ * session's transcript was already captured. Splitting them across files would
+ * let a crash land between two writes and leave the set inconsistent.
+ */
 export type CaptureSpoolState = {
-  version: 2;
+  version: 3;
   agents: PersistedAgentCaptureState[];
   sessions: SessionWatermark[];
+  pending: PendingBatch[];
 };
 
-const SPOOL_VERSION = 2 as const;
+const SPOOL_VERSION = 3 as const;
+const PREVIOUS_SPOOL_VERSION = 2 as const;
 const LEGACY_SPOOL_VERSION = 1 as const;
 const SPOOL_DIR_NAME = "graphiti-openclaw-plugin";
 const SPOOL_FILE_NAME = "capture-spool.json";
@@ -200,11 +210,23 @@ function parseState(value: unknown): CaptureSpoolState {
   if (!isObject(value) || !Array.isArray(value.agents)) {
     throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
   }
+  if (value.version === PREVIOUS_SPOOL_VERSION) {
+    // Version 2 knew nothing of confirmation. Its batches were dropped from the
+    // spool the moment Graphiti accepted them, so there is nothing outstanding to
+    // recover — an empty ledger is the truth, not a loss.
+    return {
+      version: SPOOL_VERSION,
+      agents: Array.isArray(value.agents) ? value.agents.map(parseAgentState) : [],
+      sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
+      pending: [],
+    };
+  }
   if (value.version === LEGACY_SPOOL_VERSION) {
     return {
       version: SPOOL_VERSION,
       agents: value.agents.map(parseAgentState),
       sessions: [],
+      pending: [],
     };
   }
   if (value.version !== SPOOL_VERSION) {
@@ -214,11 +236,33 @@ function parseState(value: unknown): CaptureSpoolState {
     version: SPOOL_VERSION,
     agents: value.agents.map(parseAgentState),
     sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
+    pending: Array.isArray(value.pending) ? value.pending.filter(validPendingBatch) : [],
   };
 }
 
+/**
+ * A pending batch is only worth restoring if it can still be resubmitted, which
+ * takes its identity and its body. A malformed entry is dropped rather than
+ * repaired: resubmitting a guess would write a wrong episode under a real uuid.
+ */
+function validPendingBatch(value: unknown): value is PendingBatch {
+  return (
+    isObject(value) &&
+    typeof value.uuid === "string" &&
+    value.uuid.trim() !== "" &&
+    typeof value.agentId === "string" &&
+    typeof value.sessionKey === "string" &&
+    typeof value.name === "string" &&
+    typeof value.episodeBody === "string" &&
+    typeof value.batchNumber === "number" &&
+    Number.isInteger(value.batchNumber) &&
+    typeof value.submittedAt === "number" &&
+    typeof value.attempts === "number"
+  );
+}
+
 function hasData(state: CaptureSpoolState): boolean {
-  if (state.sessions.length > 0) return true;
+  if (state.sessions.length > 0 || state.pending.length > 0) return true;
   return state.agents.some(
     (agent) => agent.activeBuffers.some((buffer) => buffer.messages.length > 0) || agent.queue.length > 0,
   );

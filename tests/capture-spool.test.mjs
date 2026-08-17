@@ -30,7 +30,7 @@ function tempSpool(t) {
 test("capture spool atomically round-trips pending state and removes empty checkpoints", (t) => {
   const spool = tempSpool(t);
   const snapshot = {
-    version: 2,
+    version: 3,
     agents: [
       {
         agentId: "main",
@@ -55,13 +55,26 @@ test("capture spool atomically round-trips pending state and removes empty check
         updatedAt: 300,
       },
     ],
+    pending: [
+      {
+        agentId: "main",
+        sessionKey: "s1",
+        uuid: "u-31",
+        name: "8248439450-31",
+        batchNumber: 31,
+        episodeBody: '{"messages":[]}',
+        previousEpisodeUuids: ["u-30"],
+        submittedAt: 900,
+        attempts: 1,
+      },
+    ],
   };
 
   spool.save(snapshot);
   assert.deepEqual(spool.load(), snapshot);
   assert.match(readFileSync(spool.path, "utf8"), /не потеряй меня/);
 
-  spool.save({ version: 2, agents: [], sessions: [] });
+  spool.save({ version: 3, agents: [], sessions: [], pending: [] });
   assert.equal(spool.load(), undefined);
 });
 
@@ -79,7 +92,7 @@ test("partial active buffer survives process-style restart without losing messag
   const first = new BufferEngine(agents, 4, 3600, async () => {
     assert.fail("partial buffer must not flush before restart");
   }, {
-    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
+    onStateChange: (snapshot) => spool.save({ version: 3, ...snapshot, sessions: [], pending: [] }),
   });
 
   first.addMessage("main", "s1", "user", "u1");
@@ -94,7 +107,7 @@ test("partial active buffer survives process-style restart without losing messag
     flushes.push(entry.buffer.messages.map((message) => `${message.role}:${message.text}`));
   }, {
     initialState: restored,
-    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
+    onStateChange: (snapshot) => spool.save({ version: 3, ...snapshot, sessions: [], pending: [] }),
   });
   t.after(() => second.stop());
   second.resumeRestored();
@@ -113,7 +126,7 @@ test("failed local FIFO head survives restart and is retried before new work", a
   const first = new BufferEngine(agents, 1, 3600, async () => {
     throw new Error("backend unavailable");
   }, {
-    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
+    onStateChange: (snapshot) => spool.save({ version: 3, ...snapshot, sessions: [], pending: [] }),
     notifyError: (_agentId, _sessionKey, _reason, error) => errors.push(error.message),
   });
 
@@ -130,7 +143,7 @@ test("failed local FIFO head survives restart and is retried before new work", a
     order.push(entry.buffer.messages[0].text);
   }, {
     initialState: restored,
-    onStateChange: (snapshot) => spool.save({ version: 2, ...snapshot, sessions: [] }),
+    onStateChange: (snapshot) => spool.save({ version: 3, ...snapshot, sessions: [], pending: [] }),
   });
   t.after(() => second.stop());
 
@@ -169,7 +182,7 @@ test("a version 1 spool from an older gateway is migrated, not rejected", (t) =>
   writeFileSync(spool.path, `${JSON.stringify(legacy)}\n`, { encoding: "utf8", flag: "w" });
 
   const restored = spool.load();
-  assert.equal(restored.version, 2);
+  assert.equal(restored.version, 3);
   assert.deepEqual(restored.sessions, []);
   assert.deepEqual(
     restored.agents[0].queue[0].buffer.messages,
@@ -181,7 +194,7 @@ test("a version 1 spool from an older gateway is migrated, not rejected", (t) =>
 test("session watermarks alone keep the spool alive", (t) => {
   const spool = tempSpool(t);
   spool.save({
-    version: 2,
+    version: 3,
     agents: [],
     sessions: [
       { agentId: "main", sessionKey: "s1", tailHashes: ["abc12345"], observedMessages: 4, updatedAt: 1 },
@@ -191,4 +204,39 @@ test("session watermarks alone keep the spool alive", (t) => {
   const restored = spool.load();
   assert.equal(restored.sessions.length, 1);
   assert.equal(restored.agents.length, 0);
+});
+
+test("a version 2 spool is migrated with an empty confirmation ledger", (t) => {
+  const spool = tempSpool(t);
+  // Version 2 dropped a batch the moment Graphiti accepted it, so it never knew
+  // of anything outstanding. An empty ledger is the truth here, not a loss.
+  writeFileSync(
+    spool.path,
+    JSON.stringify({
+      version: 2,
+      agents: [],
+      sessions: [
+        { agentId: "main", sessionKey: "s1", tailHashes: ["abc12345"], observedMessages: 4, updatedAt: 1 },
+      ],
+    }),
+  );
+
+  const restored = spool.load();
+  assert.equal(restored.version, 3);
+  assert.deepEqual(restored.pending, []);
+  assert.equal(restored.sessions.length, 1, "watermarks must survive the migration");
+});
+
+test("a pending batch survives a restart, and a malformed one is dropped", (t) => {
+  const spool = tempSpool(t);
+  const good = {
+    agentId: "main", sessionKey: "s1", uuid: "u-22", name: "8248439450-22", batchNumber: 22,
+    episodeBody: '{"messages":[]}', previousEpisodeUuids: [], submittedAt: 1, attempts: 0,
+  };
+  spool.save({ version: 3, agents: [], sessions: [], pending: [good, { uuid: "" }, { nonsense: true }] });
+
+  const restored = spool.load();
+  // Resubmitting a guess would write a wrong episode under a real uuid, so an
+  // entry that cannot be resubmitted faithfully is dropped rather than repaired.
+  assert.deepEqual(restored.pending, [good]);
 });

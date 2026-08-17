@@ -10,6 +10,7 @@ import { acquireCaptureRuntime } from "./capture-runtime.js";
 import { CaptureSpool, resolveCaptureSpoolPath, type CaptureSpoolState } from "./capture-spool.js";
 import { DEFAULT_ACTORS, parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { EpisodeSequenceTracker } from "./episode-sequence.js";
+import { PendingConfirmationTracker, sequenceKey } from "./pending-confirmation.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { compileSessionPatterns, matchSessionExclusion } from "./session-filter.js";
@@ -125,6 +126,7 @@ export function register(api: OpenClawPluginApi): void {
       );
     });
     const sequences = new EpisodeSequenceTracker();
+    const pendingConfirmation = new PendingConfirmationTracker();
     const transcriptDeltas = new TranscriptDeltaTracker();
     const lastSessionByAgent = new Map<string, string>();
     const unconfiguredAgentsReported = new Set<string>();
@@ -148,6 +150,7 @@ export function register(api: OpenClawPluginApi): void {
       }
       if (restoredCaptureState) {
         restoredWatermarks = transcriptDeltas.restore(restoredCaptureState.sessions);
+        pendingConfirmation.restore(restoredCaptureState.pending);
       }
       const restored = captureSnapshotStats(restoredCaptureState);
       if (restored.messages > 0 || restoredWatermarks > 0) {
@@ -427,11 +430,45 @@ export function register(api: OpenClawPluginApi): void {
       return saga;
     };
 
+    /**
+     * The batch number to continue from, never lower than one already issued.
+     *
+     * Graphiti's episode count reflects what it has *processed*, and processing
+     * lags acceptance — by seconds when healthy, by half an hour when the model
+     * is unreachable. Trusting it alone after a restart handed number 22 to a
+     * second, different batch while the first was still in the queue, leaving one
+     * dialog with two episodes of that name. What this process already issued is
+     * on the confirmation ledger, and it survives the restart with it.
+     */
+    const resumeFrom = (
+      agentId: string,
+      sessionKey: string,
+      saga: SagaState | undefined,
+    ): { acceptedBatches: number; lastEpisodeUuid?: string } => {
+      const fromBackend = saga?.episodeCount ?? 0;
+      const issued = pendingConfirmation.highestIssued().get(sequenceKey(agentId, sessionKey)) ?? 0;
+      if (issued <= fromBackend) {
+        return { acceptedBatches: fromBackend, ...(saga?.lastEpisodeUuid ? { lastEpisodeUuid: saga.lastEpisodeUuid } : {}) };
+      }
+      logger.info("capture_sequence_ahead_of_backend", {
+        agentId,
+        group_id: agentId,
+        saga: sessionKey,
+        backendEpisodes: fromBackend,
+        issued,
+        action: "resumed_from_issued",
+      });
+      // The predecessor still comes from the backend: linking to an episode it has
+      // not stored would produce an edge that silently fails to be created.
+      return { acceptedBatches: issued, ...(saga?.lastEpisodeUuid ? { lastEpisodeUuid: saga.lastEpisodeUuid } : {}) };
+    };
+
     const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
       if (sequences.isHydrated(agentId, sessionKey)) return;
 
       const saga = await fetchSagaState(agentId, sessionKey);
-      sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
+      const resume = resumeFrom(agentId, sessionKey, saga);
+      sequences.hydrate(agentId, sessionKey, resume.acceptedBatches, resume.lastEpisodeUuid);
       logger.debug("capture_sequence_hydrated", {
         agentId,
         group_id: agentId,
@@ -492,7 +529,10 @@ export function register(api: OpenClawPluginApi): void {
         return true;
       }
 
-      sequences.hydrate(agentId, sessionKey, saga?.episodeCount ?? 0, saga?.lastEpisodeUuid);
+      // Same rule as the ordinary path: never resume below a number this process
+      // already handed out, or the replayed batch collides with a live one.
+      const resume = resumeFrom(agentId, sessionKey, saga);
+      sequences.hydrate(agentId, sessionKey, resume.acceptedBatches, resume.lastEpisodeUuid);
 
       const reserved = {
         batchNumber: identity.batchNumber,
@@ -628,6 +668,20 @@ export function register(api: OpenClawPluginApi): void {
       const episodeUuid = acceptedEpisodeUuid(result);
       sequences.accept(agentId, sessionKey, sequence.batchNumber, episodeUuid);
 
+      // Accepted means handed over, not stored: Graphiti queues the batch and
+      // extracts entities later, so the episode appears only once that finishes.
+      // The batch stays on this ledger until it is seen in the graph.
+      pendingConfirmation.track({
+        agentId,
+        sessionKey,
+        uuid: episodeUuid,
+        name: sequence.name,
+        batchNumber: sequence.batchNumber,
+        episodeBody: jsonBody,
+        previousEpisodeUuids: sequence.previousEpisodeUuids,
+      });
+      engine.checkpoint();
+
       logger.info("capture_queue_accepted", {
         agentId,
         group_id: agentId,
@@ -654,9 +708,10 @@ export function register(api: OpenClawPluginApi): void {
         onStateChange: captureSpool
           ? (snapshot) =>
               captureSpool.save({
-                version: 2,
+                version: 3,
                 agents: snapshot.agents,
                 sessions: transcriptDeltas.export(),
+                pending: pendingConfirmation.export(),
               })
           : undefined,
         notifyError: (agentId, sessionKey, reason, error) => {

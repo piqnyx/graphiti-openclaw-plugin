@@ -89,6 +89,10 @@ function expectedEpisodeName(sessionKey: string, batchNumber: number): string {
   return `${episodeNamePrefix(sessionKey)}-${batchNumber}`;
 }
 
+function captureSessionKey(agentId: string, sessionKey: string): string {
+  return JSON.stringify([agentId, sessionKey]);
+}
+
 export function createCapturePipeline(params: {
   api: OpenClawPluginApi;
   cfg: GraphitiPluginConfig;
@@ -109,6 +113,7 @@ export function createCapturePipeline(params: {
   const backendReportedSessionByAgent = new Map<string, string>();
   const backendFingerprintByAgent = new Map<string, string>();
   const lastQueueStatusByAgent = new Map<string, QueueStatus>();
+  const cursorErrorSessions = new Set<string>();
   const statusHost: CaptureStatusHost = {};
   const durableRoot = resolveDurableCaptureRoot();
   const legacySpoolPath = resolveCaptureSpoolPath();
@@ -220,6 +225,7 @@ export function createCapturePipeline(params: {
       reason: CaptureFailureReason,
       error: Error,
     ): void => {
+      if (reason === "cursor") cursorErrorSessions.add(captureSessionKey(agentId, sessionKey));
       const value: PluginJsonValue = {
         status: "error",
         message:
@@ -749,7 +755,8 @@ export function createCapturePipeline(params: {
           { messages: delta },
         );
       }
-      clearCaptureError(agentId, sessionKey);
+      const cursorKey = captureSessionKey(agentId, sessionKey);
+      if (cursorErrorSessions.delete(cursorKey)) clearCaptureError(agentId, sessionKey);
     };
 
     const shutdown = (): Promise<void> => {

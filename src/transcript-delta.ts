@@ -163,6 +163,17 @@ type PendingObservation = {
   messages: ConversationMessage[];
 };
 
+function watermarkFor(observation: PendingObservation): SessionWatermark {
+  return {
+    agentId: observation.agentId,
+    sessionKey: observation.sessionKey,
+    tailHashes: observation.messages.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
+    observedMessages: observation.messages.length,
+    prefixDigest: transcriptDigest(observation.messages),
+    updatedAt: Date.now(),
+  };
+}
+
 export class TranscriptDeltaTracker {
   private readonly snapshots = new Map<string, ConversationMessage[]>();
   private readonly watermarks = new Map<string, SessionWatermark>();
@@ -173,28 +184,52 @@ export class TranscriptDeltaTracker {
     const current = snapshot.map((message) => ({ ...message }));
     const previous = this.snapshots.get(key);
 
+    // Compute before publishing any new in-memory cursor state. If the transcript
+    // cannot be reconciled, a failed observation must not become tomorrow's trusted
+    // predecessor and silently skip the very messages we refused to guess about.
+    const delta = this.computeDelta(key, previous, current);
+
     this.snapshots.delete(key);
     this.snapshots.set(key, current);
     this.pendingObservations.set(key, { agentId, sessionKey, messages: current });
     this.pruneSnapshots();
-
-    return this.computeDelta(key, previous, current);
+    return delta;
   }
 
-  /** Advance the durable cursor only after the returned delta is durably buffered. */
-  commit(agentId: string, sessionKey: string): void {
+  /** Build the candidate cursor without advancing the committed in-memory watermark. */
+  pendingWatermark(agentId: string, sessionKey: string): SessionWatermark {
     const key = JSON.stringify([agentId, sessionKey]);
     const observation = this.pendingObservations.get(key);
-    if (!observation) return;
+    if (!observation) {
+      throw new TranscriptCursorError(
+        `no pending transcript observation for ${agentId}/${sessionKey}`,
+      );
+    }
+    return watermarkFor(observation);
+  }
 
-    this.watermarks.set(key, {
-      agentId,
-      sessionKey,
-      tailHashes: observation.messages.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
-      observedMessages: observation.messages.length,
-      prefixDigest: transcriptDigest(observation.messages),
-      updatedAt: Date.now(),
-    });
+  /** Advance the in-memory cursor only after the caller made that candidate durable. */
+  commit(agentId: string, sessionKey: string): SessionWatermark | undefined {
+    const key = JSON.stringify([agentId, sessionKey]);
+    const observation = this.pendingObservations.get(key);
+    if (!observation) return undefined;
+
+    const watermark = watermarkFor(observation);
+    this.watermarks.set(key, watermark);
+    this.pendingObservations.delete(key);
+    return { ...watermark, tailHashes: [...watermark.tailHashes] };
+  }
+
+  /**
+   * Forget an observation whose durable transaction failed.
+   *
+   * The next call deliberately falls back to the last committed watermark rather
+   * than the unpersisted snapshot. That turns disk-full/crash uncertainty into a
+   * safe replay of the uncommitted delta instead of message loss.
+   */
+  rollback(agentId: string, sessionKey: string): void {
+    const key = JSON.stringify([agentId, sessionKey]);
+    this.snapshots.delete(key);
     this.pendingObservations.delete(key);
   }
 

@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BufferEngine, CHECK_INTERVAL_SEC } from "../dist/buffer.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CHECK_INTERVAL_SEC } from "../dist/buffer.js";
+import { DurableBufferEngine } from "../dist/durable-buffer-engine.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitFor(predicate, timeoutMs) {
+async function waitFor(predicate, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -15,44 +18,66 @@ async function waitFor(predicate, timeoutMs) {
 
 const agents = {
   main: { user: "Вит", assistant: "Краб" },
+  broken: { user: "Broken", assistant: "Краб" },
+  healthy: { user: "Healthy", assistant: "Краб" },
 };
 
-function enqueueOne(engine, agentId, sessionKey, text) {
-  engine.addMessage(agentId, sessionKey, "user", text);
+function rootFor(t) {
+  const root = mkdtempSync(join(tmpdir(), "graphiti-buffer-scheduler-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return root;
 }
 
-test("one agent processing sequentially drains its whole queue in a single pass", async (t) => {
+function mark(agentId, sessionKey, observedMessages = 1) {
+  return {
+    agentId,
+    sessionKey,
+    tailHashes: [`${agentId}:${sessionKey}:${observedMessages}`.padEnd(64, "0").slice(0, 64)],
+    observedMessages,
+    prefixDigest: "d".repeat(64),
+    updatedAt: Date.now(),
+  };
+}
+
+function enqueueOne(engine, agentId, sessionKey, text) {
+  engine.ingest(
+    agentId,
+    sessionKey,
+    [{ role: "user", text }],
+    mark(agentId, sessionKey),
+  );
+}
+
+test("one agent sequentially drains its whole disk queue", async (t) => {
   const order = [];
   const gate = deferred();
   let released = 0;
 
-  const engine = new BufferEngine(
-    agents,
-    1,
-    3600,
-    async (_agentId, entry) => {
-      order.push(entry.buffer.sessionKey);
-      if (order.length === 1) await gate.promise;
-      released += 1;
-    },
-  );
-  t.after(() => engine.stop());
+  const engine = new DurableBufferEngine(rootFor(t), agents, 1, 3600, async (_agentId, entry) => {
+    order.push(entry.buffer.sessionKey);
+    if (order.length === 1) await gate.promise;
+    released += 1;
+  });
+  t.after(async () => {
+    gate.resolve();
+    await engine.shutdown(200);
+  });
 
-  for (const s of ["a", "b", "c"]) {
-    enqueueOne(engine, "main", s, `message-${s}`);
-  }
+  for (const s of ["a", "b", "c"]) enqueueOne(engine, "main", s, `message-${s}`);
 
-  await waitFor(() => order.length === 1, 2000);
+  await waitFor(() => order.length === 1);
   gate.resolve();
-  await waitFor(() => order.length === 3, 2000);
+  await waitFor(() => order.length === 3);
   assert.deepEqual(order, ["a", "b", "c"]);
   assert.equal(released, 3);
+  assert.equal(engine.queueDepth("main"), 0);
 });
 
-test("a failed agent retains its FIFO head while another agent continues", async (t) => {
+test("a failed agent retains its head while another agent continues", async (t) => {
   const attempts = [];
   const errors = [];
-  const engine = new BufferEngine(
+  const engine = new DurableBufferEngine(
+    rootFor(t),
     agents,
     1,
     3600,
@@ -65,37 +90,37 @@ test("a failed agent retains its FIFO head while another agent continues", async
         errors.push({ agentId, sessionKey, error: error.message }),
     },
   );
-  t.after(() => engine.stop());
+  t.after(() => engine.shutdown(200));
 
   enqueueOne(engine, "broken", "b1", "broken");
-  await waitFor(() => errors.length === 1, 2000);
-  assert.equal(engine.queueLength(), 1, "failed head must stay queued");
+  await waitFor(() => errors.length === 1);
+  assert.equal(engine.queueDepth("broken"), 1);
 
   enqueueOne(engine, "healthy", "h1", "healthy");
-  await waitFor(() => attempts.some((f) => f.agentId === "healthy"), 2000);
+  await waitFor(() => attempts.some((f) => f.agentId === "healthy"));
 
   assert.deepEqual(
     attempts.find((f) => f.agentId === "healthy"),
     { agentId: "healthy", sessionKey: "h1" },
   );
-  assert.equal(errors.length, 1, "one failure incident emits one notification");
-  assert.equal(engine.queueLength(), 1, "only broken agent head remains queued");
+  assert.equal(errors.length, 1);
+  assert.equal(engine.queueDepth("broken"), 1);
+  assert.equal(engine.queueDepth("healthy"), 0);
 });
 
 test("failed head retries before later entries and recovery resumes FIFO", async (t) => {
   const originalNow = Date.now;
   let now = 1_700_000_000_000;
   Date.now = () => now;
-  t.after(() => {
-    Date.now = originalNow;
-  });
+  t.after(() => { Date.now = originalNow; });
 
   const attempts = [];
   const errors = [];
   const recovered = [];
   let firstAttempts = 0;
 
-  const engine = new BufferEngine(
+  const engine = new DurableBufferEngine(
+    rootFor(t),
     agents,
     1,
     3600,
@@ -111,56 +136,60 @@ test("failed head retries before later entries and recovery resumes FIFO", async
       notifyRecovered: (_agentId, sessionKey) => recovered.push(sessionKey),
     },
   );
-  t.after(() => engine.stop());
+  t.after(() => engine.shutdown(200));
 
   enqueueOne(engine, "main", "b1", "first");
   await sleep(0);
   assert.deepEqual(attempts, ["b1"]);
   assert.deepEqual(errors, ["b1"]);
-  assert.equal(engine.queueLength(), 1);
+  assert.equal(engine.queueDepth("main"), 1);
 
   enqueueOne(engine, "main", "b2", "second");
   await sleep(0);
   assert.deepEqual(attempts, ["b1"]);
-  assert.equal(engine.queueLength(), 2);
+  assert.equal(engine.queueDepth("main"), 2);
 
   now += CHECK_INTERVAL_SEC * 1000;
   enqueueOne(engine, "main", "b3", "third");
-  await sleep(0);
-  await sleep(0);
+  await waitFor(() => attempts.length === 4);
 
   assert.deepEqual(attempts, ["b1", "b1", "b2", "b3"]);
   assert.deepEqual(recovered, ["b1"]);
-  assert.equal(engine.queueLength(), 0);
+  assert.equal(engine.queueDepth("main"), 0);
 });
 
-test("individual user and assistant messages are representable and preserve order", async (t) => {
+test("individual user and assistant messages preserve exact order", async (t) => {
   const flushes = [];
-  const engine = new BufferEngine(
-    agents,
-    4,
-    3600,
-    async (_agentId, entry) => {
-      flushes.push(entry.buffer.messages.map((m) => `${m.role}:${m.text}`));
-    },
-  );
-  t.after(() => engine.stop());
+  const engine = new DurableBufferEngine(rootFor(t), agents, 4, 3600, async (_agentId, entry) => {
+    flushes.push(entry.buffer.messages.map((m) => `${m.role}:${m.text}`));
+  });
+  t.after(() => engine.shutdown(200));
 
-  engine.addMessage("main", "s1", "user", "u1");
-  engine.addMessage("main", "s1", "user", "u2");
-  engine.addMessage("main", "s1", "user", "u3");
-  await sleep(50);
+  engine.ingest(
+    "main",
+    "s1",
+    [
+      { role: "user", text: "u1" },
+      { role: "user", text: "u2" },
+      { role: "user", text: "u3" },
+    ],
+    mark("main", "s1", 3),
+  );
+  await sleep(30);
   assert.equal(flushes.length, 0);
 
-  engine.addMessage("main", "s1", "assistant", "a1");
-  await waitFor(() => flushes.length === 1, 2000);
+  engine.ingest(
+    "main",
+    "s1",
+    [{ role: "assistant", text: "a1" }],
+    mark("main", "s1", 4),
+  );
+  await waitFor(() => flushes.length === 1);
   assert.deepEqual(flushes[0], ["user:u1", "user:u2", "user:u3", "assistant:a1"]);
 });
 
 function deferred() {
   let resolve;
-  const promise = new Promise((res) => {
-    resolve = res;
-  });
+  const promise = new Promise((res) => { resolve = res; });
   return { promise, resolve };
 }

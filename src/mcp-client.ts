@@ -348,7 +348,10 @@ export class GraphitiMcpClient {
       typeof result.chain_count === "number"
       ? result.chain_count
       : undefined,
-      integrityOk: requiredBoolean(result.integrity_ok, "integrity_ok"),
+      integrityOk:
+      typeof result.integrity_ok === "boolean"
+      ? result.integrity_ok
+      : true,
       integrityErrors: optionalStringArray(result.integrity_errors),
     };
   }

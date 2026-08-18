@@ -314,10 +314,9 @@ export function createCapturePipeline(params: {
           agentId,
           group_id: agentId,
           saga: sessionKey,
+          integrityErrors: saga.integrityErrors,
           episodeCount: saga.episodeCount,
           chainCount: saga.chainCount,
-          errors: saga.integrityErrors,
-          action: "continue_with_existing_saga_state",
         });
       }
       if (saga.episodeCount > 0 && (!saga.firstEpisodeUuid || !saga.lastEpisodeUuid)) {

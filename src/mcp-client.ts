@@ -353,20 +353,29 @@ export class GraphitiMcpClient {
   async getQueueStatus(groupId: string): Promise<QueueStatus> {
     const result = await this.callTool("get_queue_status", { group_id: groupId });
     if (typeof result.error === "string") throw new McpToolResultError(result.error);
-    return {
+
+    const status: QueueStatus = {
       groupId: requiredString(result.group_id, "group_id"),
       blocked: requiredBoolean(result.blocked, "blocked"),
       attempts: requiredNonnegativeInteger(result.attempts, "attempts"),
       pending: requiredNonnegativeInteger(result.pending, "pending"),
-      workerRunning: typeof result.worker_running === "boolean" ? result.worker_running : undefined,
-      lastError: optionalString(result.last_error),
-      failureKind: optionalString(result.failure_kind),
-      retryInSeconds: optionalNonnegativeNumber(result.retry_in_seconds),
-      episodeUuid: optionalString(result.episode_uuid),
-      episodeName: optionalString(result.episode_name),
-      saga: optionalString(result.saga),
       queuedEpisodeUuids: optionalStringArray(result.queued_episode_uuids),
     };
+    const workerRunning = typeof result.worker_running === "boolean" ? result.worker_running : undefined;
+    const lastError = optionalString(result.last_error);
+    const failureKind = optionalString(result.failure_kind);
+    const retryInSeconds = optionalNonnegativeNumber(result.retry_in_seconds);
+    const episodeUuid = optionalString(result.episode_uuid);
+    const episodeName = optionalString(result.episode_name);
+    const saga = optionalString(result.saga);
+    if (workerRunning !== undefined) status.workerRunning = workerRunning;
+    if (lastError !== undefined) status.lastError = lastError;
+    if (failureKind !== undefined) status.failureKind = failureKind;
+    if (retryInSeconds !== undefined) status.retryInSeconds = retryInSeconds;
+    if (episodeUuid !== undefined) status.episodeUuid = episodeUuid;
+    if (episodeName !== undefined) status.episodeName = episodeName;
+    if (saga !== undefined) status.saga = saga;
+    return status;
   }
 
   async getEpisodes(groupId: string, limit: number): Promise<JsonObject[]> {

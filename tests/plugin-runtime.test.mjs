@@ -253,8 +253,11 @@ test("two committed batches of one dialog are submitted and chained strictly in 
   const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
 
+  hooks.get("agent_end")({ success: true, messages: completedTranscript(1) }, ctx);
   hooks.get("agent_end")({ success: true, messages: completedTranscript(2) }, ctx);
   await waitFor(() => toolCalls.filter((call) => call.name === "add_memory").length === 1);
+
+  hooks.get("agent_end")({ success: true, messages: completedTranscript(3) }, ctx);
   hooks.get("agent_end")({ success: true, messages: completedTranscript(4) }, ctx);
   await waitFor(() => toolCalls.filter((call) => call.name === "add_memory").length === 2);
 
@@ -278,10 +281,9 @@ test("a persisted Saga tail hydrates the next batch number and predecessor", asy
   register(api);
 
   const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
-  hooks.get("agent_end")(
-    { success: true, messages: completedTranscript(2) },
-    { agentId: "main", sessionKey, trigger: "user" },
-  );
+  const ctx = { agentId: "main", sessionKey, trigger: "user" };
+  hooks.get("agent_end")({ success: true, messages: completedTranscript(1) }, ctx);
+  hooks.get("agent_end")({ success: true, messages: completedTranscript(2) }, ctx);
   await waitFor(() => toolCalls.some((call) => call.name === "add_memory"));
 
   const add = toolCalls.find((call) => call.name === "add_memory").arguments;
@@ -301,15 +303,9 @@ test("capture stores clean user/assistant text, not injected memory wrappers or 
     {
       success: true,
       messages: [
-        {
-          role: "user",
-          content: "alpha <openviking-context>viking injection</openviking-context>",
-        },
+        { role: "user", content: "alpha <openviking-context>viking injection</openviking-context>" },
         { role: "tool", content: "secret tool result" },
-        {
-          role: "assistant",
-          content: "beta <graphiti-context>graphiti injection</graphiti-context>",
-        },
+        { role: "assistant", content: "beta <graphiti-context>graphiti injection</graphiti-context>" },
       ],
     },
     { agentId: "main", sessionKey: "agent:main:web:clean-capture", trigger: "user" },

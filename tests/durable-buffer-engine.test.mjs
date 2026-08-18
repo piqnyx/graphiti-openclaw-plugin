@@ -128,6 +128,148 @@ test("switching dialogs keeps separate active buffers and detaches each into its
   });
 });
 
+test("expired dialog is queued before a newer limit batch even when the ticker has not run", async (t) => {
+  const root = withRoot(t);
+  const delivered = [];
+  const engine = new DurableBufferEngine(root, actors, 2, 30, async (_agentId, entry) => {
+    delivered.push({
+      sessionKey: entry.buffer.sessionKey,
+      reason: entry.reason,
+      enqueuedAt: entry.enqueuedAt,
+      messages: entry.buffer.messages.map((message) => message.text),
+    });
+  });
+  t.after(() => engine.shutdown(500));
+
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+
+  engine.ingest("main", "stale", [{ role: "user", text: "old" }], watermark("main", "stale"));
+
+  // The inactivity deadline has arrived, but the 30-second ticker has not run yet.
+  now += 30_000;
+  engine.ingest(
+    "main",
+    "fresh",
+    [
+      { role: "user", text: "new-1" },
+      { role: "assistant", text: "new-2" },
+    ],
+    watermark("main", "fresh", 2),
+  );
+
+  await waitFor(() => delivered.length === 2);
+  assert.deepEqual(delivered.map(({ sessionKey, reason }) => [sessionKey, reason]), [
+    ["stale", "timeout"],
+    ["fresh", "limit"],
+  ]);
+  assert.equal(delivered[0].enqueuedAt, 1_030_000, "timeout is born at its logical deadline, not ticker time");
+});
+
+test("a limit batch one millisecond before another dialog timeout legitimately stays first", async (t) => {
+  const root = withRoot(t);
+  const delivered = [];
+  const engine = new DurableBufferEngine(root, actors, 2, 30, async (_agentId, entry) => {
+    delivered.push(`${entry.buffer.sessionKey}:${entry.reason}`);
+  });
+  t.after(() => engine.shutdown(500));
+
+  const originalNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+
+  engine.ingest("main", "stale", [{ role: "user", text: "old" }], watermark("main", "stale"));
+  now += 29_999;
+  engine.ingest(
+    "main",
+    "fresh",
+    [
+      { role: "user", text: "new-1" },
+      { role: "assistant", text: "new-2" },
+    ],
+    watermark("main", "fresh", 2),
+  );
+  await waitFor(() => delivered.length === 1);
+  assert.deepEqual(delivered, ["fresh:limit"]);
+
+  now += 1;
+  await engine.tick();
+  await waitFor(() => delivered.length === 2);
+  assert.deepEqual(delivered, ["fresh:limit", "stale:timeout"]);
+});
+
+test("multiple overdue dialogs are detached by timeout deadline rather than map insertion order", async (t) => {
+  const root = withRoot(t);
+  const delivered = [];
+  const engine = new DurableBufferEngine(root, actors, 20, 30, async (_agentId, entry) => {
+    delivered.push({
+      sessionKey: entry.buffer.sessionKey,
+      enqueuedAt: entry.enqueuedAt,
+      messages: entry.buffer.messages.map((message) => message.text),
+    });
+  });
+  t.after(() => engine.shutdown(500));
+
+  const originalNow = Date.now;
+  let now = 3_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+
+  // topic-a is inserted into the timeout map first...
+  engine.ingest("main", "topic-a", [{ role: "user", text: "a1" }], watermark("main", "topic-a", 1));
+  now += 1_000;
+  engine.ingest("main", "topic-b", [{ role: "user", text: "b1" }], watermark("main", "topic-b", 1));
+  now += 1_000;
+  // ...but later activity moves topic-a's deadline after topic-b's deadline.
+  engine.ingest("main", "topic-a", [{ role: "assistant", text: "a2" }], watermark("main", "topic-a", 2));
+
+  now += 31_000;
+  await engine.tick();
+  await waitFor(() => delivered.length === 2);
+
+  assert.deepEqual(delivered.map((item) => item.sessionKey), ["topic-b", "topic-a"]);
+  assert.deepEqual(delivered.map((item) => item.enqueuedAt), [3_031_000, 3_032_000]);
+  assert.deepEqual(delivered[1].messages, ["a1", "a2"]);
+});
+
+test("new activity in the same dialog at the exact timeout boundary starts a new batch", async (t) => {
+  const root = withRoot(t);
+  const delivered = [];
+  const engine = new DurableBufferEngine(root, actors, 2, 30, async (_agentId, entry) => {
+    delivered.push({
+      reason: entry.reason,
+      messages: entry.buffer.messages.map((message) => message.text),
+    });
+  });
+  t.after(() => engine.shutdown(500));
+
+  const originalNow = Date.now;
+  let now = 4_000_000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+
+  engine.ingest("main", "same", [{ role: "user", text: "old" }], watermark("main", "same", 1));
+  now += 30_000;
+  engine.ingest(
+    "main",
+    "same",
+    [
+      { role: "user", text: "new-1" },
+      { role: "assistant", text: "new-2" },
+    ],
+    watermark("main", "same", 3),
+  );
+
+  await waitFor(() => delivered.length === 2);
+  assert.deepEqual(delivered, [
+    { reason: "timeout", messages: ["old"] },
+    { reason: "limit", messages: ["new-1", "new-2"] },
+  ]);
+});
+
 test("sessions share one agent FIFO but different agents drain independently", async (t) => {
   const root = withRoot(t);
   let releaseMain;
@@ -235,6 +377,7 @@ test("partial buffer flushes on inactivity without moving its durable watermark"
 
   assert.equal(delivered[0].reason, "timeout");
   assert.equal(delivered[0].buffer.messages[0].text, "partial");
+  assert.equal(delivered[0].enqueuedAt, 1_030_000);
   const state = engine.journal.read("main", "s1").committed;
   assert.equal(state.active, undefined);
   assert.deepEqual(state.watermark, mark);

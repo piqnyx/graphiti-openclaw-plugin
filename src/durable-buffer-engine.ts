@@ -221,10 +221,17 @@ export class DurableBufferEngine {
   ): void {
     if (this.stopped) throw new Error("cannot add capture messages after DurableBufferEngine shutdown");
 
+    // The capture observation has one logical time. Before this observation is
+    // allowed to create a newer limit batch, every buffer of the same agent whose
+    // inactivity deadline has already passed is detached in deadline order. This
+    // closes the race where a late ticker could otherwise enqueue an older timeout
+    // behind a newer batch from another dialog.
+    const now = Date.now();
+    this.expireDueSessions(agentId, now);
+
     const previous = this.sessionState(agentId, sessionKey);
     let active = previous.active ? restoreBuffer(previous.active) : undefined;
     const batches: JournalBatch<DurableCaptureQueuePayload>[] = [];
-    const now = Date.now();
 
     const flush = (buffer: Buffer, reason: FlushReason, enqueuedAt: number): void => {
       if (buffer.messages.length === 0) return;
@@ -235,20 +242,11 @@ export class DurableBufferEngine {
     for (const message of messages) {
       const text = message.text.trim();
       if (!text) continue;
-      const at = Date.now();
-      if (
-        active &&
-        active.messages.length > 0 &&
-        at - active.lastActivityAt >= this.bufferTimeoutMs
-      ) {
-        flush(active, "timeout", at);
-        active = undefined;
-      }
-      active ??= this.newBuffer(agentId, sessionKey, at);
+      active ??= this.newBuffer(agentId, sessionKey, now);
       active.messages.push({ role: message.role, text });
-      active.lastActivityAt = at;
+      active.lastActivityAt = now;
       if (active.messages.length >= this.bufferLimit) {
-        flush(active, "limit", at);
+        flush(active, "limit", now);
         active = undefined;
       }
     }
@@ -259,35 +257,33 @@ export class DurableBufferEngine {
     };
 
     this.commitSession(agentId, sessionKey, previous, finalState, batches);
-    const lastActivityAt = finalState.active?.lastActivityAt ?? now;
-    this.updateKnownSession(agentId, sessionKey, finalState.active ? lastActivityAt : undefined);
+    this.updateKnownSession(agentId, sessionKey, finalState.active?.lastActivityAt);
     void this.pump(agentId);
   }
 
   /** Persist a cursor observation that produced no new messages. */
   checkpointWatermark(agentId: string, sessionKey: string, watermark: SessionWatermark): void {
     if (this.stopped) throw new Error("cannot checkpoint after DurableBufferEngine shutdown");
+    const now = Date.now();
+    this.expireDueSessions(agentId, now);
     const previous = this.sessionState(agentId, sessionKey);
     const finalState: DurableCaptureSessionState = {
       ...previous,
       watermark: { ...watermark, tailHashes: [...watermark.tailHashes] },
     };
     this.commitSession(agentId, sessionKey, previous, finalState, []);
+    void this.pump(agentId);
   }
 
   /** Append a synthetic note without moving the OpenClaw transcript cursor. */
   appendSynthetic(agentId: string, sessionKey: string, message: BufferMessage): void {
     if (this.stopped) throw new Error("cannot add capture messages after DurableBufferEngine shutdown");
+    const at = Date.now();
+    this.expireDueSessions(agentId, at);
     const previous = this.sessionState(agentId, sessionKey);
     let active = previous.active ? restoreBuffer(previous.active) : undefined;
     const batches: JournalBatch<DurableCaptureQueuePayload>[] = [];
-    const at = Date.now();
 
-    if (active && active.messages.length > 0 && at - active.lastActivityAt >= this.bufferTimeoutMs) {
-      const payload: DurableCaptureQueuePayload = { buffer: persistBuffer(active), reason: "timeout" };
-      batches.push({ captureId: captureId(agentId, payload), enqueuedAt: at, payload });
-      active = undefined;
-    }
     active ??= this.newBuffer(agentId, sessionKey, at);
     const text = message.text.trim();
     if (text) active.messages.push({ role: message.role, text });
@@ -346,6 +342,59 @@ export class DurableBufferEngine {
     this.knownSessions.set(key, { agentId, sessionKey, lastActivityAt });
   }
 
+  private timeoutDeadline(lastActivityAt: number): number {
+    return lastActivityAt + this.bufferTimeoutMs;
+  }
+
+  /**
+   * Detach every expired partial buffer for one agent in logical timeout order.
+   *
+   * A timeout batch is considered born at lastActivityAt + bufferTimeout, not when
+   * the 30-second maintenance ticker happens to notice it. Re-reading durable state
+   * before each detach makes the tiny in-memory timeout index advisory only. If any
+   * commit fails, the caller aborts before it can enqueue newer work and ordering is
+   * preserved across the retry/restart.
+   */
+  private expireDueSessions(agentId: string, now: number): void {
+    const due = [...this.knownSessions.values()]
+      .filter(
+        (session) =>
+          session.agentId === agentId && this.timeoutDeadline(session.lastActivityAt) <= now,
+      )
+      .sort((left, right) => {
+        const deadlineOrder =
+          this.timeoutDeadline(left.lastActivityAt) - this.timeoutDeadline(right.lastActivityAt);
+        if (deadlineOrder !== 0) return deadlineOrder;
+        return left.sessionKey.localeCompare(right.sessionKey);
+      });
+
+    for (const session of due) {
+      const state = this.sessionState(session.agentId, session.sessionKey);
+      const active = state.active;
+      if (!active || active.messages.length === 0) {
+        this.updateKnownSession(session.agentId, session.sessionKey, undefined);
+        continue;
+      }
+
+      const deadline = this.timeoutDeadline(active.lastActivityAt);
+      if (deadline > now) {
+        // The durable file changed after this timeout-index entry was recorded.
+        this.updateKnownSession(session.agentId, session.sessionKey, active.lastActivityAt);
+        continue;
+      }
+
+      const payload: DurableCaptureQueuePayload = { buffer: active, reason: "timeout" };
+      this.commitSession(
+        session.agentId,
+        session.sessionKey,
+        state,
+        state.watermark ? { watermark: state.watermark } : {},
+        [{ captureId: captureId(session.agentId, payload), enqueuedAt: deadline, payload }],
+      );
+      this.updateKnownSession(session.agentId, session.sessionKey, undefined);
+    }
+  }
+
   /** Rebuild only the tiny timeout index and return every durable transcript cursor. */
   private discoverSessions(): SessionWatermark[] {
     const watermarks: SessionWatermark[] = [];
@@ -382,29 +431,9 @@ export class DurableBufferEngine {
   private async tick(): Promise<void> {
     if (this.stopped) return;
     const now = Date.now();
-    for (const session of [...this.knownSessions.values()]) {
-      if (now - session.lastActivityAt < this.bufferTimeoutMs) continue;
-      const state = this.sessionState(session.agentId, session.sessionKey);
-      const active = state.active;
-      if (!active || active.messages.length === 0) {
-        this.updateKnownSession(session.agentId, session.sessionKey, undefined);
-        continue;
-      }
-      if (now - active.lastActivityAt < this.bufferTimeoutMs) {
-        this.updateKnownSession(session.agentId, session.sessionKey, active.lastActivityAt);
-        continue;
-      }
-      const payload: DurableCaptureQueuePayload = { buffer: active, reason: "timeout" };
-      this.commitSession(
-        session.agentId,
-        session.sessionKey,
-        state,
-        state.watermark ? { watermark: state.watermark } : {},
-        [{ captureId: captureId(session.agentId, payload), enqueuedAt: now, payload }],
-      );
-      this.updateKnownSession(session.agentId, session.sessionKey, undefined);
-      void this.pump(session.agentId);
-    }
+    const agentIds = new Set<string>();
+    for (const session of this.knownSessions.values()) agentIds.add(session.agentId);
+    for (const agentId of agentIds) this.expireDueSessions(agentId, now);
     for (const agentId of this.journal.queue.listAgents()) void this.pump(agentId);
   }
 

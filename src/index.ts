@@ -165,6 +165,8 @@ export function register(api: OpenClawPluginApi): void {
             historyMaxMessages: cfg.recallHistoryMaxMessages,
             historyMaxChars: cfg.recallHistoryMaxChars,
             maxChars: cfg.recallQueryMaxChars,
+            userName: cfg.agents[agentId]?.user,
+            assistantName: cfg.agents[agentId]?.assistant,
           },
         );
         if (!query) return;

@@ -80,6 +80,8 @@ export type RecallQueryOptions = {
   historyMaxMessages: number;
   historyMaxChars: number;
   maxChars: number;
+  userName?: string;
+  assistantName?: string;
 };
 
 export type RecallBlockResult = {
@@ -166,8 +168,17 @@ function keepTail(text: string, maxChars: number): string {
   return text.slice(-maxChars).trimStart();
 }
 
-function formatRecallMessage(message: ConversationMessage): string {
-  return `[${message.role}] ${message.text}`;
+function formatRecallMessage(
+  message: ConversationMessage,
+  userName?: string,
+  assistantName?: string,
+): string {
+  const name =
+    message.role === "user"
+      ? userName ?? "user"
+      : assistantName ?? "assistant";
+
+  return `[${name}] ${message.text}`;
 }
 
 function prepareRecallHistory(
@@ -175,6 +186,8 @@ function prepareRecallHistory(
   maxMessages: number,
   maxChars: number,
   currentPrompt: string,
+  userName?: string,
+  assistantName?: string,
 ): string {
   const conversation = extractConversationMessages(messages).slice(-maxMessages);
   if (
@@ -184,7 +197,9 @@ function prepareRecallHistory(
   ) {
     conversation.pop();
   }
-  const history = conversation.map(formatRecallMessage).join("\n");
+  const history = conversation
+    .map((message) => formatRecallMessage(message, userName, assistantName))
+    .join("\n");
   return keepTail(history, maxChars).trim();
 }
 
@@ -205,6 +220,8 @@ export function buildRecallQuery(
     options.historyMaxMessages,
     options.historyMaxChars,
     currentPrompt,
+    options.userName,
+    options.assistantName,
   );
   const combined = history
     ? `${history}\n[user] ${currentPrompt}`

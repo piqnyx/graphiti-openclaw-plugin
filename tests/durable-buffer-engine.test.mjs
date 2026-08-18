@@ -74,6 +74,60 @@ test("later batches keep entering disk FIFO while the provider head is stuck", a
   assert.deepEqual(started.slice(1), Array.from({ length: 25 }, (_, i) => `queued-${i}`));
 });
 
+test("switching dialogs keeps separate active buffers and detaches each into its own saga payload", async (t) => {
+  const root = withRoot(t);
+  const delivered = [];
+  const engine = new DurableBufferEngine(root, actors, 3, 30, async (_agentId, entry) => {
+    delivered.push({
+      sessionKey: entry.buffer.sessionKey,
+      messages: entry.buffer.messages.map((message) => message.text),
+    });
+  });
+  t.after(() => engine.shutdown(500));
+
+  engine.ingest("main", "fishing", [{ role: "user", text: "коплю на лодку" }], watermark("main", "fishing", 1));
+  engine.ingest(
+    "main",
+    "work",
+    [
+      { role: "user", text: "заработал денег" },
+      { role: "assistant", text: "отлично" },
+    ],
+    watermark("main", "work", 2),
+  );
+
+  assert.equal(engine.activeBufferCount("main"), 2, "dialog switch must not replace the other dialog's partial buffer");
+  assert.equal(delivered.length, 0);
+
+  engine.ingest(
+    "main",
+    "fishing",
+    [
+      { role: "assistant", text: "лодка подождёт" },
+      { role: "user", text: "продолжаю копить" },
+    ],
+    watermark("main", "fishing", 3),
+  );
+  await waitFor(() => delivered.length === 1);
+  assert.deepEqual(delivered[0], {
+    sessionKey: "fishing",
+    messages: ["коплю на лодку", "лодка подождёт", "продолжаю копить"],
+  });
+  assert.equal(engine.activeBufferCount("main"), 1, "work dialog must remain open after fishing detaches");
+
+  engine.ingest(
+    "main",
+    "work",
+    [{ role: "user", text: "теперь хватит на покупку" }],
+    watermark("main", "work", 3),
+  );
+  await waitFor(() => delivered.length === 2);
+  assert.deepEqual(delivered[1], {
+    sessionKey: "work",
+    messages: ["заработал денег", "отлично", "теперь хватит на покупку"],
+  });
+});
+
 test("sessions share one agent FIFO but different agents drain independently", async (t) => {
   const root = withRoot(t);
   let releaseMain;

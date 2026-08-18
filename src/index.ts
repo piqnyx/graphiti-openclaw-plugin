@@ -1,6 +1,9 @@
-import { createCapturePipeline, type CapturePipeline } from "./capture-pipeline.js";
+import {
+  createCapturePipeline,
+  resolveDurableCaptureRoot,
+  type CapturePipeline,
+} from "./capture-pipeline.js";
 import { acquireCaptureRuntime } from "./capture-runtime.js";
-import { resolveCaptureSpoolPath } from "./capture-spool.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
@@ -54,7 +57,7 @@ export function register(api: OpenClawPluginApi): void {
 
   if (cfg.autoCapture) {
     const acquired = acquireCaptureRuntime<CapturePipeline>({
-      fingerprint: JSON.stringify({ cfg, spool: resolveCaptureSpoolPath() }),
+      fingerprint: JSON.stringify({ cfg, durableRoot: resolveDurableCaptureRoot() }),
       isStopped: (candidate) => candidate.engine.isStopped(),
       create: () => createCapturePipeline({ api, cfg, logger, excludedSessionPatterns }),
     });
@@ -250,30 +253,18 @@ export function register(api: OpenClawPluginApi): void {
     });
   }
 
-  const restored = capture?.restoredCaptureState;
-  const restoredMessages = restored
-    ? restored.agents.reduce(
-        (sum, agent) =>
-          sum +
-          agent.activeBuffers.reduce((inner, buffer) => inner + buffer.messages.length, 0) +
-          agent.queue.reduce((inner, entry) => inner + entry.buffer.messages.length, 0),
-        0,
-      )
-    : 0;
-
   logger.info("plugin_loaded", {
     autoCapture: cfg.autoCapture,
     autoRecall: cfg.autoRecall,
-    captureMode: cfg.autoCapture ? "durable_fifo_v4" : "disabled",
+    captureMode: cfg.autoCapture ? "segmented_durable_fifo_v1" : "disabled",
     captureRuntime: captureOutcome,
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
-    captureDurableSpool: Boolean(capture),
-    captureSpoolPath: capture?.captureSpool.path,
+    captureDurableQueue: Boolean(capture),
+    captureRoot: capture?.durableRoot,
     captureLeasePath: capture?.captureLease.path,
     excludeSessionPatterns: cfg.excludeSessionPatterns,
     agentTools: cfg.agentTools && Boolean(api.registerTool),
-    restoredCaptureMessages: restoredMessages,
     agents: Object.entries(cfg.agents).map(
       ([agentId, actors]) => `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
     ),

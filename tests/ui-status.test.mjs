@@ -33,6 +33,13 @@ function completedTurn(n) {
   };
 }
 
+function completedTranscript(turns) {
+  return {
+    success: true,
+    messages: Array.from({ length: turns }, (_, index) => completedTurn(index + 1).messages).flat(),
+  };
+}
+
 function installDefinitiveGraphitiFailure(t) {
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -57,8 +64,6 @@ function installDefinitiveGraphitiFailure(t) {
       const groupId = payload.params.arguments.group_id;
       result = { error: `No saga named '${sagaName}' found in group '${groupId}'` };
     } else if (payload.params.name === "add_memory") {
-      // A structured tool error is definitive. Unlike a broken HTTP connection,
-      // it is safe to surface immediately because there is no ambiguous mutation.
       result = { error: "simulated definitive Graphiti rejection" };
     } else {
       throw new Error(`unexpected tool ${payload.params.name}`);
@@ -150,7 +155,7 @@ test("definitive capture failures publish error-only plugin session status", asy
   const sessionKey = "agent:main:web:status-test";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
   hooks.get("agent_end")(completedTurn(1), ctx);
-  hooks.get("agent_end")(completedTurn(2), ctx);
+  hooks.get("agent_end")(completedTranscript(2), ctx);
 
   await waitFor(() => patches.length === 1);
   const status = patches[0].entry.pluginExtensions["graphiti-openclaw-plugin"]["capture-status"];
@@ -168,7 +173,7 @@ test("session status write failures never escape into capture control flow", asy
 
   const ctx = { agentId: "main", sessionKey: "agent:main:web:status-failure", trigger: "user" };
   hooks.get("agent_end")(completedTurn(1), ctx);
-  hooks.get("agent_end")(completedTurn(2), ctx);
+  hooks.get("agent_end")(completedTranscript(2), ctx);
 
   await waitFor(() => logs.some((line) => line.includes("event=capture_ui_status_failed")));
   assert.ok(logs.some((line) => line.includes("event=capture_flush_failed")));

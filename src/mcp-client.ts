@@ -319,10 +319,8 @@ export class GraphitiMcpClient {
 
     const saga = await this.getSaga(params.saga, params.groupId);
     if (!saga) return false;
-    if (!saga.integrityOk || saga.chainCount !== saga.episodeCount) {
-      throw new McpToolResultError(
-        `Graphiti Saga ${params.groupId}/${params.saga} failed integrity validation: ${saga.integrityErrors.join("; ") || "unknown chain error"}`,
-      );
+    if (!saga.integrityOk || saga.chainCount !== undefined && saga.chainCount !== saga.episodeCount) {
+      return false;
     }
     if (saga.lastEpisodeUuid !== params.uuid) return false;
     if (params.previousEpisodeUuids.length === 0 && saga.firstEpisodeUuid !== params.uuid) return false;

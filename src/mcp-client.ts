@@ -35,6 +35,8 @@ export type QueueStatus = {
   pending: number;
   workerRunning?: boolean;
   lastError?: string;
+  failureKind?: string;
+  retryInSeconds?: number;
   episodeUuid?: string;
   episodeName?: string;
   saga?: string;
@@ -147,6 +149,10 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
+function optionalNonnegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function requiredNonnegativeInteger(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new McpToolResultError(`Graphiti returned invalid ${field}`);
@@ -207,9 +213,10 @@ export class GraphitiMcpClient {
    * Deliver one durable FIFO head and return only after a structurally valid Saga
    * reports that exact UUID as its committed tail.
    *
-   * The call may wait for hours through provider outages. The caller's queue head
-   * remains on disk during that entire time. A lost HTTP response never triggers
-   * a blind replay: graph state and server queue ownership are observed first.
+   * First handoff is immediate. MCP is local and is not a reason to preflight the
+   * graph or sleep before enqueueing ordinary work. Only an ambiguous post-send
+   * transport outcome enters the observation/grace path before the same UUID may
+   * be submitted again. The durable caller keeps the head on disk the whole time.
    */
   async addMemory(params: {
     uuid: string;
@@ -236,8 +243,22 @@ export class GraphitiMcpClient {
     if (params.saga) args.saga = params.saga;
     if (params.sagaPreviousEpisodeUuid) args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
 
+    // Initialization is a local prerequisite, not an ambiguous mutation. If MCP is
+    // actually down, fail promptly and let the durable outer queue retry later.
+    await this.ensureInitialized();
+
     let lastSubmissionResult: JsonObject = {};
-    let lastSubmissionAt = 0;
+    let lastSubmissionAt = Date.now();
+    try {
+      lastSubmissionResult = await this.callToolOnce("add_memory", args);
+      if (typeof lastSubmissionResult.error === "string") {
+        throw new McpToolResultError(lastSubmissionResult.error);
+      }
+    } catch (error) {
+      if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
+      // The request may have reached add_memory before the transport failed. Never
+      // turn that uncertainty into an immediate duplicate. Observe graph/queue state.
+    }
 
     while (true) {
       this.assertOpen();
@@ -247,8 +268,6 @@ export class GraphitiMcpClient {
         }
       } catch (error) {
         if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
-        // Read visibility is required before any retry decision. During an outage
-        // we wait rather than turning uncertainty into a duplicate side effect.
         await cancellableSleep(this.deliveryPollMs, this.lifecycle.signal);
         continue;
       }
@@ -264,13 +283,12 @@ export class GraphitiMcpClient {
 
       const activeHere = status.episodeUuid === params.uuid;
       const queuedHere = status.queuedEpisodeUuids.includes(params.uuid);
-      // A queued UUID with no worker is not ownership, it is stranded RAM. The
-      // server normally self-heals this in get_queue_status; treating the broken
-      // answer as absent lets the idempotent server submission kick it again after
-      // the ambiguity grace instead of waiting forever.
+      // A queued UUID with no worker is stranded RAM rather than useful ownership.
+      // The server normally self-heals this in get_queue_status; after the ambiguity
+      // grace, re-submitting the same UUID is the safe kick if it remains stranded.
       const backendOwnsUuid = activeHere || (queuedHere && status.workerRunning !== false);
       const submissionOldEnough =
-        lastSubmissionAt === 0 || Date.now() - lastSubmissionAt >= this.deliveryResubmitGraceMs;
+        Date.now() - lastSubmissionAt >= this.deliveryResubmitGraceMs;
 
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
@@ -280,8 +298,7 @@ export class GraphitiMcpClient {
           }
         } catch (error) {
           if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
-          // Ambiguous transport outcome. Record that an attempt happened and
-          // observe graph/queue state for the whole grace period before retrying.
+          // Same ambiguity rule on a later kick: wait and observe before another.
         }
         lastSubmissionAt = Date.now();
       }
@@ -343,6 +360,8 @@ export class GraphitiMcpClient {
       pending: requiredNonnegativeInteger(result.pending, "pending"),
       workerRunning: typeof result.worker_running === "boolean" ? result.worker_running : undefined,
       lastError: optionalString(result.last_error),
+      failureKind: optionalString(result.failure_kind),
+      retryInSeconds: optionalNonnegativeNumber(result.retry_in_seconds),
       episodeUuid: optionalString(result.episode_uuid),
       episodeName: optionalString(result.episode_name),
       saga: optionalString(result.saga),

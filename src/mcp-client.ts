@@ -292,6 +292,9 @@ export class GraphitiMcpClient {
 
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
+          if (await this.episodeCommitted(params)) {
+            return lastSubmissionResult;
+          }
           lastSubmissionResult = await this.callToolOnce("add_memory", args);
           if (typeof lastSubmissionResult.error === "string") {
             throw new McpToolResultError(lastSubmissionResult.error);
@@ -319,7 +322,7 @@ export class GraphitiMcpClient {
 
     const saga = await this.getSaga(params.saga, params.groupId);
     if (!saga) return false;
-    if (!saga.integrityOk || saga.chainCount !== undefined && saga.chainCount !== saga.episodeCount) {
+    if (!saga.integrityOk) {
       return false;
     }
     if (saga.lastEpisodeUuid !== params.uuid) return false;

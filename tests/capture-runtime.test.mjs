@@ -48,6 +48,13 @@ function installFetch(t) {
         result: { structuredContent: { result: { message: "queued", uuid: args.uuid } } },
       });
     }
+    if (name === "get_episodes_by_ref") {
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: { structuredContent: { result: { episodes: [] } } },
+      });
+    }
     throw new Error(`unexpected tool ${name}`);
   };
   return calls;
@@ -103,7 +110,6 @@ test("repeated registrations in one process share one capture pipeline", async (
   const calls = installFetch(t);
   const dir = join(stateRoot, "shared");
 
-  // OpenClaw registers the plugin once per host surface.
   const first = registerRuntime(dir);
   const second = registerRuntime(dir);
   const third = registerRuntime(dir);
@@ -111,7 +117,6 @@ test("repeated registrations in one process share one capture pipeline", async (
   assert.equal(second.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0,
     "a reused pipeline is not announced as new");
 
-  // Two messages through one surface, two through another: one buffer, one batch.
   first.hooks.get("agent_end")(turn(1), ctx);
   third.hooks.get("agent_end")(
     { success: true, messages: [...turn(1).messages, ...turn(2).messages] },
@@ -131,14 +136,11 @@ test("a restart with unsent messages flushes the restored buffer exactly once", 
   const dir = join(stateRoot, "restore-once");
   const firstCalls = installFetch(t);
 
-  // Leave two messages unsent, then stop.
   const before = registerRuntime(dir, { bufferLimit: 6 });
   before.hooks.get("agent_end")(turn(1), ctx);
   await before.hooks.get("gateway_stop")();
   assert.equal(firstCalls.filter((c) => c.name === "add_memory").length, 0);
 
-  // New process: several registrations, and the restored buffer is already idle,
-  // so every engine that owned it would flush it on resume.
   resetCaptureRuntimeForTests();
   const calls = installFetch(t);
   const restored = [
@@ -173,8 +175,6 @@ test("a stopped pipeline is replaced rather than reused", async (t) => {
   const first = registerRuntime(dir);
   await first.hooks.get("gateway_stop")();
 
-  // A hot reload after the host stopped the previous surface must not inherit a
-  // dead engine: capture would silently stop working.
   const second = registerRuntime(dir);
   assert.ok(second.logs.some((l) => l.includes('event=capture_pipeline outcome="replaced_stopped"')));
 
@@ -186,14 +186,20 @@ test("a stopped pipeline is replaced rather than reused", async (t) => {
   await second.hooks.get("gateway_stop")();
 });
 
-test("a different configuration gets its own pipeline", (t) => {
+test("hot reconfiguration cannot create a second live spool owner", async (t) => {
   resetCaptureRuntimeForTests();
   installFetch(t);
   const dir = join(stateRoot, "reconfigured");
 
-  registerRuntime(dir, { bufferLimit: 4 });
+  const first = registerRuntime(dir, { bufferLimit: 4 });
   const changed = registerRuntime(dir, { bufferLimit: 9 });
-  assert.ok(changed.logs.some((l) => l.includes('outcome="replaced_reconfigured"')));
+  assert.ok(changed.logs.some((l) => l.includes('outcome="reused_config_mismatch"')));
+
+  // The old runtime remains the only owner until it is explicitly stopped.
+  await first.hooks.get("gateway_stop")();
+  const afterStop = registerRuntime(dir, { bufferLimit: 9 });
+  assert.ok(afterStop.logs.some((l) => l.includes('outcome="replaced_reconfigured"')));
+  await afterStop.hooks.get("gateway_stop")();
 });
 
 test("one spool holds several agents without their data ever meeting", async (t) => {
@@ -201,7 +207,6 @@ test("one spool holds several agents without their data ever meeting", async (t)
   const dir = join(stateRoot, "multi-agent");
   const before = installFetch(t);
 
-  // Two agents talk through the same process; neither is flushed yet.
   const gateway = registerRuntime(dir, { bufferLimit: 6 });
   gateway.hooks.get("agent_end")(
     { success: true, messages: [{ role: "user", content: "секрет вита" }] },
@@ -214,7 +219,6 @@ test("one spool holds several agents without their data ever meeting", async (t)
   await gateway.hooks.get("gateway_stop")();
   assert.deepEqual(before.filter((c) => c.name === "add_memory"), []);
 
-  // Restart: both survive, and each one flushes into its own group only.
   resetCaptureRuntimeForTests();
   const calls = installFetch(t);
   const after = registerRuntime(dir, { bufferLimit: 2, bufferTimeout: 30 });

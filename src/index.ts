@@ -6,15 +6,15 @@ import {
   type EpisodeJson,
   type PersistedAgentCaptureState,
 } from "./buffer.js";
+import { CaptureLease } from "./capture-lease.js";
 import { acquireCaptureRuntime } from "./capture-runtime.js";
 import { CaptureSpool, resolveCaptureSpoolPath, type CaptureSpoolState } from "./capture-spool.js";
 import { DEFAULT_ACTORS, parseConfig, type GraphitiPluginConfig } from "./config.js";
-import { EpisodeSequenceTracker } from "./episode-sequence.js";
-import { PendingConfirmationTracker, sequenceKey } from "./pending-confirmation.js";
+import { deriveEpisodeUuid, episodeNamePrefix, EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { compileSessionPatterns, matchSessionExclusion } from "./session-filter.js";
-import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION, type SagaState } from "./mcp-client.js";
+import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION, type QueueStatus, type SagaState } from "./mcp-client.js";
 import {
   buildRecallBlockDetailed,
   buildRecallQuery,
@@ -23,7 +23,7 @@ import {
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
 import { createGraphitiTools } from "./tools.js";
-import { TranscriptDeltaTracker } from "./transcript-delta.js";
+import { TranscriptCursorError, TranscriptDeltaTracker } from "./transcript-delta.js";
 import type {
   AgentEndEvent,
   BeforePromptBuildEvent,
@@ -46,6 +46,28 @@ const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
 const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
 const GATEWAY_STOP_HOOK_TIMEOUT_MS = 4_500;
 
+type CaptureFailureReason = "limit" | "timeout" | "cursor" | "durability";
+
+type StatusHost = {
+  patchSessionEntry?: NonNullable<
+    NonNullable<NonNullable<OpenClawPluginApi["runtime"]>["agent"]>["session"]
+  >["patchSessionEntry"];
+};
+
+type CapturePipeline = {
+  client: GraphitiMcpClient;
+  transcriptDeltas: TranscriptDeltaTracker;
+  captureSpool: CaptureSpool | undefined;
+  captureLease: CaptureLease | undefined;
+  engine: BufferEngine;
+  statusHost: StatusHost;
+  queueHealthTimer: ReturnType<typeof setInterval> | undefined;
+  restoredCaptureState: CaptureSpoolState | undefined;
+  lastSessionByAgent: Map<string, string>;
+  unconfiguredAgentsReported: Set<string>;
+  lastQueueStatusByAgent: Map<string, QueueStatus>;
+};
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -59,18 +81,14 @@ function requireSessionKey(value: unknown): string {
 
 function acceptedEpisodeUuid(result: Record<string, unknown>): string {
   if (typeof result.error === "string") throw new Error(result.error);
+  if (result.persisted !== true) {
+    throw new Error("Graphiti delivery returned before the episode was proven committed");
+  }
   if (typeof result.uuid !== "string" || result.uuid.trim() === "") {
-    throw new Error("Graphiti add_memory accepted response did not contain episode uuid");
+    throw new Error("Graphiti committed response did not contain episode uuid");
   }
   return result.uuid;
 }
-
-/** The host surface used for best-effort session status; replaced by the newest registration. */
-type StatusHost = {
-  patchSessionEntry?: NonNullable<
-    NonNullable<NonNullable<OpenClawPluginApi["runtime"]>["agent"]>["session"]
-  >["patchSessionEntry"];
-};
 
 function captureSnapshotStats(snapshot: { agents: PersistedAgentCaptureState[] } | undefined): {
   agents: number;
@@ -91,6 +109,10 @@ function captureSnapshotStats(snapshot: { agents: PersistedAgentCaptureState[] }
   return { agents: snapshot.agents.length, activeBuffers, queuedEntries, messages };
 }
 
+function expectedEpisodeName(sessionKey: string, batchNumber: number): string {
+  return `${episodeNamePrefix(sessionKey)}-${batchNumber}`;
+}
+
 export function register(api: OpenClawPluginApi): void {
   let cfg: GraphitiPluginConfig;
   try {
@@ -102,22 +124,7 @@ export function register(api: OpenClawPluginApi): void {
 
   const logger = createGraphitiLogger(api.logger, cfg);
   const excludedSessionPatterns = compileSessionPatterns(cfg.excludeSessionPatterns);
-  type CapturePipeline = {
-    client: GraphitiMcpClient;
-    transcriptDeltas: TranscriptDeltaTracker;
-    captureSpool: CaptureSpool | undefined;
-    engine: BufferEngine;
-    statusHost: StatusHost;
-    pendingConfirmation: PendingConfirmationTracker;
-    queueHealthTimer: ReturnType<typeof setInterval> | undefined;
-    restoredCaptureState: CaptureSpoolState | undefined;
-    lastSessionByAgent: Map<string, string>;
-    unconfiguredAgentsReported: Set<string>;
-  };
 
-  // Built once per process. See capture-runtime.ts: one BufferEngine may own the
-  // durable spool, or a restart with unsent messages hands the same buffer to
-  // every registration and each one flushes it.
   const buildPipeline = (): CapturePipeline => {
     const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs, (kind, body) => {
       logger.debugContent(
@@ -127,771 +134,648 @@ export function register(api: OpenClawPluginApi): void {
       );
     });
     const sequences = new EpisodeSequenceTracker();
-    const pendingConfirmation = new PendingConfirmationTracker();
     const transcriptDeltas = new TranscriptDeltaTracker();
     const lastSessionByAgent = new Map<string, string>();
     const unconfiguredAgentsReported = new Set<string>();
     const backendReportedSessionByAgent = new Map<string, string>();
     const backendFingerprintByAgent = new Map<string, string>();
-
+    const lastQueueStatusByAgent = new Map<string, QueueStatus>();
     const statusHost: StatusHost = {};
+
     const captureSpool = cfg.autoCapture ? new CaptureSpool() : undefined;
+    const captureLease = captureSpool ? new CaptureLease(captureSpool.path) : undefined;
     let restoredCaptureState: CaptureSpoolState | undefined;
-    let restoredWatermarks = 0;
-    if (captureSpool) {
-      try {
-        restoredCaptureState = captureSpool.load();
-      } catch (error) {
-        logger.error("capture_spool_load_failed", {
-          path: captureSpool.path,
-          error: errorText(error),
-          action: "startup_aborted_to_preserve_spool",
-        });
-        throw error;
-      }
-      if (restoredCaptureState) {
-        restoredWatermarks = transcriptDeltas.restore(restoredCaptureState.sessions);
-        pendingConfirmation.restore(restoredCaptureState.pending);
-      }
-      const restored = captureSnapshotStats(restoredCaptureState);
-      if (restored.messages > 0 || restoredWatermarks > 0) {
-        logger.info("capture_spool_restored", {
-          path: captureSpool.path,
-          ...restored,
-          sessionWatermarks: restoredWatermarks,
+    let engine!: BufferEngine;
+    let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
+
+    try {
+      if (captureLease) {
+        captureLease.acquire();
+        logger.info("capture_spool_lease_acquired", {
+          path: captureLease.path,
+          pid: process.pid,
         });
       }
-    }
 
-    api.session?.state?.registerSessionExtension({
-      namespace: CAPTURE_STATUS_NAMESPACE,
-      description: "Graphiti auto-capture transport error state for this OpenClaw session",
-      project: ({ state }) => state,
-    });
-    api.session?.state?.registerSessionExtension({
-      namespace: BACKEND_STATUS_NAMESPACE,
-      description: "Graphiti asynchronous backend queue error state for this OpenClaw session",
-      project: ({ state }) => state,
-    });
-    api.session?.controls?.registerControlUiDescriptor({
-      id: CAPTURE_STATUS_DESCRIPTOR_ID,
-      surface: "session",
-      label: "Graphiti capture",
-      description: "Shows Graphiti capture transport failures for the current session",
-      schema: {
-        type: "object",
-        properties: {
-          status: { const: "error" },
-          message: { type: "string" },
-          error: { type: "string" },
-          reason: { enum: ["limit", "timeout"] },
-          retryIntervalSeconds: { type: "integer" },
-          occurredAt: { type: "string" },
-        },
-        required: ["status", "message", "reason", "retryIntervalSeconds", "occurredAt"],
-      },
-    });
-    api.session?.controls?.registerControlUiDescriptor({
-      id: BACKEND_STATUS_DESCRIPTOR_ID,
-      surface: "session",
-      label: "Graphiti backend",
-      description: "Shows terminal Graphiti backend processing or health failures",
-      schema: {
-        type: "object",
-        properties: {
-          status: { const: "error" },
-          source: { enum: ["backend_queue", "backend_health"] },
-          message: { type: "string" },
-          error: { type: "string" },
-          attempts: { type: "integer" },
-          pending: { type: "integer" },
-          episodeUuid: { type: "string" },
-          episodeName: { type: "string" },
-          occurredAt: { type: "string" },
-        },
-        required: ["status", "source", "message", "occurredAt"],
-      },
-    });
+      let restoredWatermarks = 0;
+      if (captureSpool) {
+        try {
+          restoredCaptureState = captureSpool.load();
+        } catch (error) {
+          logger.error("capture_spool_load_failed", {
+            path: captureSpool.path,
+            error: errorText(error),
+            action: "startup_aborted_to_preserve_spool",
+          });
+          throw error;
+        }
+        if (restoredCaptureState) {
+          restoredWatermarks = transcriptDeltas.restore(restoredCaptureState.sessions);
+        }
+        const restored = captureSnapshotStats(restoredCaptureState);
+        if (restored.messages > 0 || restoredWatermarks > 0) {
+          logger.info("capture_spool_restored", {
+            path: captureSpool.path,
+            ...restored,
+            sessionWatermarks: restoredWatermarks,
+          });
+        }
+      }
 
-    const patchSessionStatus = async (
-      agentId: string,
-      sessionKey: string,
-      namespace: string,
-      value: PluginJsonValue | undefined,
-    ): Promise<void> => {
-      const patchSessionEntry = statusHost.patchSessionEntry;
-      if (!patchSessionEntry || !sessionKey || agentId === "__tick__") return;
-
-      await patchSessionEntry({
-        agentId,
-        sessionKey,
-        preserveActivity: true,
-        update: (entry) => {
-          const pluginExtensions = { ...(entry.pluginExtensions ?? {}) };
-          const pluginState = { ...(pluginExtensions[id] ?? {}) };
-          if (value === undefined) {
-            delete pluginState[namespace];
-          } else {
-            pluginState[namespace] = value;
-          }
-          if (Object.keys(pluginState).length > 0) {
-            pluginExtensions[id] = pluginState;
-          } else {
-            delete pluginExtensions[id];
-          }
-          return {
-            pluginExtensions:
-              Object.keys(pluginExtensions).length > 0 ? pluginExtensions : undefined,
-          };
+      api.session?.state?.registerSessionExtension({
+        namespace: CAPTURE_STATUS_NAMESPACE,
+        description: "Graphiti durable capture error state for this OpenClaw session",
+        project: ({ state }) => state,
+      });
+      api.session?.state?.registerSessionExtension({
+        namespace: BACKEND_STATUS_NAMESPACE,
+        description: "Graphiti asynchronous backend processing error state for this OpenClaw session",
+        project: ({ state }) => state,
+      });
+      api.session?.controls?.registerControlUiDescriptor({
+        id: CAPTURE_STATUS_DESCRIPTOR_ID,
+        surface: "session",
+        label: "Graphiti capture",
+        description: "Shows durable capture or transcript cursor failures for the current session",
+        schema: {
+          type: "object",
+          properties: {
+            status: { const: "error" },
+            message: { type: "string" },
+            error: { type: "string" },
+            reason: { enum: ["limit", "timeout", "cursor", "durability"] },
+            retryIntervalSeconds: { type: "integer" },
+            occurredAt: { type: "string" },
+          },
+          required: ["status", "message", "reason", "retryIntervalSeconds", "occurredAt"],
         },
       });
-    };
+      api.session?.controls?.registerControlUiDescriptor({
+        id: BACKEND_STATUS_DESCRIPTOR_ID,
+        surface: "session",
+        label: "Graphiti backend",
+        description: "Shows provider/backend retries or health failures",
+        schema: {
+          type: "object",
+          properties: {
+            status: { const: "error" },
+            source: { enum: ["backend_queue", "backend_health"] },
+            message: { type: "string" },
+            error: { type: "string" },
+            attempts: { type: "integer" },
+            pending: { type: "integer" },
+            episodeUuid: { type: "string" },
+            episodeName: { type: "string" },
+            occurredAt: { type: "string" },
+          },
+          required: ["status", "source", "message", "occurredAt"],
+        },
+      });
 
-    const publishCaptureError = (
-      agentId: string,
-      sessionKey: string,
-      reason: "limit" | "timeout",
-      error: Error,
-    ): void => {
-      const value: PluginJsonValue = {
-        status: "error",
-        message: "Graphiti capture failed; batch retained for automatic retry",
-        error: errorText(error),
-        reason,
-        retryIntervalSeconds: CHECK_INTERVAL_SEC,
-        occurredAt: new Date().toISOString(),
+      const patchSessionStatus = async (
+        agentId: string,
+        sessionKey: string,
+        namespace: string,
+        value: PluginJsonValue | undefined,
+      ): Promise<void> => {
+        const patchSessionEntry = statusHost.patchSessionEntry;
+        if (!patchSessionEntry || !sessionKey || agentId === "__tick__") return;
+        await patchSessionEntry({
+          agentId,
+          sessionKey,
+          preserveActivity: true,
+          update: (entry) => {
+            const pluginExtensions = { ...(entry.pluginExtensions ?? {}) };
+            const pluginState = { ...(pluginExtensions[id] ?? {}) };
+            if (value === undefined) delete pluginState[namespace];
+            else pluginState[namespace] = value;
+            if (Object.keys(pluginState).length > 0) pluginExtensions[id] = pluginState;
+            else delete pluginExtensions[id];
+            return {
+              pluginExtensions:
+                Object.keys(pluginExtensions).length > 0 ? pluginExtensions : undefined,
+            };
+          },
+        });
       };
-      void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, value).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "publish_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
 
-    const clearCaptureError = (agentId: string, sessionKey: string): void => {
-      void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, undefined).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "clear_recovered_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
-
-    const publishBackendError = (
-      agentId: string,
-      sessionKey: string,
-      value: PluginJsonValue,
-    ): void => {
-      void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, value).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "publish_backend_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
-
-    const clearBackendError = (agentId: string, sessionKey: string): void => {
-      void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, undefined).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "clear_backend_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
-
-    const pollBackendQueueStatus = async (): Promise<void> => {
-      for (const agentId of Object.keys(cfg.agents)) {
-        try {
-          const status = await client.getQueueStatus(agentId);
-          if (status.groupId !== agentId) {
-            throw new Error(
-              `Graphiti get_queue_status identity mismatch: requested ${agentId}, got ${status.groupId}`,
-            );
-          }
-
-          if (status.blocked) {
-            const sessionKey = status.saga ?? lastSessionByAgent.get(agentId);
-            const fingerprint = `blocked:${status.episodeUuid ?? ""}:${status.attempts}:${status.lastError ?? ""}`;
-            const previousSession = backendReportedSessionByAgent.get(agentId);
-            if (previousSession && sessionKey && previousSession !== sessionKey) {
-              clearBackendError(agentId, previousSession);
-            }
-
-            if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
-              publishBackendError(agentId, sessionKey, {
-                status: "error",
-                source: "backend_queue",
-                message: `Graphiti backend queue is blocked after ${status.attempts} failed attempts; memory persistence for this agent is stopped`,
-                error: status.lastError ?? "unknown backend processing error",
-                attempts: status.attempts,
-                pending: status.pending,
-                episodeUuid: status.episodeUuid ?? "",
-                episodeName: status.episodeName ?? "",
-                occurredAt: new Date().toISOString(),
-              });
-              backendReportedSessionByAgent.set(agentId, sessionKey);
-              backendFingerprintByAgent.set(agentId, fingerprint);
-              logger.error("capture_backend_blocked", {
-                agentId,
-                group_id: agentId,
-                saga: sessionKey,
-                uuid: status.episodeUuid,
-                name: status.episodeName,
-                attempts: status.attempts,
-                pending: status.pending,
-                error: status.lastError,
-                uiNotification: "session_status",
-              });
-            }
-            continue;
-          }
-
-          const previousSession = backendReportedSessionByAgent.get(agentId);
-          if (previousSession) {
-            clearBackendError(agentId, previousSession);
-            logger.info("capture_backend_recovered", {
-              agentId,
-              group_id: agentId,
-              saga: previousSession,
-            });
-          }
-          backendReportedSessionByAgent.delete(agentId);
-          backendFingerprintByAgent.delete(agentId);
-        } catch (error) {
-          const previousFingerprint = backendFingerprintByAgent.get(agentId);
-          if (previousFingerprint?.startsWith("blocked:")) {
-            logger.warn("capture_backend_healthcheck_failed", {
-              agentId,
-              group_id: agentId,
-              error: errorText(error),
-              preservedStatus: "backend_queue_blocked",
-            });
-            continue;
-          }
-
-          const sessionKey = lastSessionByAgent.get(agentId);
-          const fingerprint = `health:${errorText(error)}`;
-          if (sessionKey && previousFingerprint !== fingerprint) {
-            publishBackendError(agentId, sessionKey, {
-              status: "error",
-              source: "backend_health",
-              message: "Graphiti backend health check failed; memory persistence cannot be verified",
-              error: errorText(error),
-              occurredAt: new Date().toISOString(),
-            });
-            backendReportedSessionByAgent.set(agentId, sessionKey);
-            backendFingerprintByAgent.set(agentId, fingerprint);
-            logger.error("capture_backend_healthcheck_failed", {
+      const publishCaptureError = (
+        agentId: string,
+        sessionKey: string,
+        reason: CaptureFailureReason,
+        error: Error,
+      ): void => {
+        const value: PluginJsonValue = {
+          status: "error",
+          message:
+            reason === "cursor"
+              ? "Graphiti capture stopped for this session because transcript position is ambiguous"
+              : reason === "durability"
+                ? "Graphiti capture cannot make a durable checkpoint; remote delivery is stopped"
+                : "Graphiti capture failed; durable FIFO head retained for automatic retry",
+          error: errorText(error),
+          reason,
+          retryIntervalSeconds: CHECK_INTERVAL_SEC,
+          occurredAt: new Date().toISOString(),
+        };
+        void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, value).catch(
+          (statusError) => {
+            logger.warn("capture_ui_status_failed", {
               agentId,
               group_id: agentId,
               saga: sessionKey,
-              error: errorText(error),
-              uiNotification: "session_status",
+              action: "publish_error",
+              error: errorText(statusError),
             });
-          }
+          },
+        );
+      };
+
+      const clearCaptureError = (agentId: string, sessionKey: string): void => {
+        void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, undefined).catch(
+          (statusError) => {
+            logger.warn("capture_ui_status_failed", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              action: "clear_capture_error",
+              error: errorText(statusError),
+            });
+          },
+        );
+      };
+
+      const publishBackendError = (
+        agentId: string,
+        sessionKey: string,
+        value: PluginJsonValue,
+      ): void => {
+        void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, value).catch(
+          (statusError) => {
+            logger.warn("capture_ui_status_failed", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              action: "publish_backend_error",
+              error: errorText(statusError),
+            });
+          },
+        );
+      };
+
+      const clearBackendError = (agentId: string, sessionKey: string): void => {
+        void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, undefined).catch(
+          (statusError) => {
+            logger.warn("capture_ui_status_failed", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              action: "clear_backend_error",
+              error: errorText(statusError),
+            });
+          },
+        );
+      };
+
+      const fetchSagaState = async (
+        agentId: string,
+        sessionKey: string,
+      ): Promise<SagaState | undefined> => {
+        const saga = await client.getSaga(sessionKey, agentId);
+        if (!saga) return undefined;
+        if (saga.groupId !== agentId || saga.name !== sessionKey) {
+          throw new Error(
+            `Graphiti get_saga identity mismatch: requested ${agentId}/${sessionKey}, got ${saga.groupId}/${saga.name}`,
+          );
         }
-      }
-    };
+        if (!saga.integrityOk || saga.chainCount !== saga.episodeCount) {
+          throw new Error(
+            `Graphiti saga ${agentId}/${sessionKey} is structurally invalid: ${saga.integrityErrors.join("; ") || "chain count mismatch"}`,
+          );
+        }
+        if (saga.episodeCount > 0 && (!saga.firstEpisodeUuid || !saga.lastEpisodeUuid)) {
+          throw new Error(
+            `Graphiti saga ${agentId}/${sessionKey} has ${saga.episodeCount} episodes but incomplete first/last pointers`,
+          );
+        }
+        return saga;
+      };
 
-    const fetchSagaState = async (agentId: string, sessionKey: string): Promise<SagaState | undefined> => {
-      const saga = await client.getSaga(sessionKey, agentId);
-      if (!saga) return undefined;
-
-      if (saga.groupId !== agentId || saga.name !== sessionKey) {
-        throw new Error(
-          `Graphiti get_saga identity mismatch: requested ${agentId}/${sessionKey}, got ${saga.groupId}/${saga.name}`,
+      const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
+        if (sequences.isHydrated(agentId, sessionKey)) return;
+        const saga = await fetchSagaState(agentId, sessionKey);
+        sequences.hydrate(
+          agentId,
+          sessionKey,
+          saga?.episodeCount ?? 0,
+          saga?.lastEpisodeUuid,
         );
-      }
-      if (saga.episodeCount > 0 && !saga.lastEpisodeUuid) {
-        throw new Error(
-          `Graphiti saga ${agentId}/${sessionKey} has ${saga.episodeCount} episodes but no last_episode_uuid`,
-        );
-      }
-      return saga;
-    };
+        logger.debug("capture_sequence_hydrated", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          episodeCount: saga?.episodeCount ?? 0,
+          lastEpisodeUuid: saga?.lastEpisodeUuid,
+          integrity: saga?.integrityOk ?? true,
+        });
+      };
 
-    /**
-     * The batch number to continue from, never lower than one already issued.
-     *
-     * Graphiti's episode count reflects what it has *processed*, and processing
-     * lags acceptance — by seconds when healthy, by half an hour when the model
-     * is unreachable. Trusting it alone after a restart handed number 22 to a
-     * second, different batch while the first was still in the queue, leaving one
-     * dialog with two episodes of that name. What this process already issued is
-     * on the confirmation ledger, and it survives the restart with it.
-     */
-    const resumeFrom = (
-      agentId: string,
-      sessionKey: string,
-      saga: SagaState | undefined,
-    ): { acceptedBatches: number; lastEpisodeUuid?: string } => {
-      const fromBackend = saga?.episodeCount ?? 0;
-      const issued = pendingConfirmation.highestIssued().get(sequenceKey(agentId, sessionKey));
-      if (!issued || issued.batchNumber <= fromBackend) {
-        return { acceptedBatches: fromBackend, ...(saga?.lastEpisodeUuid ? { lastEpisodeUuid: saga.lastEpisodeUuid } : {}) };
-      }
-      logger.info("capture_sequence_ahead_of_backend", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        backendEpisodes: fromBackend,
-        issued: issued.batchNumber,
-        action: "resumed_from_issued",
-      });
-      // The predecessor comes from the ledger too, and must: taking the number
-      // from one source and the predecessor from another produced a sequence
-      // claiming batches with nothing to chain them to, which the tracker
-      // rightly refused — and capture stopped entirely for that session.
-      //
-      // Chaining to an episode the backend has not stored yet is safe: the edge
-      // is written by MATCH, so it simply does not appear until that episode
-      // does, and appears correctly once the pending batch lands.
-      return { acceptedBatches: issued.batchNumber, lastEpisodeUuid: issued.uuid };
-    };
+      const reconcileRestoredIdentity = async (
+        agentId: string,
+        sessionKey: string,
+        identity: EpisodeIdentity,
+        jsonBody: string,
+      ): Promise<boolean> => {
+        const expectedName = expectedEpisodeName(sessionKey, identity.batchNumber);
+        if (identity.name !== expectedName) {
+          throw new Error(
+            `restored capture identity name mismatch for ${agentId}/${sessionKey}: expected ${expectedName}, got ${identity.name}`,
+          );
+        }
+        const expectedUuid = deriveEpisodeUuid(agentId, sessionKey, identity.batchNumber, jsonBody);
+        if (identity.uuid !== expectedUuid) {
+          throw new Error(
+            `restored capture identity/body mismatch for ${agentId}/${sessionKey} batch ${identity.batchNumber}; refusing to mint or reuse a different episode`,
+          );
+        }
 
-    const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {
-      if (sequences.isHydrated(agentId, sessionKey)) return;
-
-      const saga = await fetchSagaState(agentId, sessionKey);
-      const resume = resumeFrom(agentId, sessionKey, saga);
-      sequences.hydrate(agentId, sessionKey, resume.acceptedBatches, resume.lastEpisodeUuid);
-      logger.debug("capture_sequence_hydrated", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        episodeCount: saga?.episodeCount ?? 0,
-        lastEpisodeUuid: saga?.lastEpisodeUuid,
-        source: "graphiti",
-      });
-    };
-
-    /**
-     * A batch restored from the spool was already submitted once, and the answer to
-     * that submission was lost with the previous process. Ask Graphiti which of the
-     * two happened before doing anything else.
-     *
-     * Returns true when the batch is already persisted and must not be sent again.
-     */
-    const reconcileRestoredBatch = async (
-      agentId: string,
-      sessionKey: string,
-      identity: EpisodeIdentity,
-    ): Promise<boolean> => {
-      if (sequences.isHydrated(agentId, sessionKey)) {
-        // This process already established the sequence for the session, so its
-        // in-memory state is newer than anything get_saga can tell us.
-        const state = sequences.snapshot(agentId, sessionKey);
-        if (state.lastEpisodeUuid === identity.uuid) {
-          logger.info("capture_replay_already_persisted", {
+        const saga = await fetchSagaState(agentId, sessionKey);
+        if (saga?.lastEpisodeUuid === identity.uuid) {
+          if (saga.episodeCount !== identity.batchNumber) {
+            throw new Error(
+              `restored batch ${identity.name} is Saga tail but Saga count is ${saga.episodeCount}; expected ${identity.batchNumber}`,
+            );
+          }
+          sequences.hydrate(agentId, sessionKey, identity.batchNumber, identity.uuid);
+          logger.info("capture_replay_already_committed", {
             agentId,
             group_id: agentId,
             saga: sessionKey,
             name: identity.name,
             batchNumber: identity.batchNumber,
             uuid: identity.uuid,
-            action: "dropped_confirmed_batch",
-            source: "in_memory_sequence",
+            action: "remove_durable_head_without_resubmission",
           });
           return true;
         }
+
+        const predecessorCount = identity.batchNumber - 1;
+        if ((saga?.episodeCount ?? 0) !== predecessorCount) {
+          throw new Error(
+            `restored batch ${identity.name} expects committed predecessor count ${predecessorCount}, but Saga has ${saga?.episodeCount ?? 0}; refusing chronology guess`,
+          );
+        }
+        if (predecessorCount === 0) {
+          if (identity.previousEpisodeUuid !== undefined) {
+            throw new Error(`first restored batch ${identity.name} unexpectedly has a predecessor UUID`);
+          }
+          sequences.hydrate(agentId, sessionKey, 0);
+        } else {
+          if (!identity.previousEpisodeUuid) {
+            throw new Error(`restored batch ${identity.name} is missing its predecessor UUID`);
+          }
+          if (saga?.lastEpisodeUuid !== identity.previousEpisodeUuid) {
+            throw new Error(
+              `restored batch ${identity.name} predecessor mismatch: durable=${identity.previousEpisodeUuid}, graph=${saga?.lastEpisodeUuid ?? "none"}`,
+            );
+          }
+          sequences.hydrate(agentId, sessionKey, predecessorCount, identity.previousEpisodeUuid);
+        }
+
+        const adopted = sequences.adoptPending(agentId, sessionKey, {
+          batchNumber: identity.batchNumber,
+          episodeUuid: identity.uuid,
+          name: identity.name,
+          previousEpisodeUuids: identity.previousEpisodeUuid ? [identity.previousEpisodeUuid] : [],
+          ...(identity.previousEpisodeUuid
+            ? { sagaPreviousEpisodeUuid: identity.previousEpisodeUuid }
+            : {}),
+        });
+        if (!adopted) {
+          throw new Error(
+            `could not re-adopt durable identity ${identity.name}; refusing to reserve a replacement identity`,
+          );
+        }
+        logger.info("capture_replay_identity_adopted", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          name: identity.name,
+          batchNumber: identity.batchNumber,
+          uuid: identity.uuid,
+        });
         return false;
-      }
-
-      const saga = await fetchSagaState(agentId, sessionKey);
-
-      if (saga?.lastEpisodeUuid === identity.uuid) {
-        // Graphiti holds this exact episode. Continue the chain from it instead of
-        // creating a second episode with the same content.
-        sequences.hydrate(agentId, sessionKey, identity.batchNumber, identity.uuid);
-        logger.info("capture_replay_already_persisted", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          name: identity.name,
-          batchNumber: identity.batchNumber,
-          uuid: identity.uuid,
-          action: "dropped_confirmed_batch",
-        });
-        return true;
-      }
-
-      // Same rule as the ordinary path: never resume below a number this process
-      // already handed out, or the replayed batch collides with a live one.
-      const resume = resumeFrom(agentId, sessionKey, saga);
-      sequences.hydrate(agentId, sessionKey, resume.acceptedBatches, resume.lastEpisodeUuid);
-
-      const reserved = {
-        batchNumber: identity.batchNumber,
-        episodeUuid: identity.uuid,
-        name: identity.name,
-        previousEpisodeUuids: identity.previousEpisodeUuid ? [identity.previousEpisodeUuid] : [],
-        ...(identity.previousEpisodeUuid === undefined
-          ? {}
-          : { sagaPreviousEpisodeUuid: identity.previousEpisodeUuid }),
       };
-      const adopted =
-        sequences.snapshot(agentId, sessionKey).pending === undefined &&
-        sequences.adoptPending(agentId, sessionKey, reserved);
 
-      if (adopted) {
-        logger.info("capture_replay_reserved_identity", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          name: identity.name,
-          batchNumber: identity.batchNumber,
-          uuid: identity.uuid,
-          action: "retry_with_same_uuid",
-        });
-      } else {
-        logger.warn("capture_replay_identity_diverged", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          reservedBatchNumber: identity.batchNumber,
-          reservedUuid: identity.uuid,
-          sagaEpisodeCount: saga?.episodeCount ?? 0,
-          sagaLastEpisodeUuid: saga?.lastEpisodeUuid,
-          action: "reserving_new_identity",
-        });
-      }
-      return false;
-    };
+      const sink: AgentSink = async (agentId, entry, reason) => {
+        const sessionKey = entry.buffer.sessionKey;
+        const episode: EpisodeJson = entry.buffer.episode;
+        const jsonBody = JSON.stringify(episode);
 
-    const sink: AgentSink = async (agentId, entry, reason) => {
-      const sessionKey = entry.buffer.sessionKey;
+        if (entry.identityRestored && entry.episode) {
+          const alreadyCommitted = await reconcileRestoredIdentity(
+            agentId,
+            sessionKey,
+            entry.episode,
+            jsonBody,
+          );
+          entry.identityRestored = false;
+          if (alreadyCommitted) return;
+        } else {
+          await ensureSequenceHydrated(agentId, sessionKey);
+        }
 
-      if (entry.identityRestored && entry.episode) {
-        const alreadyPersisted = await reconcileRestoredBatch(agentId, sessionKey, entry.episode);
-        entry.identityRestored = false;
-        // Returning without submitting reports the batch as delivered, which is
-        // exactly right: Graphiti already has it.
-        if (alreadyPersisted) return;
-      }
+        const sequence = sequences.prepare(agentId, sessionKey, jsonBody);
+        if (entry.episode) {
+          const predecessor = entry.episode.previousEpisodeUuid;
+          if (
+            entry.episode.uuid !== sequence.episodeUuid ||
+            entry.episode.name !== sequence.name ||
+            entry.episode.batchNumber !== sequence.batchNumber ||
+            predecessor !== sequence.sagaPreviousEpisodeUuid
+          ) {
+            throw new Error(
+              `durable FIFO identity diverged from sequence state for ${agentId}/${sessionKey}; refusing remote mutation`,
+            );
+          }
+        } else {
+          entry.episode = {
+            uuid: sequence.episodeUuid,
+            name: sequence.name,
+            batchNumber: sequence.batchNumber,
+            ...(sequence.sagaPreviousEpisodeUuid
+              ? { previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid }
+              : {}),
+            submittedAt: Date.now(),
+          };
+          // This is the crucial write-ahead boundary. A remote call is forbidden
+          // unless the exact UUID/body/predecessor identity is already on disk.
+          if (!engine.checkpoint()) {
+            throw new Error(
+              `could not durably checkpoint episode identity ${sequence.name}; remote delivery not started`,
+            );
+          }
+        }
 
-      await ensureSequenceHydrated(agentId, sessionKey);
-
-      const episode: EpisodeJson = entry.buffer.episode;
-      const jsonBody = JSON.stringify(episode);
-      const sequence = sequences.prepare(agentId, sessionKey, jsonBody);
-      // Record what we are about to submit before submitting it. If the answer is
-      // lost with the process, the next start knows which episode to ask about.
-      entry.episode = {
-        uuid: sequence.episodeUuid,
-        name: sequence.name,
-        batchNumber: sequence.batchNumber,
-        ...(sequence.sagaPreviousEpisodeUuid === undefined
-          ? {}
-          : { previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid }),
-        submittedAt: Date.now(),
-      };
-      engine.checkpoint();
-
-      const referenceTime = new Date(entry.enqueuedAt).toISOString();
-
-      logger.debug("capture_flush_start", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        name: sequence.name,
-        batchNumber: sequence.batchNumber,
-        uuid: sequence.episodeUuid,
-        previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
-        messages: entry.buffer.messages.length,
-        reason,
-        chars: jsonBody.length,
-        reference_time: referenceTime,
-      });
-      logger.debugContent(
-        "capture_payload",
-        {
+        const referenceTime = new Date(entry.enqueuedAt).toISOString();
+        logger.debug("capture_flush_start", {
           agentId,
           group_id: agentId,
           saga: sessionKey,
           name: sequence.name,
           batchNumber: sequence.batchNumber,
           uuid: sequence.episodeUuid,
+          previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
           messages: entry.buffer.messages.length,
           reason,
           chars: jsonBody.length,
-        },
-        {
-          episodeBody: jsonBody,
-          source: "json",
-          source_description: OPENCLAW_SOURCE_DESCRIPTION,
           reference_time: referenceTime,
-          previous_episode_uuids: sequence.previousEpisodeUuids,
-        },
-      );
+        });
+        logger.debugContent(
+          "capture_payload",
+          {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            name: sequence.name,
+            batchNumber: sequence.batchNumber,
+            uuid: sequence.episodeUuid,
+            messages: entry.buffer.messages.length,
+            reason,
+            chars: jsonBody.length,
+          },
+          {
+            episodeBody: jsonBody,
+            source: "json",
+            source_description: OPENCLAW_SOURCE_DESCRIPTION,
+            reference_time: referenceTime,
+            previous_episode_uuids: sequence.previousEpisodeUuids,
+          },
+        );
 
-      const started = Date.now();
-      const result = await client.addMemory({
-        uuid: sequence.episodeUuid,
-        name: sequence.name,
-        jsonBody,
-        groupId: agentId,
-        saga: sessionKey,
-        referenceTime,
-        previousEpisodeUuids: sequence.previousEpisodeUuids,
-        sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
-      });
+        const started = Date.now();
+        const result = await client.addMemory({
+          uuid: sequence.episodeUuid,
+          name: sequence.name,
+          jsonBody,
+          groupId: agentId,
+          saga: sessionKey,
+          referenceTime,
+          previousEpisodeUuids: sequence.previousEpisodeUuids,
+          sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
+        });
+        const committedUuid = acceptedEpisodeUuid(result);
+        if (committedUuid !== sequence.episodeUuid) {
+          throw new Error(
+            `Graphiti committed unexpected UUID: expected ${sequence.episodeUuid}, got ${committedUuid}`,
+          );
+        }
+        sequences.accept(agentId, sessionKey, sequence.batchNumber, committedUuid);
 
-      logger.debugContent(
-        "capture_mcp_response",
-        {
+        logger.info("capture_committed", {
           agentId,
           group_id: agentId,
           saga: sessionKey,
           name: sequence.name,
           batchNumber: sequence.batchNumber,
-          uuid: sequence.episodeUuid,
+          uuid: committedUuid,
+          previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
           messages: entry.buffer.messages.length,
+          reason,
           durationMs: Date.now() - started,
+        });
+      };
+
+      engine = new BufferEngine(
+        cfg.agents,
+        cfg.bufferLimit,
+        cfg.bufferTimeout,
+        sink,
+        {
+          initialState: restoredCaptureState,
+          onStateChange: captureSpool
+            ? (snapshot) =>
+                captureSpool.save({
+                  version: 4,
+                  agents: snapshot.agents,
+                  sessions: transcriptDeltas.export(),
+                })
+            : undefined,
+          notifyError: (agentId, sessionKey, reason, error) => {
+            logger.error("capture_flush_failed", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              reason,
+              error: errorText(error),
+              action: "durable_head_retained",
+              automaticRetry: true,
+              retryIntervalSeconds: CHECK_INTERVAL_SEC,
+              uiNotification: "session_status",
+            });
+            publishCaptureError(agentId, sessionKey, reason, error);
+          },
+          notifyRecovered: (agentId, sessionKey, reason) => {
+            logger.info("capture_flush_recovered", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              reason,
+            });
+            clearCaptureError(agentId, sessionKey);
+          },
+          notifyPersistError: (error) => {
+            logger.error("capture_spool_write_failed", {
+              path: captureSpool?.path,
+              error: errorText(error),
+              action: "remote_delivery_stopped",
+              durableReplayRequired: true,
+            });
+            for (const [agentId, sessionKey] of lastSessionByAgent) {
+              publishCaptureError(agentId, sessionKey, "durability", error);
+            }
+          },
+          notifyPersistRecovered: () => {
+            logger.info("capture_spool_write_recovered", { path: captureSpool?.path });
+            for (const [agentId, sessionKey] of lastSessionByAgent) {
+              clearCaptureError(agentId, sessionKey);
+            }
+          },
         },
-        { mcpResult: JSON.stringify(result) },
       );
 
-      const episodeUuid = acceptedEpisodeUuid(result);
-      sequences.accept(agentId, sessionKey, sequence.batchNumber, episodeUuid);
+      const pollBackendQueueStatus = async (): Promise<void> => {
+        const agentIds = new Set([...Object.keys(cfg.agents), ...lastSessionByAgent.keys()]);
+        for (const agentId of agentIds) {
+          try {
+            const status = await client.getQueueStatus(agentId);
+            lastQueueStatusByAgent.set(agentId, status);
+            if (status.groupId !== agentId) {
+              throw new Error(
+                `Graphiti get_queue_status identity mismatch: requested ${agentId}, got ${status.groupId}`,
+              );
+            }
 
-      // Accepted means handed over, not stored: Graphiti queues the batch and
-      // extracts entities later, so the episode appears only once that finishes.
-      // The batch stays on this ledger until it is seen in the graph.
-      pendingConfirmation.track({
-        agentId,
-        sessionKey,
-        uuid: episodeUuid,
-        name: sequence.name,
-        batchNumber: sequence.batchNumber,
-        episodeBody: jsonBody,
-        previousEpisodeUuids: sequence.previousEpisodeUuids,
-        referenceTime,
-        ...(sequence.sagaPreviousEpisodeUuid ? { sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid } : {}),
-      });
-      engine.checkpoint();
+            const degraded =
+              status.attempts > 0 ||
+              Boolean(status.lastError) ||
+              (status.pending > 0 && status.workerRunning === false);
+            if (degraded) {
+              const sessionKey = status.saga ?? lastSessionByAgent.get(agentId);
+              const fingerprint = `retry:${status.episodeUuid ?? ""}:${status.attempts}:${status.pending}:${status.workerRunning}:${status.lastError ?? ""}`;
+              const previousSession = backendReportedSessionByAgent.get(agentId);
+              if (previousSession && sessionKey && previousSession !== sessionKey) {
+                clearBackendError(agentId, previousSession);
+              }
+              if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
+                const stranded = status.pending > 0 && status.workerRunning === false;
+                publishBackendError(agentId, sessionKey, {
+                  status: "error",
+                  source: "backend_queue",
+                  message: stranded
+                    ? "Graphiti backend has queued work but no worker; self-healing/retry is required"
+                    : `Graphiti backend is retrying the current FIFO head after ${status.attempts} failure(s)`,
+                  error: status.lastError ?? (stranded ? "queue worker not running" : "backend retry in progress"),
+                  attempts: status.attempts,
+                  pending: status.pending,
+                  episodeUuid: status.episodeUuid ?? "",
+                  episodeName: status.episodeName ?? "",
+                  occurredAt: new Date().toISOString(),
+                });
+                backendReportedSessionByAgent.set(agentId, sessionKey);
+                backendFingerprintByAgent.set(agentId, fingerprint);
+                logger.warn("capture_backend_retrying", {
+                  agentId,
+                  group_id: agentId,
+                  saga: sessionKey,
+                  uuid: status.episodeUuid,
+                  name: status.episodeName,
+                  attempts: status.attempts,
+                  pending: status.pending,
+                  workerRunning: status.workerRunning,
+                  error: status.lastError,
+                });
+              }
+              continue;
+            }
 
-      logger.info("capture_queue_accepted", {
-        agentId,
-        group_id: agentId,
-        saga: sessionKey,
-        name: sequence.name,
-        batchNumber: sequence.batchNumber,
-        uuid: episodeUuid,
-        previousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
-        messages: entry.buffer.messages.length,
-        reason,
-        durationMs: Date.now() - started,
-      });
-    };
+            const previousSession = backendReportedSessionByAgent.get(agentId);
+            if (previousSession) {
+              clearBackendError(agentId, previousSession);
+              logger.info("capture_backend_recovered", {
+                agentId,
+                group_id: agentId,
+                saga: previousSession,
+              });
+            }
+            backendReportedSessionByAgent.delete(agentId);
+            backendFingerprintByAgent.delete(agentId);
+          } catch (error) {
+            const sessionKey = lastSessionByAgent.get(agentId);
+            const fingerprint = `health:${errorText(error)}`;
+            if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
+              publishBackendError(agentId, sessionKey, {
+                status: "error",
+                source: "backend_health",
+                message: "Graphiti backend health check failed; durable head remains local",
+                error: errorText(error),
+                occurredAt: new Date().toISOString(),
+              });
+              backendReportedSessionByAgent.set(agentId, sessionKey);
+              backendFingerprintByAgent.set(agentId, fingerprint);
+              logger.warn("capture_backend_healthcheck_failed", {
+                agentId,
+                group_id: agentId,
+                saga: sessionKey,
+                error: errorText(error),
+              });
+            }
+          }
+        }
+      };
 
-    const engine = new BufferEngine(
-      cfg.agents,
-      cfg.bufferLimit,
-      cfg.bufferTimeout,
-      sink,
-      {
-        initialState: restoredCaptureState,
-        // Unaccepted batches and the transcript watermarks that describe how far
-        // each session was already captured are one atomic durable unit.
-        onStateChange: captureSpool
-          ? (snapshot) =>
-              captureSpool.save({
-                version: 3,
-                agents: snapshot.agents,
-                sessions: transcriptDeltas.export(),
-                pending: pendingConfirmation.export(),
-              })
-          : undefined,
-        notifyError: (agentId, sessionKey, reason, error) => {
-          logger.error("capture_flush_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            reason,
-            error: errorText(error),
-            action: "retained_for_retry",
-            automaticRetry: true,
-            retryIntervalSeconds: CHECK_INTERVAL_SEC,
-            uiNotification: "session_status",
-          });
-          publishCaptureError(agentId, sessionKey, reason, error);
-        },
-        notifyRecovered: (agentId, sessionKey, reason) => {
-          logger.info("capture_flush_recovered", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            reason,
-          });
-          clearCaptureError(agentId, sessionKey);
-        },
-        notifyPersistError: (error) => {
-          logger.error("capture_spool_write_failed", {
-            path: captureSpool?.path,
-            error: errorText(error),
-            action: "kept_in_memory",
-            durableReplayRequired: true,
-          });
-        },
-        notifyPersistRecovered: () => {
-          logger.info("capture_spool_write_recovered", { path: captureSpool?.path });
-        },
-      },
-    );
-
-    /**
-     * Ask the graph which handed-over batches actually landed, and resend the rest.
-     *
-     * This is the half that acceptance never gave us. Graphiti says "queued"
-     * immediately and does the work later; if extraction fails — a model that is
-     * unreachable, a reply truncated at the token ceiling, a schema the model
-     * echoed instead of filling — nothing ever tells the plugin. The episode
-     * simply never appears. So the plugin looks.
-     *
-     * Resending is safe because the uuid is derived from the batch content and
-     * the server merges on it: the same batch twice lands on the same node. It is
-     * also cheap to be wrong about, since a batch merely slow to process is
-     * confirmed on the next pass rather than duplicated.
-     */
-    const confirmPendingBatches = async (): Promise<void> => {
-      const outstanding = pendingConfirmation.outstandingUuids();
-      if (outstanding.length === 0) return;
-
-      const byAgent = new Map<string, string[]>();
-      for (const batch of pendingConfirmation.export()) {
-        byAgent.set(batch.agentId, [...(byAgent.get(batch.agentId) ?? []), batch.uuid]);
+      if (cfg.autoCapture) {
+        engine.resumeRestored();
+        queueHealthTimer = setInterval(() => {
+          void pollBackendQueueStatus();
+        }, CHECK_INTERVAL_SEC * 1000);
+        queueHealthTimer.unref?.();
       }
 
-      let confirmed = 0;
-      for (const [agentId, uuids] of byAgent) {
+      return {
+        client,
+        transcriptDeltas,
+        captureSpool,
+        captureLease,
+        engine,
+        statusHost,
+        queueHealthTimer,
+        restoredCaptureState,
+        lastSessionByAgent,
+        unconfiguredAgentsReported,
+        lastQueueStatusByAgent,
+      };
+    } catch (error) {
+      client.close();
+      if (captureLease?.isHeld()) {
         try {
-          const episodes = await client.getEpisodesByRef(agentId, { uuids });
-          const present = episodes
-            .map((episode) => (typeof episode.uuid === "string" ? episode.uuid : ""))
-            .filter(Boolean);
-          confirmed += pendingConfirmation.confirm(present);
-        } catch (error) {
-          // The backend is unreachable: nothing is confirmed and nothing is
-          // resent this pass. Everything stays outstanding, which is the point.
-          logger.debug("capture_confirmation_check_failed", {
-            agentId,
-            group_id: agentId,
-            error: errorText(error),
+          captureLease.release();
+        } catch (releaseError) {
+          logger.error("capture_spool_lease_release_failed", {
+            path: captureLease.path,
+            error: errorText(releaseError),
           });
         }
       }
-
-      const snapshot = pendingConfirmation.snapshot();
-      for (const batch of snapshot.due) {
-        try {
-          await client.addMemory({
-            uuid: batch.uuid,
-            name: batch.name,
-            jsonBody: batch.episodeBody,
-            groupId: batch.agentId,
-            saga: batch.sessionKey,
-            referenceTime: batch.referenceTime,
-            previousEpisodeUuids: batch.previousEpisodeUuids,
-            ...(batch.sagaPreviousEpisodeUuid ? { sagaPreviousEpisodeUuid: batch.sagaPreviousEpisodeUuid } : {}),
-          });
-          pendingConfirmation.resubmitted(batch.uuid);
-          logger.info("capture_resubmitted", {
-            agentId: batch.agentId,
-            group_id: batch.agentId,
-            saga: batch.sessionKey,
-            name: batch.name,
-            batchNumber: batch.batchNumber,
-            uuid: batch.uuid,
-            attempt: batch.attempts + 1,
-            reason: "episode_absent_after_grace",
-          });
-        } catch (error) {
-          logger.warn("capture_resubmit_failed", {
-            agentId: batch.agentId,
-            group_id: batch.agentId,
-            name: batch.name,
-            uuid: batch.uuid,
-            error: errorText(error),
-          });
-        }
-      }
-
-      // Reported, never abandoned: it will be tried again, just less often.
-      for (const batch of snapshot.needsAttention) {
-        logger.warn("capture_batch_not_landing", {
-          agentId: batch.agentId,
-          group_id: batch.agentId,
-          saga: batch.sessionKey,
-          name: batch.name,
-          batchNumber: batch.batchNumber,
-          uuid: batch.uuid,
-          attempts: batch.attempts,
-          ageMs: Date.now() - batch.submittedAt,
-          nextAttemptInMs: pendingConfirmation.backoffFor(batch.attempts),
-          action: "still_retrying",
-        });
-      }
-
-      if (confirmed > 0 || snapshot.due.length > 0) engine.checkpoint();
-    };
-
-    let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
-    if (cfg.autoCapture) {
-      engine.resumeRestored();
-
-      // One poller per process, not one per registration.
-      queueHealthTimer = setInterval(() => {
-        void pollBackendQueueStatus();
-        void confirmPendingBatches();
-      }, CHECK_INTERVAL_SEC * 1000);
-      queueHealthTimer.unref?.();
+      throw error;
     }
-
-
-    return {
-      client,
-      transcriptDeltas,
-      captureSpool,
-      pendingConfirmation,
-      engine,
-      statusHost,
-      queueHealthTimer,
-      restoredCaptureState,
-      lastSessionByAgent,
-      unconfiguredAgentsReported,
-    };
   };
 
   const { runtime: pipeline, outcome } = acquireCaptureRuntime<CapturePipeline>({
-    // The spool path is part of the runtime's identity: a pipeline owns one
-    // durable file, so a different state directory is a different pipeline.
     fingerprint: JSON.stringify({ cfg, spool: resolveCaptureSpoolPath() }),
-    isStopped: (candidate: CapturePipeline) => candidate.engine.isStopped(),
+    isStopped: (candidate) => candidate.engine.isStopped(),
     create: buildPipeline,
   });
-  // Session status is best effort and belongs to whichever host surface
-  // registered most recently; the pipeline itself is shared.
   pipeline.statusHost.patchSessionEntry = api.runtime?.agent?.session?.patchSessionEntry;
   if (outcome !== "reused") logger.info("capture_pipeline", { outcome });
 
@@ -899,20 +783,23 @@ export function register(api: OpenClawPluginApi): void {
     client,
     transcriptDeltas,
     captureSpool,
+    captureLease,
     engine,
-    pendingConfirmation,
     restoredCaptureState,
     lastSessionByAgent,
     unconfiguredAgentsReported,
+    lastQueueStatusByAgent,
   } = pipeline;
   const queueHealthTimer = pipeline.queueHealthTimer;
-
 
   if (cfg.autoCapture) {
     api.on(
       "gateway_stop",
       async () => {
         if (queueHealthTimer) clearInterval(queueHealthTimer);
+        // Abort long provider/backend polling before waiting for BufferEngine. The
+        // durable head stays on disk and the next process reconciles it.
+        client.close();
         const before = captureSnapshotStats(engine.snapshot());
         logger.info("capture_shutdown_checkpoint", {
           path: captureSpool?.path,
@@ -926,6 +813,17 @@ export function register(api: OpenClawPluginApi): void {
           ...after,
           durableReplayRequired: after.messages > 0,
         });
+        if (captureLease?.isHeld()) {
+          try {
+            captureLease.release();
+            logger.info("capture_spool_lease_released", { path: captureLease.path });
+          } catch (error) {
+            logger.error("capture_spool_lease_release_failed", {
+              path: captureLease.path,
+              error: errorText(error),
+            });
+          }
+        }
       },
       { timeoutMs: GATEWAY_STOP_HOOK_TIMEOUT_MS },
     );
@@ -937,46 +835,52 @@ export function register(api: OpenClawPluginApi): void {
       client,
       logger,
       excludedSessionPatterns,
-      // Only this process knows what has been captured but not yet submitted;
-      // the backend cannot report a batch it has never seen.
-      // A note goes through the same door as a message. The pipeline owns the
-      // saga chain, so letting it do the writing is what keeps a note from
-      // forking that chain; checkpointing afterwards puts the note in the spool
-      // so a restart before the batch is committed does not lose it.
       captureNote: (agentId, sessionKey, note) => {
         engine.addMessages(agentId, sessionKey, [{ role: "assistant", text: note }]);
-        engine.checkpoint();
+        if (!engine.checkpoint()) {
+          throw new Error("note was not durably checkpointed; it was not reported as remembered");
+        }
       },
       localCaptureState: (agentId) => {
         const agent = engine.snapshot().agents.find((entry) => entry.agentId === agentId);
         const buffers = agent?.activeBuffers ?? [];
-        const lastActivity = buffers.map((buffer) => buffer.lastActivityAt);
-        const confirmation = pendingConfirmation.snapshot();
-        const mine = pendingConfirmation.export().filter((batch) => batch.agentId === agentId);
-        const oldestAwaiting = mine.length > 0 ? Math.min(...mine.map((batch) => batch.submittedAt)) : undefined;
+        const queue = agent?.queue ?? [];
+        const assigned = queue.filter((entry) => entry.episode !== undefined);
+        const oldestAwaiting = assigned.length > 0
+          ? Math.min(...assigned.map((entry) => entry.episode?.submittedAt ?? entry.enqueuedAt))
+          : undefined;
+        const backend = lastQueueStatusByAgent.get(agentId);
         return {
-          awaitingConfirmation: mine.length,
-          awaitingBytes: mine.reduce((sum, batch) => sum + batch.episodeBody.length, 0),
-          ...(oldestAwaiting !== undefined ? { oldestAwaitingMs: Date.now() - oldestAwaiting } : {}),
-          notLanding: confirmation.needsAttention
-            .filter((batch) => batch.agentId === agentId)
-            .map((batch) => ({ name: batch.name, attempts: batch.attempts, ageMs: Date.now() - batch.submittedAt })),
-          droppedForSpace: confirmation.dropped,
+          awaitingConfirmation: assigned.length,
+          awaitingBytes: assigned.reduce(
+            (sum, entry) => sum + JSON.stringify(entry.buffer).length,
+            0,
+          ),
+          ...(oldestAwaiting !== undefined
+            ? { oldestAwaitingMs: Date.now() - oldestAwaiting }
+            : {}),
+          notLanding:
+            backend && backend.attempts > 0 && backend.episodeName
+              ? [{ name: backend.episodeName, attempts: backend.attempts, ageMs: 0 }]
+              : [],
+          droppedForSpace: 0,
           bufferedMessages: buffers.reduce((sum, buffer) => sum + buffer.messages.length, 0),
-          queuedBatches: agent?.queue.length ?? 0,
-          ...(lastActivity.length > 0
-            ? { oldestBufferAgeMs: Date.now() - Math.min(...lastActivity) }
+          queuedBatches: queue.length,
+          ...(buffers.length > 0
+            ? {
+                oldestBufferAgeMs:
+                  Date.now() - Math.min(...buffers.map((buffer) => buffer.lastActivityAt)),
+              }
             : {}),
           ...(captureSpool ? { spoolPath: captureSpool.path } : {}),
         };
       },
     });
     for (const tool of tools) {
-      // Registered per invocation context so each call resolves its own agent
-      // and session; the tool can never act on another agent's graph.
-      api.registerTool((ctx) => ({ ...tool, execute: (id, params) => tool.execute(id, params, ctx) }), {
-        name: tool.name,
-      });
+      api.registerTool(
+        (ctx) => ({ ...tool, execute: (toolCallId, params) => tool.execute(toolCallId, params, ctx) }),
+        { name: tool.name },
+      );
     }
     logger.info("agent_tools_registered", { tools: tools.map((tool) => tool.name) });
   } else if (cfg.agentTools && !api.registerTool) {
@@ -999,8 +903,6 @@ export function register(api: OpenClawPluginApi): void {
           return;
         }
 
-        // A session excluded from memory is excluded in both directions: it
-        // neither writes to Graphiti nor receives injected memory from it.
         const excluded = matchSessionExclusion(ctx ?? {}, excludedSessionPatterns);
         if (excluded) {
           logger.debug("recall_skipped", {
@@ -1035,10 +937,7 @@ export function register(api: OpenClawPluginApi): void {
             maxChars: cfg.recallQueryMaxChars,
           },
         );
-        if (!query) {
-          logger.debug("recall_skipped", { agentId, group_id: agentId, reason: "empty_query" });
-          return;
-        }
+        if (!query) return;
 
         logger.debugContent(
           "recall_query",
@@ -1062,7 +961,6 @@ export function register(api: OpenClawPluginApi): void {
             .filter(Boolean);
           const recallBlock = buildRecallBlockDetailed(factTexts, cfg.recallMaxInjectedChars);
           const block = recallBlock.block;
-
           logger.debugContent(
             "recall_payload",
             {
@@ -1101,8 +999,6 @@ export function register(api: OpenClawPluginApi): void {
     );
   }
 
-  // Opt-in on top of the content switches: this dumps the whole assembled
-  // prompt, system instructions included, on every single run.
   if (cfg.logModelInput && cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent) {
     api.on("llm_input", (rawEvent: unknown, ctx?: HookContext): void => {
       const event = rawEvent as LlmInputEvent;
@@ -1152,12 +1048,8 @@ export function register(api: OpenClawPluginApi): void {
         logger.warn("capture_skipped", { reason: "missing_context_id", error: errorText(error) });
         return;
       }
-
       lastSessionByAgent.set(agentId, sessionKey);
 
-      // An agent missing from the config still gets captured, but under the
-      // default actor names and without backend queue monitoring. Say so once
-      // instead of letting a config typo change participant names silently.
       if (!cfg.agents[agentId] && !unconfiguredAgentsReported.has(agentId)) {
         unconfiguredAgentsReported.add(agentId);
         logger.warn("capture_agent_unconfigured", {
@@ -1165,17 +1057,42 @@ export function register(api: OpenClawPluginApi): void {
           group_id: agentId,
           configuredAgents: Object.keys(cfg.agents),
           participants: DEFAULT_ACTORS,
-          backendQueueMonitoring: false,
+          backendQueueMonitoring: true,
         });
       }
 
       const snapshot = extractConversationMessages(Array.isArray(event.messages) ? event.messages : []);
-      const delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
+      let delta;
+      try {
+        delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
+      } catch (error) {
+        if (error instanceof TranscriptCursorError) {
+          logger.error("capture_cursor_ambiguous", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            snapshotMessages: snapshot.length,
+            error: errorText(error),
+            action: "capture_stopped_without_advancing_cursor",
+          });
+          publishCaptureError(agentId, sessionKey, "cursor", error);
+          return;
+        }
+        throw error;
+      }
+
       if (delta.length === 0) {
-        // Nothing new to capture, but the session was observed this far. Commit
-        // the watermark so a restart resumes here instead of guessing.
         transcriptDeltas.commit(agentId, sessionKey);
-        engine.checkpoint();
+        if (!engine.checkpoint()) {
+          publishCaptureError(
+            agentId,
+            sessionKey,
+            "durability",
+            new Error("failed to checkpoint transcript cursor"),
+          );
+        } else {
+          clearCaptureError(agentId, sessionKey);
+        }
         logger.debug("capture_skipped", {
           agentId,
           group_id: agentId,
@@ -1207,9 +1124,6 @@ export function register(api: OpenClawPluginApi): void {
       try {
         engine.addMessages(agentId, sessionKey, delta);
       } catch (error) {
-        // Buffering can only refuse after shutdown. Leaving the watermark where
-        // it was means the next process observes these messages again rather
-        // than treating them as captured.
         logger.warn("capture_skipped", {
           agentId,
           group_id: agentId,
@@ -1222,26 +1136,34 @@ export function register(api: OpenClawPluginApi): void {
         return;
       }
 
-      // Observing is not capturing: the watermark only advances once the delta
-      // is in the buffer, and the checkpoint that follows makes both durable.
       transcriptDeltas.commit(agentId, sessionKey);
-      engine.checkpoint();
+      if (!engine.checkpoint()) {
+        publishCaptureError(
+          agentId,
+          sessionKey,
+          "durability",
+          new Error("messages and transcript cursor remain only in memory until spool recovers"),
+        );
+      } else {
+        clearCaptureError(agentId, sessionKey);
+      }
     });
   }
 
   logger.info("plugin_loaded", {
     autoCapture: cfg.autoCapture,
     autoRecall: cfg.autoRecall,
-    captureMode: "message_delta",
+    captureMode: "durable_fifo_v4",
     bufferLimit: cfg.bufferLimit,
     bufferTimeout: cfg.bufferTimeout,
     captureDurableSpool: Boolean(captureSpool),
     captureSpoolPath: captureSpool?.path,
+    captureLeasePath: captureLease?.path,
     excludeSessionPatterns: cfg.excludeSessionPatterns,
     agentTools: cfg.agentTools && Boolean(api.registerTool),
     restoredCaptureMessages: captureSnapshotStats(restoredCaptureState).messages,
-    agents: Object.entries(cfg.agents).map(([agentId, actors]) =>
-      `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
+    agents: Object.entries(cfg.agents).map(
+      ([agentId, actors]) => `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
     ),
     requestTimeoutMs: cfg.requestTimeoutMs,
     recallLimit: cfg.recallLimit,

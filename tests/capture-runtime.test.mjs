@@ -15,6 +15,8 @@ function jsonResponse(body) {
 
 function installFetch(t) {
   const calls = [];
+  const sagas = new Map();
+  const episodes = new Map();
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -28,20 +30,49 @@ function installFetch(t) {
     calls.push(payload.params);
     const { name, arguments: args } = payload.params;
     if (name === "get_saga") {
+      const saga = sagas.get(`${args.group_id}\0${args.saga_name}`);
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
-        result: { structuredContent: { result: { error: `No saga named '${args.saga_name}' found in group '${args.group_id}'` } } },
+        result: {
+          structuredContent: {
+            result: saga ?? { error: `No saga named '${args.saga_name}' found in group '${args.group_id}'` },
+          },
+        },
       });
     }
     if (name === "get_queue_status") {
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
-        result: { structuredContent: { result: { group_id: args.group_id, blocked: false, attempts: 0, pending: 0 } } },
+        result: {
+          structuredContent: {
+            result: {
+              group_id: args.group_id,
+              blocked: false,
+              attempts: 0,
+              pending: 0,
+              queued_episode_uuids: [],
+            },
+          },
+        },
       });
     }
     if (name === "add_memory") {
+      episodes.set(args.uuid, { uuid: args.uuid, name: args.name, content: args.episode_body });
+      if (args.saga) {
+        const key = `${args.group_id}\0${args.saga}`;
+        const previous = sagas.get(key);
+        sagas.set(key, {
+          uuid: previous?.uuid ?? `saga-${args.saga}`,
+          name: args.saga,
+          group_id: args.group_id,
+          summary: "",
+          first_episode_uuid: previous?.first_episode_uuid ?? args.uuid,
+          last_episode_uuid: args.uuid,
+          episode_count: (previous?.episode_count ?? 0) + (previous?.last_episode_uuid === args.uuid ? 0 : 1),
+        });
+      }
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
@@ -49,10 +80,11 @@ function installFetch(t) {
       });
     }
     if (name === "get_episodes_by_ref") {
+      const found = (args.uuids ?? []).map((uuid) => episodes.get(uuid)).filter(Boolean);
       return jsonResponse({
         jsonrpc: "2.0",
         id: payload.id,
-        result: { structuredContent: { result: { episodes: [] } } },
+        result: { structuredContent: { result: { episodes: found } } },
       });
     }
     throw new Error(`unexpected tool ${name}`);
@@ -124,6 +156,7 @@ test("repeated registrations in one process share one capture pipeline", async (
   );
 
   await waitFor(() => calls.some((c) => c.name === "add_memory"));
+  await waitFor(() => calls.some((c) => c.name === "get_episodes_by_ref"));
   const adds = calls.filter((c) => c.name === "add_memory");
   assert.equal(adds.length, 1, "one batch must produce exactly one episode");
   assert.equal(adds[0].arguments.name.endsWith("-1"), true);
@@ -159,7 +192,7 @@ test("a restart with unsent messages flushes the restored buffer exactly once", 
     ctx,
   );
   await waitFor(() => calls.some((c) => c.name === "add_memory"));
-  await sleep(120);
+  await waitFor(() => calls.filter((c) => c.name === "get_saga").length >= 2);
 
   const adds = calls.filter((c) => c.name === "add_memory");
   assert.equal(adds.length, 1, "the restored batch must reach Graphiti once, under one uuid");
@@ -195,7 +228,6 @@ test("hot reconfiguration cannot create a second live spool owner", async (t) =>
   const changed = registerRuntime(dir, { bufferLimit: 9 });
   assert.ok(changed.logs.some((l) => l.includes('outcome="reused_config_mismatch"')));
 
-  // The old runtime remains the only owner until it is explicitly stopped.
   await first.hooks.get("gateway_stop")();
   const afterStop = registerRuntime(dir, { bufferLimit: 9 });
   assert.ok(afterStop.logs.some((l) => l.includes('outcome="replaced_reconfigured"')));

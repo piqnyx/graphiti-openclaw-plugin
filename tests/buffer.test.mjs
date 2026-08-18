@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { BufferEngine, CHECK_INTERVAL_SEC } from "../dist/buffer.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 async function waitFor(predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -12,21 +11,15 @@ async function waitFor(predicate, timeoutMs) {
   }
   assert.fail("condition was not met before timeout");
 }
-
 function deferred() {
   let resolve;
-  const promise = new Promise((res) => {
-    resolve = res;
-  });
+  const promise = new Promise((res) => { resolve = res; });
   return { promise, resolve };
 }
-
-const agents = {
-  main: { user: "Вит", assistant: "Краб" },
-};
-
+const agents = { main: { user: "Вит", assistant: "Краб" } };
 function addMessages(engine, agentId, sessionKey, ...messages) {
   engine.addMessages(agentId, sessionKey, messages);
+  engine.checkpoint();
 }
 
 test("odd bufferLimit is valid because the limit counts individual messages", () => {
@@ -39,65 +32,37 @@ test("odd bufferLimit is valid because the limit counts individual messages", ()
 test("limit trigger flushes exactly at the configured message limit", async (t) => {
   const flushes = [];
   const engine = new BufferEngine(agents, 4, 3600, async (agentId, entry, reason) => {
-    flushes.push({
-      agentId,
-      sessionKey: entry.buffer.sessionKey,
-      count: entry.buffer.messages.length,
-      roles: entry.buffer.messages.map((m) => m.role),
-      reason,
-    });
+    flushes.push({ agentId, sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, roles: entry.buffer.messages.map((m) => m.role), reason });
   });
   t.after(() => engine.stop());
-
   addMessages(engine, "main", "s1", { role: "user", text: "u1" }, { role: "assistant", text: "a1" });
   await sleep(20);
   assert.equal(flushes.length, 0);
-
   addMessages(engine, "main", "s1", { role: "user", text: "u2" }, { role: "assistant", text: "a2" });
   await waitFor(() => flushes.length === 1, 2000);
-  assert.deepEqual(flushes[0], {
-    agentId: "main",
-    sessionKey: "s1",
-    count: 4,
-    roles: ["user", "assistant", "user", "assistant"],
-    reason: "limit",
-  });
+  assert.deepEqual(flushes[0], { agentId: "main", sessionKey: "s1", count: 4, roles: ["user", "assistant", "user", "assistant"], reason: "limit" });
   assert.equal(engine.activeBufferCount("main"), 1);
   assert.equal(engine.queueLength(), 0);
 });
 
-test("one observed delta is checkpointed as a whole, never one message at a time", async (t) => {
+test("one observed delta has no partial durable checkpoint", async (t) => {
   const snapshots = [];
   const gate = deferred();
-  const engine = new BufferEngine(
-    agents,
-    4,
-    3600,
-    async () => gate.promise,
-    { onStateChange: (snapshot) => snapshots.push(structuredClone(snapshot)) },
-  );
+  const engine = new BufferEngine(agents, 4, 3600, async () => gate.promise, {
+    onStateChange: (snapshot) => snapshots.push(structuredClone(snapshot)),
+  });
   t.after(() => engine.stop());
 
-  addMessages(
-    engine,
-    "main",
-    "s1",
+  engine.addMessages("main", "s1", [
     { role: "user", text: "u1" },
     { role: "assistant", text: "a1" },
     { role: "user", text: "u2" },
     { role: "assistant", text: "a2" },
-  );
-
-  // addMessages itself performs no partial durable writes. The explicit caller
-  // checkpoint is the transaction boundary shared with the transcript watermark.
-  assert.equal(snapshots.length, 0);
+  ]);
+  assert.equal(snapshots.length, 0, "staging a delta must not write a stale transcript watermark");
   engine.checkpoint();
   assert.equal(snapshots.length, 1);
-  assert.deepEqual(
-    snapshots[0].agents[0].queue[0].buffer.messages.map((m) => m.text),
-    ["u1", "a1", "u2", "a2"],
-  );
-
+  assert.deepEqual(snapshots[0].agents[0].queue[0].buffer.messages.map((m) => m.text), ["u1", "a1", "u2", "a2"]);
   gate.resolve();
 });
 
@@ -105,28 +70,16 @@ test("a failed spool write prevents any remote side effect until durability reco
   let diskWritable = false;
   let sinkCalls = 0;
   const persistErrors = [];
-  const engine = new BufferEngine(
-    agents,
-    1,
-    3600,
-    async () => {
-      sinkCalls += 1;
-    },
-    {
-      onStateChange: () => {
-        if (!diskWritable) throw new Error("disk full");
-      },
-      notifyPersistError: (error) => persistErrors.push(error.message),
-    },
-  );
+  const engine = new BufferEngine(agents, 1, 3600, async () => { sinkCalls += 1; }, {
+    onStateChange: () => { if (!diskWritable) throw new Error("disk full"); },
+    notifyPersistError: (error) => persistErrors.push(error.message),
+  });
   t.after(() => engine.stop());
-
   engine.addMessage("main", "s1", "user", "must-live-on-disk-first");
   await sleep(30);
-  assert.equal(sinkCalls, 0, "nothing may leave RAM while the authoritative spool write failed");
+  assert.equal(sinkCalls, 0);
   assert.deepEqual(persistErrors, ["disk full"]);
   assert.equal(engine.queueLength(), 1);
-
   diskWritable = true;
   engine.checkpoint();
   await waitFor(() => sinkCalls === 1, 1000);
@@ -134,20 +87,16 @@ test("a failed spool write prevents any remote side effect until durability reco
 
 test("buffers are isolated per session within an agent", () => {
   const flushes = [];
-  const engine = new BufferEngine(agents, 4, 3600, async (_agentId, entry) => {
-    flushes.push(entry.buffer.sessionKey);
-  });
+  const engine = new BufferEngine(agents, 4, 3600, async (_agentId, entry) => flushes.push(entry.buffer.sessionKey));
   try {
     engine.addMessage("main", "sA", "user", "a-only");
     engine.addMessage("main", "sB", "assistant", "b-only");
     assert.equal(engine.activeBufferCount("main"), 2);
     assert.equal(flushes.length, 0);
-  } finally {
-    engine.stop();
-  }
+  } finally { engine.stop(); }
 });
 
-test("FIFO queue per agent preserves chronological order", async (t) => {
+test("FIFO queue per agent preserves queue order", async (t) => {
   const flushes = [];
   const gate = deferred();
   const engine = new BufferEngine(agents, 1, 3600, async (_agentId, entry) => {
@@ -155,10 +104,8 @@ test("FIFO queue per agent preserves chronological order", async (t) => {
     if (flushes.length === 1) await gate.promise;
   });
   t.after(() => engine.stop());
-
   engine.addMessage("main", "first", "user", "first-message");
   engine.addMessage("main", "second", "assistant", "second-message");
-
   await waitFor(() => flushes.length === 1, 2000);
   gate.resolve();
   await waitFor(() => flushes.length === 2, 2000);
@@ -173,36 +120,22 @@ test("agents are isolated: one agent processing slot does not affect another", a
     if (agentId === "igor") await gate.promise;
   });
   t.after(() => engine.stop());
-
   engine.addMessage("igor", "i1", "user", "igor-message");
   await waitFor(() => flushes.some((f) => f.agentId === "igor"), 2000);
-
   engine.addMessage("main", "m1", "assistant", "main-message");
   await waitFor(() => flushes.some((f) => f.agentId === "main"), 2000);
-
   gate.resolve();
-  assert.ok(flushes.some((f) => f.agentId === "main"));
 });
 
 test("failed sink retains the detached FIFO head and reports the error", async (t) => {
   const errors = [];
-  const engine = new BufferEngine(
-    agents,
-    1,
-    3600,
-    async () => {
-      throw new Error("backend down");
-    },
-    {
-      notifyError: (agentId, sessionKey, _reason, error) =>
-        errors.push({ agentId, sessionKey, error: error.message }),
-    },
-  );
+  const engine = new BufferEngine(agents, 1, 3600, async () => { throw new Error("backend down"); }, {
+    notifyError: (agentId, sessionKey, _reason, error) => errors.push({ agentId, sessionKey, error: error.message }),
+  });
   t.after(() => engine.stop());
-
   engine.addMessage("main", "s1", "user", "retained");
   await waitFor(() => errors.length === 1, 2000);
-  assert.equal(engine.queueLength(), 1, "failed head must remain queued for retry");
+  assert.equal(engine.queueLength(), 1);
   assert.deepEqual(errors, [{ agentId: "main", sessionKey: "s1", error: "backend down" }]);
 });
 
@@ -213,48 +146,18 @@ test("timeout ticker flushes a non-empty message buffer exactly after inactivity
   let scheduled;
   let scheduledMs;
   let now = 1_700_000_000_000;
-
-  globalThis.setInterval = (callback, ms) => {
-    scheduled = callback;
-    scheduledMs = ms;
-    return { unref() {} };
-  };
+  globalThis.setInterval = (callback, ms) => { scheduled = callback; scheduledMs = ms; return { unref() {} }; };
   globalThis.clearInterval = () => {};
   Date.now = () => now;
-  t.after(() => {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    Date.now = originalNow;
-  });
-
+  t.after(() => { globalThis.setInterval = originalSetInterval; globalThis.clearInterval = originalClearInterval; Date.now = originalNow; });
   const flushes = [];
   const engine = new BufferEngine(agents, 50, 30, async (_agentId, entry, reason) => {
-    flushes.push({
-      sessionKey: entry.buffer.sessionKey,
-      count: entry.buffer.messages.length,
-      reason,
-      storedReason: entry.reason,
-      enqueuedAt: entry.enqueuedAt,
-    });
+    flushes.push({ sessionKey: entry.buffer.sessionKey, count: entry.buffer.messages.length, reason, storedReason: entry.reason, enqueuedAt: entry.enqueuedAt });
   });
-
   assert.equal(scheduledMs, CHECK_INTERVAL_SEC * 1000);
   engine.addMessage("main", "session-a", "user", "single-user");
-
-  now += 29_999;
-  scheduled();
-  await sleep(0);
-  assert.equal(flushes.length, 0);
-
-  now += 1;
-  scheduled();
-  await waitFor(() => flushes.length === 1, 500);
-  assert.deepEqual(flushes[0], {
-    sessionKey: "session-a",
-    count: 1,
-    reason: "timeout",
-    storedReason: "timeout",
-    enqueuedAt: now,
-  });
+  now += 29_999; scheduled(); await sleep(0); assert.equal(flushes.length, 0);
+  now += 1; scheduled(); await waitFor(() => flushes.length === 1, 500);
+  assert.deepEqual(flushes[0], { sessionKey: "session-a", count: 1, reason: "timeout", storedReason: "timeout", enqueuedAt: now });
   assert.equal(engine.activeBufferCount("main"), 0);
 });

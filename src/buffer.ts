@@ -128,7 +128,7 @@ export class BufferEngine {
   isStopped(): boolean { return this.stopped; }
 
   /** Persist staged state before any eligible head is allowed to leave the process. */
-  checkpoint(): void { if (this.persistState()) this.flushPendingPumps(); }
+  checkpoint(): boolean { const durable = this.persistState(); if (durable) this.flushPendingPumps(); return durable; }
   private persistState(): boolean { const onStateChange = this.opts.onStateChange; if (!onStateChange) return true; try { onStateChange(this.snapshot()); } catch (error) { if (!this.persistFailureActive) { this.persistFailureActive = true; this.opts.notifyPersistError?.(asError(error)); } return false; } if (this.persistFailureActive) { this.persistFailureActive = false; this.opts.notifyPersistRecovered?.(); } return true; }
 
   async shutdown(graceMs = 4_000): Promise<void> { if (!this.stopped) { this.stopped = true; clearInterval(this.timer); this.persistState(); } const deadline = Date.now() + Math.max(0, graceMs); while ([...this.captureStates.values()].some((state) => state.processing)) { if (Date.now() >= deadline) break; await new Promise((resolve) => setTimeout(resolve, 10)); } this.persistState(); }

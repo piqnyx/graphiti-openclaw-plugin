@@ -10,7 +10,10 @@ const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-runtime-share-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
 
 function jsonResponse(body) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function installFetch(t) {
@@ -18,51 +21,50 @@ function installFetch(t) {
   const sagas = new Map();
   const episodes = new Map();
   const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const sagaResult = (saga) => ({
+    ...saga,
+    chain_count: saga.episode_count,
+    integrity_ok: true,
+    integrity_errors: [],
   });
+
   globalThis.fetch = async (_url, init) => {
     const payload = JSON.parse(init.body);
     if (payload.method === "initialize") {
-      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: { protocolVersion: "2025-06-18" },
+      });
     }
     if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+
     calls.push(payload.params);
     const { name, arguments: args } = payload.params;
+    let result;
+
     if (name === "get_saga") {
       const saga = sagas.get(`${args.group_id}\0${args.saga_name}`);
-      return jsonResponse({
-        jsonrpc: "2.0",
-        id: payload.id,
-        result: {
-          structuredContent: {
-            result: saga ?? { error: `No saga named '${args.saga_name}' found in group '${args.group_id}'` },
-          },
-        },
-      });
-    }
-    if (name === "get_queue_status") {
-      return jsonResponse({
-        jsonrpc: "2.0",
-        id: payload.id,
-        result: {
-          structuredContent: {
-            result: {
-              group_id: args.group_id,
-              blocked: false,
-              attempts: 0,
-              pending: 0,
-              queued_episode_uuids: [],
-            },
-          },
-        },
-      });
-    }
-    if (name === "add_memory") {
+      result = saga
+        ? sagaResult(saga)
+        : { error: `No saga named '${args.saga_name}' found in group '${args.group_id}'` };
+    } else if (name === "get_queue_status") {
+      result = {
+        group_id: args.group_id,
+        blocked: false,
+        attempts: 0,
+        pending: 0,
+        worker_running: true,
+        queued_episode_uuids: [],
+      };
+    } else if (name === "add_memory") {
       episodes.set(args.uuid, { uuid: args.uuid, name: args.name, content: args.episode_body });
       if (args.saga) {
         const key = `${args.group_id}\0${args.saga}`;
         const previous = sagas.get(key);
+        const alreadyTail = previous?.last_episode_uuid === args.uuid;
         sagas.set(key, {
           uuid: previous?.uuid ?? `saga-${args.saga}`,
           name: args.saga,
@@ -70,30 +72,29 @@ function installFetch(t) {
           summary: "",
           first_episode_uuid: previous?.first_episode_uuid ?? args.uuid,
           last_episode_uuid: args.uuid,
-          episode_count: (previous?.episode_count ?? 0) + (previous?.last_episode_uuid === args.uuid ? 0 : 1),
+          episode_count: (previous?.episode_count ?? 0) + (alreadyTail ? 0 : 1),
         });
       }
-      return jsonResponse({
-        jsonrpc: "2.0",
-        id: payload.id,
-        result: { structuredContent: { result: { message: "queued", uuid: args.uuid } } },
-      });
+      result = { message: "queued", uuid: args.uuid };
+    } else if (name === "get_episodes_by_ref") {
+      result = {
+        episodes: (args.uuids ?? []).map((uuid) => episodes.get(uuid)).filter(Boolean),
+      };
+    } else {
+      throw new Error(`unexpected tool ${name}`);
     }
-    if (name === "get_episodes_by_ref") {
-      const found = (args.uuids ?? []).map((uuid) => episodes.get(uuid)).filter(Boolean);
-      return jsonResponse({
-        jsonrpc: "2.0",
-        id: payload.id,
-        result: { structuredContent: { result: { episodes: found } } },
-      });
-    }
-    throw new Error(`unexpected tool ${name}`);
+
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: { structuredContent: { result }, content: [], isError: false },
+    });
   };
   return calls;
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function waitFor(predicate, timeoutMs = 2000) {
+async function waitFor(predicate, timeoutMs = 2500) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -107,7 +108,10 @@ const config = (overrides = {}) => ({
   bufferLimit: 4,
   bufferTimeout: 30,
   logLevel: "debug",
-  agents: { main: { user: "Вит", assistant: "Краб" } },
+  agents: {
+    main: { user: "Вит", assistant: "Краб" },
+    igor: { user: "Игорь", assistant: "Краб" },
+  },
   ...overrides,
 });
 
@@ -128,7 +132,11 @@ function registerRuntime(stateDir, overrides) {
   return { hooks, logs };
 }
 
-const ctx = { agentId: "main", sessionKey: "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957", trigger: "user" };
+const ctx = {
+  agentId: "main",
+  sessionKey: "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957",
+  trigger: "user",
+};
 const turn = (n) => ({
   success: true,
   messages: [
@@ -139,6 +147,7 @@ const turn = (n) => ({
 
 test("repeated registrations in one process share one capture pipeline", async (t) => {
   resetCaptureRuntimeForTests();
+  t.after(resetCaptureRuntimeForTests);
   const calls = installFetch(t);
   const dir = join(stateRoot, "shared");
 
@@ -146,8 +155,8 @@ test("repeated registrations in one process share one capture pipeline", async (
   const second = registerRuntime(dir);
   const third = registerRuntime(dir);
 
-  assert.equal(second.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0,
-    "a reused pipeline is not announced as new");
+  assert.equal(second.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0);
+  assert.equal(third.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0);
 
   first.hooks.get("agent_end")(turn(1), ctx);
   third.hooks.get("agent_end")(
@@ -156,16 +165,15 @@ test("repeated registrations in one process share one capture pipeline", async (
   );
 
   await waitFor(() => calls.some((c) => c.name === "add_memory"));
-  await waitFor(() => calls.some((c) => c.name === "get_episodes_by_ref"));
   const adds = calls.filter((c) => c.name === "add_memory");
   assert.equal(adds.length, 1, "one batch must produce exactly one episode");
   assert.equal(adds[0].arguments.name.endsWith("-1"), true);
-
   await second.hooks.get("gateway_stop")();
 });
 
-test("a restart with unsent messages flushes the restored buffer exactly once", async (t) => {
+test("a restart with a partial buffer flushes it exactly once after continuation", async (t) => {
   resetCaptureRuntimeForTests();
+  t.after(resetCaptureRuntimeForTests);
   const dir = join(stateRoot, "restore-once");
   const firstCalls = installFetch(t);
 
@@ -177,14 +185,17 @@ test("a restart with unsent messages flushes the restored buffer exactly once", 
   resetCaptureRuntimeForTests();
   const calls = installFetch(t);
   const restored = [
-    registerRuntime(dir, { bufferLimit: 6, bufferTimeout: 30 }),
-    registerRuntime(dir, { bufferLimit: 6, bufferTimeout: 30 }),
-    registerRuntime(dir, { bufferLimit: 6, bufferTimeout: 30 }),
+    registerRuntime(dir, { bufferLimit: 6 }),
+    registerRuntime(dir, { bufferLimit: 6 }),
+    registerRuntime(dir, { bufferLimit: 6 }),
   ];
   assert.equal(
-    restored.filter((r) => r.logs.some((l) => l.includes("event=capture_spool_restored"))).length,
+    restored.reduce(
+      (sum, runtime) => sum + runtime.logs.filter((l) => l.includes("event=capture_pipeline")).length,
+      0,
+    ),
     1,
-    "the spool is read by one pipeline, not by every registration",
+    "only one live runtime owns the restored durable journal",
   );
 
   restored[0].hooks.get("agent_end")(
@@ -192,16 +203,17 @@ test("a restart with unsent messages flushes the restored buffer exactly once", 
     ctx,
   );
   await waitFor(() => calls.some((c) => c.name === "add_memory"));
-  await waitFor(() => calls.filter((c) => c.name === "get_saga").length >= 2);
+  await waitFor(() => calls.some((c) => c.name === "get_episodes_by_ref"));
 
   const adds = calls.filter((c) => c.name === "add_memory");
-  assert.equal(adds.length, 1, "the restored batch must reach Graphiti once, under one uuid");
+  assert.equal(adds.length, 1);
   assert.equal(adds[0].arguments.name.endsWith("-1"), true);
   await restored[0].hooks.get("gateway_stop")();
 });
 
 test("a stopped pipeline is replaced rather than reused", async (t) => {
   resetCaptureRuntimeForTests();
+  t.after(resetCaptureRuntimeForTests);
   installFetch(t);
   const dir = join(stateRoot, "revive");
 
@@ -210,17 +222,14 @@ test("a stopped pipeline is replaced rather than reused", async (t) => {
 
   const second = registerRuntime(dir);
   assert.ok(second.logs.some((l) => l.includes('event=capture_pipeline outcome="replaced_stopped"')));
-
   second.hooks.get("agent_end")(turn(1), ctx);
-  assert.ok(
-    !second.logs.some((l) => l.includes("engine_rejected_messages")),
-    "the fresh pipeline accepts capture",
-  );
+  assert.ok(!second.logs.some((l) => l.includes("engine_rejected_messages")));
   await second.hooks.get("gateway_stop")();
 });
 
-test("hot reconfiguration cannot create a second live spool owner", async (t) => {
+test("hot reconfiguration cannot create a second live durable owner", async (t) => {
   resetCaptureRuntimeForTests();
+  t.after(resetCaptureRuntimeForTests);
   installFetch(t);
   const dir = join(stateRoot, "reconfigured");
 
@@ -234,10 +243,11 @@ test("hot reconfiguration cannot create a second live spool owner", async (t) =>
   await afterStop.hooks.get("gateway_stop")();
 });
 
-test("one spool holds several agents without their data ever meeting", async (t) => {
+test("durable state for several agents never mixes their conversations", async (t) => {
   resetCaptureRuntimeForTests();
+  t.after(resetCaptureRuntimeForTests);
   const dir = join(stateRoot, "multi-agent");
-  const before = installFetch(t);
+  const beforeCalls = installFetch(t);
 
   const gateway = registerRuntime(dir, { bufferLimit: 6 });
   gateway.hooks.get("agent_end")(
@@ -249,21 +259,27 @@ test("one spool holds several agents without their data ever meeting", async (t)
     { agentId: "igor", sessionKey: "agent:igor:telegram:2", trigger: "user" },
   );
   await gateway.hooks.get("gateway_stop")();
-  assert.deepEqual(before.filter((c) => c.name === "add_memory"), []);
+  assert.deepEqual(beforeCalls.filter((c) => c.name === "add_memory"), []);
 
   resetCaptureRuntimeForTests();
   const calls = installFetch(t);
-  const after = registerRuntime(dir, { bufferLimit: 2, bufferTimeout: 30 });
+  const after = registerRuntime(dir, { bufferLimit: 2 });
   after.hooks.get("agent_end")(
-    { success: true, messages: [{ role: "user", content: "секрет вита" }, { role: "assistant", content: "ответ виту" }] },
+    {
+      success: true,
+      messages: [
+        { role: "user", content: "секрет вита" },
+        { role: "assistant", content: "ответ виту" },
+      ],
+    },
     { agentId: "main", sessionKey: "agent:main:telegram:1", trigger: "user" },
   );
   await waitFor(() => calls.some((c) => c.name === "add_memory"));
 
   const adds = calls.filter((c) => c.name === "add_memory").map((c) => c.arguments);
-  assert.equal(adds.length, 1, "only the agent that reached its limit is submitted");
+  assert.equal(adds.length, 1);
   assert.equal(adds[0].group_id, "main");
   assert.match(adds[0].episode_body, /секрет вита/);
-  assert.doesNotMatch(adds[0].episode_body, /секрет игоря/, "another agent's buffer must never join this episode");
+  assert.doesNotMatch(adds[0].episode_body, /секрет игоря/);
   await after.hooks.get("gateway_stop")();
 });

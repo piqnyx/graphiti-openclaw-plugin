@@ -170,26 +170,25 @@ export class GraphitiMcpClient {
   }
 
   /**
-   * Submit one durable episode head and resolve only after the episode is actually
-   * visible in the graph.
+   * Submit one durable episode head and resolve only after the episode is fully
+   * committed to its saga.
    *
-   * Graphiti's add_memory response means "queued", not "stored". Returning that
-   * response to BufferEngine used to pop the durable FIFO head and let later
-   * batches overtake an episode that could still fail in the backend. This method
-   * therefore owns the acknowledgement boundary: queued work stays in the caller's
-   * queue until get_episodes_by_ref proves that the exact UUID exists.
+   * Graphiti saves the Episodic node before it creates NEXT_EPISODE/HAS_EPISODE
+   * and before it persists saga.first/last_episode_uuid. Seeing the bare node is
+   * therefore not a delivery acknowledgement: a crash in that window leaves the
+   * exact detached/half-written episode this pipeline is meant to prevent.
    *
-   * If the backend process restarts, its RAM queue disappears. Once the backend is
-   * reachable again and reports that this UUID is neither active nor queued, the
-   * same UUID is resubmitted after a grace period. The server deduplicates active
-   * and queued UUIDs, so a lost MCP response cannot create a second execution.
+   * For conversation batches, saga.last_episode_uuid is the commit marker because
+   * Graphiti writes it after both saga edges. For a first batch we additionally
+   * require saga.first_episode_uuid to match. Standalone episodes without a saga
+   * fall back to exact UUID existence because they have no chronology to commit.
    */
   async addMemory(params: {
     uuid: string;
     name: string;
     jsonBody: string;
     groupId: string;
-    /** Omitted for standalone episodes such as agent notes, which belong to no dialog chronology. */
+    /** Omitted for standalone episodes such as direct MCP callers with no dialog chronology. */
     saga?: string;
     referenceTime: string;
     previousEpisodeUuids: string[];
@@ -217,10 +216,9 @@ export class GraphitiMcpClient {
 
     while (true) {
       // Confirmation always wins. This also makes replay after an OpenClaw restart
-      // cheap: if the previous process submitted successfully before dying, no LLM
-      // work is repeated.
+      // cheap: if the previous process finished before dying, no LLM work is repeated.
       try {
-        if (await this.episodeExists(params.groupId, params.uuid)) {
+        if (await this.episodeCommitted(params)) {
           return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
         }
       } catch (error) {
@@ -266,9 +264,22 @@ export class GraphitiMcpClient {
     }
   }
 
-  private async episodeExists(groupId: string, uuid: string): Promise<boolean> {
-    const episodes = await this.getEpisodesByRef(groupId, { uuids: [uuid] });
-    return episodes.some((episode) => episode.uuid === uuid);
+  private async episodeCommitted(params: {
+    uuid: string;
+    groupId: string;
+    saga?: string;
+    previousEpisodeUuids: string[];
+  }): Promise<boolean> {
+    const episodes = await this.getEpisodesByRef(params.groupId, { uuids: [params.uuid] });
+    if (!episodes.some((episode) => episode.uuid === params.uuid)) return false;
+    if (!params.saga) return true;
+
+    const saga = await this.getSaga(params.saga, params.groupId);
+    if (!saga || saga.lastEpisodeUuid !== params.uuid) return false;
+    if (params.previousEpisodeUuids.length === 0 && saga.firstEpisodeUuid !== params.uuid) {
+      return false;
+    }
+    return true;
   }
 
   async getSaga(sagaName: string, groupId: string): Promise<SagaState | undefined> {
@@ -278,7 +289,7 @@ export class GraphitiMcpClient {
     });
     if (typeof result.error === "string") {
       if (/^No saga named /.test(result.error)) return undefined;
-      throw new Error(result.error);
+      throw new McpToolResultError(result.error);
     }
     const episodeCount = requiredNonnegativeInteger(result.episode_count, "episode_count");
     return {
@@ -313,10 +324,7 @@ export class GraphitiMcpClient {
     };
   }
 
-  /**
-   * Entity search. Like searchFacts this is scoped to one group, which the fork
-   * resolves to that agent's physical graph.
-   */
+  /** Entity search. Like fact search this is scoped to one physical agent graph. */
   async getEpisodes(groupId: string, limit: number): Promise<JsonObject[]> {
     const result = await this.callTool("get_episodes", {
       group_ids: groupId,
@@ -328,13 +336,7 @@ export class GraphitiMcpClient {
       : [];
   }
 
-  /**
-   * Graph size, shape and integrity, from the fork's read-only diagnostics tool.
-   *
-   * The report is returned as received: it is a bag of independently gathered
-   * sections, and one unavailable section must not cost us the others, so shape
-   * validation belongs where the report is rendered rather than here.
-   */
+  /** Graph size, shape and integrity from the fork's read-only diagnostics tool. */
   async getGraphStats(
     groupId: string,
     topEntities: number,
@@ -365,13 +367,7 @@ export class GraphitiMcpClient {
       : [];
   }
 
-  /**
-   * One search returning facts, entities and episodes, each with its score.
-   *
-   * Replaces the separate fact and node searches: the server runs a single
-   * retrieval pass, and the scores it computes survive the trip, which is what
-   * lets an agent choose what to expand by number rather than by position.
-   */
+  /** One search returning facts, entities and episodes with backend-computed scores. */
   async searchCombined(
     query: string,
     groupId: string,
@@ -440,8 +436,6 @@ export class GraphitiMcpClient {
 
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
-    // Concurrent callers (capture flush plus the backend health poll) must share
-    // one handshake instead of racing two sessions onto the same client.
     this.initializing ??= this.initialize().finally(() => {
       this.initializing = undefined;
     });

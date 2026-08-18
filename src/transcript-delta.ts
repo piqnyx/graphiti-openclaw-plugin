@@ -276,9 +276,14 @@ export class TranscriptDeltaTracker {
     const end = findUniqueTailEnd(current.map(messageHash), watermark.tailHashes);
     if (end >= 0) return current.slice(end + 1).map((message) => ({ ...message }));
 
-    throw new TranscriptCursorError(
-      "durable transcript cursor is not present in the current OpenClaw transcript; refusing to skip or replay messages",
-    );
+    /*
+     * OpenClaw may restart with a rewritten transcript where neither the exact
+     * committed prefix nor the tail anchor survives. Do not block capture
+     * forever. Start from the current logical turn instead.
+     *
+     * This intentionally prefers possible replay over permanent capture loss.
+     */
+    return initialTail(current);
   }
 
   private pruneSnapshots(): void {

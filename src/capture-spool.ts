@@ -18,27 +18,20 @@ import type {
   PersistedBuffer,
   PersistedQueueEntry,
 } from "./buffer.js";
-import type { PendingBatch } from "./pending-confirmation.js";
 import type { SessionWatermark } from "./transcript-delta.js";
 
 /**
- * Durable capture state.
- *
- * Three things that must survive a restart together: batches not yet handed to
- * Graphiti, batches handed over but not yet seen in the graph, and how far each
- * session's transcript was already captured. Splitting them across files would
- * let a crash land between two writes and leave the set inconsistent.
+ * One authoritative local state: transcript cursors plus the per-agent durable
+ * FIFO. A batch stays in that FIFO until Graphiti proves the complete Saga commit.
+ * There is intentionally no second "accepted but unconfirmed" ledger anymore.
  */
 export type CaptureSpoolState = {
-  version: 3;
+  version: 4;
   agents: PersistedAgentCaptureState[];
   sessions: SessionWatermark[];
-  pending: PendingBatch[];
 };
 
-const SPOOL_VERSION = 3 as const;
-const PREVIOUS_SPOOL_VERSION = 2 as const;
-const LEGACY_SPOOL_VERSION = 1 as const;
+const SPOOL_VERSION = 4 as const;
 const SPOOL_DIR_NAME = "graphiti-openclaw-plugin";
 const SPOOL_FILE_NAME = "capture-spool.json";
 
@@ -53,7 +46,6 @@ function resolveUserPath(value: string): string {
   return resolve(trimmed);
 }
 
-/** Resolve OpenClaw's mutable state directory without importing OpenClaw internals. */
 export function resolveOpenClawStateDir(): string {
   const override = process.env.OPENCLAW_STATE_DIR?.trim();
   return override ? resolveUserPath(override) : join(homedir(), ".openclaw");
@@ -182,12 +174,15 @@ function parseSessionWatermark(value: unknown): SessionWatermark {
   }
   if (
     !Array.isArray(value.tailHashes) ||
-    !value.tailHashes.every((hash) => typeof hash === "string" && hash.trim() !== "")
+    !value.tailHashes.every((hash) => typeof hash === "string" && /^[0-9a-f]{64}$/i.test(hash))
   ) {
     throw new Error("capture spool session watermark has invalid tailHashes");
   }
-  if (typeof value.observedMessages !== "number" || !Number.isFinite(value.observedMessages)) {
+  if (!Number.isInteger(value.observedMessages) || (value.observedMessages as number) < 0) {
     throw new Error("capture spool session watermark has an invalid observedMessages");
+  }
+  if (typeof value.prefixDigest !== "string" || !/^[0-9a-f]{64}$/i.test(value.prefixDigest)) {
+    throw new Error("capture spool session watermark has an invalid prefixDigest");
   }
   if (typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt)) {
     throw new Error("capture spool session watermark has an invalid updatedAt");
@@ -196,86 +191,174 @@ function parseSessionWatermark(value: unknown): SessionWatermark {
     agentId: value.agentId,
     sessionKey: value.sessionKey,
     tailHashes: value.tailHashes as string[],
-    observedMessages: value.observedMessages,
+    observedMessages: value.observedMessages as number,
+    prefixDigest: value.prefixDigest,
     updatedAt: value.updatedAt,
   };
 }
 
-/**
- * Version 1 spools carry unaccepted batches but no session watermarks. They are
- * accepted as-is so a gateway upgrade never strands capture data behind a
- * schema check.
- */
-function parseState(value: unknown): CaptureSpoolState {
-  if (!isObject(value) || !Array.isArray(value.agents)) {
-    throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
+type LegacyPending = {
+  agentId: string;
+  sessionKey: string;
+  uuid: string;
+  name: string;
+  batchNumber: number;
+  episodeBody: string;
+  previousEpisodeUuids: string[];
+  referenceTime: string;
+  sagaPreviousEpisodeUuid?: string;
+  submittedAt: number;
+};
+
+function parseLegacyPending(value: unknown): LegacyPending | undefined {
+  if (!isObject(value)) return undefined;
+  if (
+    typeof value.agentId !== "string" ||
+    typeof value.sessionKey !== "string" ||
+    typeof value.uuid !== "string" ||
+    typeof value.name !== "string" ||
+    !Number.isInteger(value.batchNumber) ||
+    typeof value.episodeBody !== "string" ||
+    typeof value.referenceTime !== "string" ||
+    typeof value.submittedAt !== "number" ||
+    !Number.isFinite(value.submittedAt)
+  ) {
+    return undefined;
   }
-  if (value.version === PREVIOUS_SPOOL_VERSION) {
-    // Version 2 knew nothing of confirmation. Its batches were dropped from the
-    // spool the moment Graphiti accepted them, so there is nothing outstanding to
-    // recover — an empty ledger is the truth, not a loss.
-    return {
-      version: SPOOL_VERSION,
-      agents: Array.isArray(value.agents) ? value.agents.map(parseAgentState) : [],
-      sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
-      pending: [],
-    };
-  }
-  if (value.version === LEGACY_SPOOL_VERSION) {
-    return {
-      version: SPOOL_VERSION,
-      agents: value.agents.map(parseAgentState),
-      sessions: [],
-      pending: [],
-    };
-  }
-  if (value.version !== SPOOL_VERSION) {
-    throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
-  }
+  const previousEpisodeUuids = Array.isArray(value.previousEpisodeUuids)
+    ? value.previousEpisodeUuids.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
   return {
-    version: SPOOL_VERSION,
-    agents: value.agents.map(parseAgentState),
-    sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
-    pending: Array.isArray(value.pending) ? value.pending.filter(validPendingBatch) : [],
+    agentId: value.agentId,
+    sessionKey: value.sessionKey,
+    uuid: value.uuid,
+    name: value.name,
+    batchNumber: value.batchNumber as number,
+    episodeBody: value.episodeBody,
+    previousEpisodeUuids,
+    referenceTime: value.referenceTime,
+    ...(typeof value.sagaPreviousEpisodeUuid === "string" && value.sagaPreviousEpisodeUuid
+      ? { sagaPreviousEpisodeUuid: value.sagaPreviousEpisodeUuid }
+      : {}),
+    submittedAt: value.submittedAt,
+  };
+}
+
+function legacyPendingQueueEntry(batch: LegacyPending): PersistedQueueEntry {
+  let episode: unknown;
+  try {
+    episode = JSON.parse(batch.episodeBody) as unknown;
+  } catch {
+    throw new Error(`legacy pending batch ${batch.uuid} has invalid episodeBody JSON`);
+  }
+  if (!isObject(episode) || !isObject(episode.participants) || !Array.isArray(episode.messages)) {
+    throw new Error(`legacy pending batch ${batch.uuid} has invalid conversation shape`);
+  }
+  const participants = episode.participants;
+  if (typeof participants.user !== "string" || typeof participants.assistant !== "string") {
+    throw new Error(`legacy pending batch ${batch.uuid} has invalid participants`);
+  }
+  if (!episode.messages.every(validMessage)) {
+    throw new Error(`legacy pending batch ${batch.uuid} has invalid messages`);
+  }
+  const at = Number.isFinite(Date.parse(batch.referenceTime))
+    ? Date.parse(batch.referenceTime)
+    : batch.submittedAt;
+  const previousEpisodeUuid =
+    batch.sagaPreviousEpisodeUuid ?? batch.previousEpisodeUuids.at(-1);
+  return {
+    buffer: {
+      sessionKey: batch.sessionKey,
+      participants: { user: participants.user, assistant: participants.assistant },
+      messages: episode.messages.map((message) => ({
+        role: (message as { role: "user" | "assistant" }).role,
+        text: (message as { text: string }).text,
+      })),
+      createdAt: at,
+      lastActivityAt: at,
+    },
+    enqueuedAt: at,
+    reason: "timeout",
+    episode: {
+      uuid: batch.uuid,
+      name: batch.name,
+      batchNumber: batch.batchNumber,
+      ...(previousEpisodeUuid ? { previousEpisodeUuid } : {}),
+      submittedAt: batch.submittedAt,
+    },
   };
 }
 
 /**
- * A pending batch is only worth restoring if it can still be resubmitted, which
- * takes its identity and its body. A malformed entry is dropped rather than
- * repaired: resubmitting a guess would write a wrong episode under a real uuid.
+ * Version 3 had two authoritative queues. Migrate every pending confirmation back
+ * in front of the ordinary FIFO, preserving submission order, then throw the old
+ * cursor hashes away because v4 uses cryptographic prefix identity. No batch is
+ * discarded merely because the old architecture called it "accepted".
  */
-function validPendingBatch(value: unknown): value is PendingBatch {
-  return (
-    isObject(value) &&
-    typeof value.uuid === "string" &&
-    value.uuid.trim() !== "" &&
-    typeof value.agentId === "string" &&
-    typeof value.sessionKey === "string" &&
-    typeof value.name === "string" &&
-    typeof value.episodeBody === "string" &&
-    typeof value.referenceTime === "string" &&
-    typeof value.batchNumber === "number" &&
-    Number.isInteger(value.batchNumber) &&
-    typeof value.submittedAt === "number" &&
-    typeof value.attempts === "number"
-  );
+function migrateV3(value: Record<string, unknown>): CaptureSpoolState {
+  const agents = Array.isArray(value.agents) ? value.agents.map(parseAgentState) : [];
+  const byAgent = new Map(agents.map((agent) => [agent.agentId, agent] as const));
+  const pending = Array.isArray(value.pending)
+    ? value.pending.map(parseLegacyPending).filter((batch): batch is LegacyPending => batch !== undefined)
+    : [];
+  pending.sort((a, b) => a.submittedAt - b.submittedAt || a.batchNumber - b.batchNumber);
+
+  for (const batch of pending) {
+    let agent = byAgent.get(batch.agentId);
+    if (!agent) {
+      agent = { agentId: batch.agentId, activeBuffers: [], queue: [] };
+      agents.push(agent);
+      byAgent.set(batch.agentId, agent);
+    }
+    if (agent.queue.some((entry) => entry.episode?.uuid === batch.uuid)) continue;
+    agent.queue.unshift(legacyPendingQueueEntry(batch));
+  }
+
+  // unshift reverses within an agent; restore chronological order by the identity
+  // submission timestamp before any unassigned later queue entries.
+  for (const agent of agents) {
+    const assigned = agent.queue.filter((entry) => entry.episode).sort(
+      (a, b) => (a.episode?.submittedAt ?? 0) - (b.episode?.submittedAt ?? 0),
+    );
+    const unassigned = agent.queue.filter((entry) => !entry.episode);
+    agent.queue = [...assigned, ...unassigned];
+  }
+
+  return { version: SPOOL_VERSION, agents, sessions: [] };
+}
+
+function parseState(value: unknown): CaptureSpoolState {
+  if (!isObject(value) || !Array.isArray(value.agents)) {
+    throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
+  }
+  if (value.version === 4) {
+    return {
+      version: SPOOL_VERSION,
+      agents: value.agents.map(parseAgentState),
+      sessions: Array.isArray(value.sessions) ? value.sessions.map(parseSessionWatermark) : [],
+    };
+  }
+  if (value.version === 3) return migrateV3(value);
+  if (value.version === 2 || value.version === 1) {
+    // These formats contain no reliable exact transcript cursor. Their local
+    // unaccepted queue is still valuable and is preserved byte-for-structure.
+    return {
+      version: SPOOL_VERSION,
+      agents: value.agents.map(parseAgentState),
+      sessions: [],
+    };
+  }
+  throw new Error(`capture spool must use schema version ${SPOOL_VERSION}`);
 }
 
 function hasData(state: CaptureSpoolState): boolean {
-  if (state.sessions.length > 0 || state.pending.length > 0) return true;
+  if (state.sessions.length > 0) return true;
   return state.agents.some(
     (agent) => agent.activeBuffers.some((buffer) => buffer.messages.length > 0) || agent.queue.length > 0,
   );
 }
 
-/**
- * Atomic local checkpoint for unaccepted capture data.
- *
- * A CaptureSpool instance may remove the shared file only after that same
- * instance has successfully loaded or written it. This prevents another empty
- * plugin runtime from deleting capture data that appeared after its own startup.
- */
+/** Atomic replace + fsync for the single authoritative local checkpoint. */
 export class CaptureSpool {
   readonly path: string;
   private ownsFile = false;
@@ -299,9 +382,6 @@ export class CaptureSpool {
 
   save(snapshot: CaptureSpoolState): void {
     if (!hasData(snapshot)) {
-      // register() may run in more than one OpenClaw runtime/process. An instance
-      // that started with no spool and never wrote capture data must not unlink a
-      // file created later by another live instance.
       if (!this.ownsFile) return;
       try {
         unlinkSync(this.path);
@@ -338,7 +418,7 @@ export class CaptureSpool {
       try {
         unlinkSync(tempPath);
       } catch {
-        // Best-effort cleanup; the authoritative previous spool was never replaced.
+        // The previous authoritative spool is untouched; temp cleanup is best effort.
       }
       throw error;
     }

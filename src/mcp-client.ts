@@ -23,6 +23,9 @@ export type SagaState = {
   firstEpisodeUuid?: string;
   lastEpisodeUuid?: string;
   episodeCount: number;
+  chainCount: number;
+  integrityOk: boolean;
+  integrityErrors: string[];
 };
 
 export type QueueStatus = {
@@ -40,6 +43,12 @@ export type QueueStatus = {
 
 class McpToolResultError extends Error {}
 class McpJsonRpcError extends Error {}
+class McpClientClosedError extends Error {
+  constructor() {
+    super("Graphiti MCP client is shutting down");
+    this.name = "McpClientClosedError";
+  }
+}
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -55,8 +64,23 @@ function isDefinitiveMcpError(value: unknown): boolean {
   return value instanceof McpToolResultError || value instanceof McpJsonRpcError;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function isClientClosedError(value: unknown): boolean {
+  return value instanceof McpClientClosedError;
+}
+
+function cancellableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new McpClientClosedError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new McpClientClosedError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function parseSseBody(body: string, requestId: number): JsonRpcResponse {
@@ -81,7 +105,6 @@ function parseSseBody(body: string, requestId: number): JsonRpcResponse {
   throw new Error("MCP SSE response contained no JSON-RPC payload");
 }
 
-/** Normalize FastMCP structuredContent, including the {result:{...}} wrapper used by Graphiti. */
 function normalizeStructuredResult(value: JsonObject): JsonObject {
   return isObject(value.result) ? value.result : value;
 }
@@ -98,10 +121,7 @@ function decodeToolResult(result: unknown): JsonObject {
     throw new McpToolResultError(text || "Graphiti MCP tool returned isError=true");
   }
 
-  if (isObject(result.structuredContent)) {
-    return normalizeStructuredResult(result.structuredContent);
-  }
-
+  if (isObject(result.structuredContent)) return normalizeStructuredResult(result.structuredContent);
   if (Array.isArray(result.content)) {
     for (const item of result.content) {
       if (!isObject(item) || typeof item.text !== "string") continue;
@@ -109,17 +129,16 @@ function decodeToolResult(result: unknown): JsonObject {
         const parsed = JSON.parse(item.text) as unknown;
         if (isObject(parsed)) return normalizeStructuredResult(parsed);
       } catch {
-        // Plain text is not useful for the structured Graphiti tools used here.
+        // Plain text is irrelevant for the structured tools used here.
       }
     }
   }
-
   return {};
 }
 
 function requiredString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`Graphiti returned invalid ${field}`);
+    throw new McpToolResultError(`Graphiti returned invalid ${field}`);
   }
   return value;
 }
@@ -130,8 +149,13 @@ function optionalString(value: unknown): string | undefined {
 
 function requiredNonnegativeInteger(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new Error(`Graphiti returned invalid ${field}`);
+    throw new McpToolResultError(`Graphiti returned invalid ${field}`);
   }
+  return value;
+}
+
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") throw new McpToolResultError(`Graphiti returned invalid ${field}`);
   return value;
 }
 
@@ -150,6 +174,7 @@ export class GraphitiMcpClient {
   private readonly rawLogger?: (kind: "request" | "response", body: string) => void;
   private readonly deliveryPollMs: number;
   private readonly deliveryResubmitGraceMs: number;
+  private readonly lifecycle = new AbortController();
 
   constructor(
     private readonly baseUrl: string,
@@ -169,26 +194,28 @@ export class GraphitiMcpClient {
     }
   }
 
+  close(): void {
+    if (!this.lifecycle.signal.aborted) this.lifecycle.abort();
+    this.resetSession();
+  }
+
+  private assertOpen(): void {
+    if (this.lifecycle.signal.aborted) throw new McpClientClosedError();
+  }
+
   /**
-   * Submit one durable episode head and resolve only after the episode is fully
-   * committed to its saga.
+   * Deliver one durable FIFO head and return only after a structurally valid Saga
+   * reports that exact UUID as its committed tail.
    *
-   * Graphiti saves the Episodic node before it creates NEXT_EPISODE/HAS_EPISODE
-   * and before it persists saga.first/last_episode_uuid. Seeing the bare node is
-   * therefore not a delivery acknowledgement: a crash in that window leaves the
-   * exact detached/half-written episode this pipeline is meant to prevent.
-   *
-   * For conversation batches, saga.last_episode_uuid is the commit marker because
-   * Graphiti writes it after both saga edges. For a first batch we additionally
-   * require saga.first_episode_uuid to match. Standalone episodes without a saga
-   * fall back to exact UUID existence because they have no chronology to commit.
+   * The call may wait for hours through provider outages. The caller's queue head
+   * remains on disk during that entire time. A lost HTTP response never triggers
+   * a blind replay: graph state and server queue ownership are observed first.
    */
   async addMemory(params: {
     uuid: string;
     name: string;
     jsonBody: string;
     groupId: string;
-    /** Omitted for standalone episodes such as direct MCP callers with no dialog chronology. */
     saga?: string;
     referenceTime: string;
     previousEpisodeUuids: string[];
@@ -207,25 +234,22 @@ export class GraphitiMcpClient {
       custom_extraction_instructions: CUSTOM_EXTRACTION_PROMPT,
     };
     if (params.saga) args.saga = params.saga;
-    if (params.sagaPreviousEpisodeUuid) {
-      args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
-    }
+    if (params.sagaPreviousEpisodeUuid) args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
 
     let lastSubmissionResult: JsonObject = {};
     let lastSubmissionAt = 0;
 
     while (true) {
-      // Confirmation always wins. This also makes replay after an OpenClaw restart
-      // cheap: if the previous process finished before dying, no LLM work is repeated.
+      this.assertOpen();
       try {
         if (await this.episodeCommitted(params)) {
           return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
         }
       } catch (error) {
-        if (isDefinitiveMcpError(error)) throw error;
-        // If the backend cannot answer a read, it is not safe to guess that the
-        // episode is absent and submit another copy. Wait for observability first.
-        await sleep(this.deliveryPollMs);
+        if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
+        // Read visibility is required before any retry decision. During an outage
+        // we wait rather than turning uncertainty into a duplicate side effect.
+        await cancellableSleep(this.deliveryPollMs, this.lifecycle.signal);
         continue;
       }
 
@@ -233,34 +257,36 @@ export class GraphitiMcpClient {
       try {
         status = await this.getQueueStatus(params.groupId);
       } catch (error) {
-        if (isDefinitiveMcpError(error)) throw error;
-        await sleep(this.deliveryPollMs);
+        if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
+        await cancellableSleep(this.deliveryPollMs, this.lifecycle.signal);
         continue;
       }
 
-      const backendOwnsUuid =
-        status.episodeUuid === params.uuid || status.queuedEpisodeUuids.includes(params.uuid);
+      const activeHere = status.episodeUuid === params.uuid;
+      const queuedHere = status.queuedEpisodeUuids.includes(params.uuid);
+      // A queued UUID with no worker is not ownership, it is stranded RAM. The
+      // server normally self-heals this in get_queue_status; treating the broken
+      // answer as absent lets the idempotent server submission kick it again after
+      // the ambiguity grace instead of waiting forever.
+      const backendOwnsUuid = activeHere || (queuedHere && status.workerRunning !== false);
       const submissionOldEnough =
         lastSubmissionAt === 0 || Date.now() - lastSubmissionAt >= this.deliveryResubmitGraceMs;
 
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
-          // Side-effecting calls intentionally get no automatic transport replay.
-          // If the HTTP response is lost after the server accepted the task, the
-          // next loop verifies graph/queue state before considering a resubmit.
           lastSubmissionResult = await this.callToolOnce("add_memory", args);
           if (typeof lastSubmissionResult.error === "string") {
             throw new McpToolResultError(lastSubmissionResult.error);
           }
         } catch (error) {
-          if (isDefinitiveMcpError(error)) throw error;
-          // The outcome is ambiguous at the transport boundary. Remember that an
-          // attempt happened and spend the grace period observing before retrying.
+          if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
+          // Ambiguous transport outcome. Record that an attempt happened and
+          // observe graph/queue state for the whole grace period before retrying.
         }
         lastSubmissionAt = Date.now();
       }
 
-      await sleep(this.deliveryPollMs);
+      await cancellableSleep(this.deliveryPollMs, this.lifecycle.signal);
     }
   }
 
@@ -275,23 +301,23 @@ export class GraphitiMcpClient {
     if (!params.saga) return true;
 
     const saga = await this.getSaga(params.saga, params.groupId);
-    if (!saga || saga.lastEpisodeUuid !== params.uuid) return false;
-    if (params.previousEpisodeUuids.length === 0 && saga.firstEpisodeUuid !== params.uuid) {
-      return false;
+    if (!saga) return false;
+    if (!saga.integrityOk || saga.chainCount !== saga.episodeCount) {
+      throw new McpToolResultError(
+        `Graphiti Saga ${params.groupId}/${params.saga} failed integrity validation: ${saga.integrityErrors.join("; ") || "unknown chain error"}`,
+      );
     }
+    if (saga.lastEpisodeUuid !== params.uuid) return false;
+    if (params.previousEpisodeUuids.length === 0 && saga.firstEpisodeUuid !== params.uuid) return false;
     return true;
   }
 
   async getSaga(sagaName: string, groupId: string): Promise<SagaState | undefined> {
-    const result = await this.callTool("get_saga", {
-      saga_name: sagaName,
-      group_id: groupId,
-    });
+    const result = await this.callTool("get_saga", { saga_name: sagaName, group_id: groupId });
     if (typeof result.error === "string") {
       if (/^No saga named /.test(result.error)) return undefined;
       throw new McpToolResultError(result.error);
     }
-    const episodeCount = requiredNonnegativeInteger(result.episode_count, "episode_count");
     return {
       uuid: requiredString(result.uuid, "uuid"),
       name: requiredString(result.name, "name"),
@@ -300,19 +326,19 @@ export class GraphitiMcpClient {
       summary: typeof result.summary === "string" ? result.summary : "",
       firstEpisodeUuid: optionalString(result.first_episode_uuid),
       lastEpisodeUuid: optionalString(result.last_episode_uuid),
-      episodeCount,
+      episodeCount: requiredNonnegativeInteger(result.episode_count, "episode_count"),
+      chainCount: requiredNonnegativeInteger(result.chain_count, "chain_count"),
+      integrityOk: requiredBoolean(result.integrity_ok, "integrity_ok"),
+      integrityErrors: optionalStringArray(result.integrity_errors),
     };
   }
 
   async getQueueStatus(groupId: string): Promise<QueueStatus> {
     const result = await this.callTool("get_queue_status", { group_id: groupId });
     if (typeof result.error === "string") throw new McpToolResultError(result.error);
-    if (typeof result.blocked !== "boolean") {
-      throw new McpToolResultError("Graphiti get_queue_status returned invalid blocked");
-    }
     return {
       groupId: requiredString(result.group_id, "group_id"),
-      blocked: result.blocked,
+      blocked: requiredBoolean(result.blocked, "blocked"),
       attempts: requiredNonnegativeInteger(result.attempts, "attempts"),
       pending: requiredNonnegativeInteger(result.pending, "pending"),
       workerRunning: typeof result.worker_running === "boolean" ? result.worker_running : undefined,
@@ -324,19 +350,14 @@ export class GraphitiMcpClient {
     };
   }
 
-  /** Entity search. Like fact search this is scoped to one physical agent graph. */
   async getEpisodes(groupId: string, limit: number): Promise<JsonObject[]> {
-    const result = await this.callTool("get_episodes", {
-      group_ids: groupId,
-      max_episodes: limit,
-    });
+    const result = await this.callTool("get_episodes", { group_ids: groupId, max_episodes: limit });
     if (typeof result.error === "string") throw new Error(result.error);
     return Array.isArray(result.episodes)
       ? result.episodes.filter((episode): episode is JsonObject => isObject(episode))
       : [];
   }
 
-  /** Graph size, shape and integrity from the fork's read-only diagnostics tool. */
   async getGraphStats(
     groupId: string,
     topEntities: number,
@@ -351,7 +372,6 @@ export class GraphitiMcpClient {
     return result;
   }
 
-  /** Fetch specific episodes, with their text, by uuid or by name. */
   async getEpisodesByRef(
     groupId: string,
     refs: { uuids?: string[]; names?: string[] },
@@ -367,7 +387,6 @@ export class GraphitiMcpClient {
       : [];
   }
 
-  /** One search returning facts, entities and episodes with backend-computed scores. */
   async searchCombined(
     query: string,
     groupId: string,
@@ -389,11 +408,7 @@ export class GraphitiMcpClient {
     if (typeof result.error === "string") throw new Error(result.error);
     const list = (value: unknown): JsonObject[] =>
       Array.isArray(value) ? value.filter((item): item is JsonObject => isObject(item)) : [];
-    return {
-      facts: list(result.facts),
-      entities: list(result.entities),
-      episodes: list(result.episodes),
-    };
+    return { facts: list(result.facts), entities: list(result.entities), episodes: list(result.episodes) };
   }
 
   async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
@@ -421,12 +436,9 @@ export class GraphitiMcpClient {
     try {
       response = await this.rpc("tools/call", { name, arguments: args });
     } catch (error) {
-      // Read-only calls may safely repair a lost MCP session and retry. add_memory
-      // bypasses this method so a side effect is never replayed merely because an
-      // HTTP/MCP response went missing.
-      if (!this.initialized) throw error;
-      if (!/404|session/i.test(errorMessage(error))) throw error;
-
+      if (isClientClosedError(error)) throw error;
+      // Read-only calls may safely repair a lost MCP session and retry once.
+      if (!this.initialized || !/404|session/i.test(errorMessage(error))) throw error;
       this.resetSession();
       await this.ensureInitialized();
       response = await this.rpc("tools/call", { name, arguments: args });
@@ -435,6 +447,7 @@ export class GraphitiMcpClient {
   }
 
   private async ensureInitialized(): Promise<void> {
+    this.assertOpen();
     if (this.initialized) return;
     this.initializing ??= this.initialize().finally(() => {
       this.initializing = undefined;
@@ -448,10 +461,7 @@ export class GraphitiMcpClient {
       {
         protocolVersion: this.protocolVersion,
         capabilities: {},
-        clientInfo: {
-          name: "graphiti-openclaw-plugin",
-          version: "0.1.0",
-        },
+        clientInfo: { name: "graphiti-openclaw-plugin", version: "0.4.0" },
       },
       false,
     );
@@ -459,7 +469,6 @@ export class GraphitiMcpClient {
     if (isObject(response.result) && typeof response.result.protocolVersion === "string") {
       this.protocolVersion = response.result.protocolVersion;
     }
-
     await this.notify("notifications/initialized", {});
     this.initialized = true;
   }
@@ -479,9 +488,7 @@ export class GraphitiMcpClient {
     const response = await this.post(payload, includeProtocolHeader);
     if (isObject(response.error)) {
       throw new McpJsonRpcError(
-        typeof response.error.message === "string"
-          ? response.error.message
-          : `MCP ${method} failed`,
+        typeof response.error.message === "string" ? response.error.message : `MCP ${method} failed`,
       );
     }
     return response;
@@ -496,8 +503,12 @@ export class GraphitiMcpClient {
     includeProtocolHeader: boolean,
     notification = false,
   ): Promise<JsonRpcResponse> {
+    this.assertOpen();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const closeRequest = () => controller.abort();
+    this.lifecycle.signal.addEventListener("abort", closeRequest, { once: true });
+
     try {
       const headers = new Headers({
         Accept: "application/json, text/event-stream",
@@ -509,7 +520,7 @@ export class GraphitiMcpClient {
       this.rawLogger?.(
         "request",
         `POST ${this.baseUrl}\n${[...headers.entries()]
-          .map(([k, v]) => `${k}: ${v}`)
+          .map(([key, value]) => `${key}: ${value}`)
           .join("\n")}\n\n${JSON.stringify(payload)}`,
       );
 
@@ -528,7 +539,6 @@ export class GraphitiMcpClient {
         this.rawLogger?.("response", `HTTP ${response.status}\n${detail}`);
         throw new Error(`Graphiti MCP HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
       }
-
       if (notification || response.status === 202 || response.status === 204) return {};
 
       const body = await response.text();
@@ -544,12 +554,14 @@ export class GraphitiMcpClient {
       }
       return JSON.parse(body) as JsonRpcResponse;
     } catch (error) {
+      if (this.lifecycle.signal.aborted) throw new McpClientClosedError();
       if (controller.signal.aborted) {
         throw new Error(`Graphiti MCP request timed out after ${this.timeoutMs}ms`);
       }
       throw error;
     } finally {
       clearTimeout(timer);
+      this.lifecycle.signal.removeEventListener("abort", closeRequest);
     }
   }
 }

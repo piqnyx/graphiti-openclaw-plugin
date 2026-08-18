@@ -486,6 +486,15 @@ export class DurableBufferEngine {
     return count;
   }
 
+  activeMessageCount(agentId: string): number {
+    let count = 0;
+    for (const session of this.knownSessions.values()) {
+      if (session.agentId !== agentId) continue;
+      count += this.sessionState(session.agentId, session.sessionKey).active?.messages.length ?? 0;
+    }
+    return count;
+  }
+
   isStopped(): boolean {
     return this.stopped;
   }

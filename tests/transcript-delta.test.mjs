@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BufferEngine } from "../dist/buffer.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DurableBufferEngine } from "../dist/durable-buffer-engine.js";
 import {
   TranscriptCursorError,
   TranscriptDeltaTracker,
@@ -21,6 +24,23 @@ async function waitFor(predicate, timeoutMs = 2000) {
 
 const u = (text) => ({ role: "user", text });
 const a = (text) => ({ role: "assistant", text });
+
+function rootFor(t) {
+  const root = mkdtempSync(join(tmpdir(), "graphiti-transcript-delta-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return root;
+}
+
+function watermark(sessionKey, observedMessages) {
+  return {
+    agentId: "main",
+    sessionKey,
+    tailHashes: [String(observedMessages).padStart(64, "0")],
+    observedMessages,
+    prefixDigest: "e".repeat(64),
+    updatedAt: Date.now(),
+  };
+}
 
 test("first observation captures only the current tail, including consecutive users", () => {
   const tracker = new TranscriptDeltaTracker();
@@ -46,44 +66,43 @@ test("successive snapshots emit only new user/assistant messages", () => {
 
 test("seven users plus assistant split by hard message limit without loss", async (t) => {
   const entries = [];
-  const engine = new BufferEngine(agents, 6, 3600, async (_agentId, entry) => {
+  const engine = new DurableBufferEngine(rootFor(t), agents, 6, 3600, async (_agentId, entry) => {
     entries.push(entry);
   });
-  t.after(() => engine.stop());
+  t.after(() => engine.shutdown(200));
 
-  engine.addMessages("main", "s1", [
-    u("u1"), u("u2"), u("u3"), u("u4"), u("u5"), u("u6"), u("u7"), a("a1"),
-  ]);
+  engine.ingest(
+    "main",
+    "s1",
+    [u("u1"), u("u2"), u("u3"), u("u4"), u("u5"), u("u6"), u("u7"), a("a1")],
+    watermark("s1", 8),
+  );
 
   await waitFor(() => entries.length === 1);
   assert.deepEqual(entries[0].buffer.messages, [u("u1"), u("u2"), u("u3"), u("u4"), u("u5"), u("u6")]);
   assert.equal(engine.activeBufferCount("main"), 1);
+  const state = engine.journal.read("main", "s1").committed;
+  assert.deepEqual(state.active.messages, [u("u7"), a("a1")]);
 });
 
 test("one lonely user message is eligible for timeout flush", async (t) => {
   const originalNow = Date.now;
-  const originalSetInterval = globalThis.setInterval;
   let now = 1_700_000_000_000;
-  let tick;
   Date.now = () => now;
-  globalThis.setInterval = (fn) => {
-    tick = fn;
-    return { unref() {} };
-  };
-  t.after(() => {
-    Date.now = originalNow;
-    globalThis.setInterval = originalSetInterval;
-  });
+  t.after(() => { Date.now = originalNow; });
 
   const entries = [];
-  const engine = new BufferEngine(agents, 6, 30, async (_agentId, entry, reason) => {
+  const engine = new DurableBufferEngine(rootFor(t), agents, 6, 30, async (_agentId, entry, reason) => {
     entries.push({ entry, reason });
   });
-  t.after(() => engine.stop());
+  t.after(() => engine.shutdown(200));
 
-  engine.addMessage("main", "s1", "user", "lonely-user");
-  now += 30_000;
-  await tick();
+  engine.ingest("main", "s1", [u("lonely-user")], watermark("s1", 1));
+  now += 29_999;
+  await engine.tick();
+  assert.equal(entries.length, 0);
+  now += 1;
+  await engine.tick();
   await waitFor(() => entries.length === 1);
 
   assert.equal(entries[0].reason, "timeout");
@@ -131,8 +150,6 @@ test("an ambiguous transcript failure does not poison the next cursor", () => {
     TranscriptCursorError,
   );
 
-  // Because the rejected snapshot was never published as in-memory truth, the
-  // original committed transcript still accepts its real continuation.
   assert.deepEqual(
     tracker.take("main", "s1", [u("u1"), a("a1"), u("u2")]),
     [u("u2")],
@@ -179,15 +196,15 @@ test("durable watermarks contain no text, keep a bounded tail, and do not age ou
   tracker.take("main", "s1", long);
   tracker.commit("main", "s1");
 
-  const [watermark] = tracker.export();
-  assert.equal(watermark.tailHashes.length, WATERMARK_TAIL_MESSAGES);
-  assert.equal(watermark.observedMessages, 40);
-  assert.match(JSON.stringify(watermark), /^[^а-яА-Я]*$/);
-  assert.ok(!JSON.stringify(watermark).includes("u38"));
+  const [mark] = tracker.export();
+  assert.equal(mark.tailHashes.length, WATERMARK_TAIL_MESSAGES);
+  assert.equal(mark.observedMessages, 40);
+  assert.match(JSON.stringify(mark), /^[^а-яА-Я]*$/);
+  assert.ok(!JSON.stringify(mark).includes("u38"));
 
   const yearsLater = new TranscriptDeltaTracker();
   assert.equal(
-    yearsLater.restore([{ ...watermark, updatedAt: Date.now() - 10 * 365 * 24 * 60 * 60 * 1000 }]),
+    yearsLater.restore([{ ...mark, updatedAt: Date.now() - 10 * 365 * 24 * 60 * 60 * 1000 }]),
     1,
     "durable conversation cursors must survive long-term memory retention",
   );

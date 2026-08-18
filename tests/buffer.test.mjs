@@ -66,6 +66,72 @@ test("limit trigger flushes exactly at the configured message limit", async (t) 
   assert.equal(engine.queueLength(), 0);
 });
 
+test("one observed delta is checkpointed as a whole, never one message at a time", async (t) => {
+  const snapshots = [];
+  const gate = deferred();
+  const engine = new BufferEngine(
+    agents,
+    4,
+    3600,
+    async () => gate.promise,
+    { onStateChange: (snapshot) => snapshots.push(structuredClone(snapshot)) },
+  );
+  t.after(() => engine.stop());
+
+  addMessages(
+    engine,
+    "main",
+    "s1",
+    { role: "user", text: "u1" },
+    { role: "assistant", text: "a1" },
+    { role: "user", text: "u2" },
+    { role: "assistant", text: "a2" },
+  );
+
+  // addMessages itself performs no partial durable writes. The explicit caller
+  // checkpoint is the transaction boundary shared with the transcript watermark.
+  assert.equal(snapshots.length, 0);
+  engine.checkpoint();
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(
+    snapshots[0].agents[0].queue[0].buffer.messages.map((m) => m.text),
+    ["u1", "a1", "u2", "a2"],
+  );
+
+  gate.resolve();
+});
+
+test("a failed spool write prevents any remote side effect until durability recovers", async (t) => {
+  let diskWritable = false;
+  let sinkCalls = 0;
+  const persistErrors = [];
+  const engine = new BufferEngine(
+    agents,
+    1,
+    3600,
+    async () => {
+      sinkCalls += 1;
+    },
+    {
+      onStateChange: () => {
+        if (!diskWritable) throw new Error("disk full");
+      },
+      notifyPersistError: (error) => persistErrors.push(error.message),
+    },
+  );
+  t.after(() => engine.stop());
+
+  engine.addMessage("main", "s1", "user", "must-live-on-disk-first");
+  await sleep(30);
+  assert.equal(sinkCalls, 0, "nothing may leave RAM while the authoritative spool write failed");
+  assert.deepEqual(persistErrors, ["disk full"]);
+  assert.equal(engine.queueLength(), 1);
+
+  diskWritable = true;
+  engine.checkpoint();
+  await waitFor(() => sinkCalls === 1, 1000);
+});
+
 test("buffers are isolated per session within an agent", () => {
   const flushes = [];
   const engine = new BufferEngine(agents, 4, 3600, async (_agentId, entry) => {

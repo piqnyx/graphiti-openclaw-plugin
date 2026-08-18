@@ -17,7 +17,10 @@ import {
   type JournalBatch,
 } from "./durable-capture-journal.js";
 import type { DurableQueueRecord } from "./durable-queue-store.js";
-import type { SessionWatermark } from "./transcript-delta.js";
+import {
+  TranscriptDeltaTracker,
+  type SessionWatermark,
+} from "./transcript-delta.js";
 
 export type DurableCaptureSessionState = {
   watermark?: SessionWatermark;
@@ -97,15 +100,17 @@ function sessionMapKey(agentId: string, sessionKey: string): string {
 }
 
 /**
- * Disk-authoritative capture engine intended to replace the monolithic JSON spool.
+ * Disk-authoritative capture engine.
  *
  * Active partial buffers are one small journal file per session. Completed batches
  * are segmented immutable queue files and are never copied back into session state.
  * Consequently backlog size is bounded by disk, not process RAM and not O(backlog)
  * checkpoint rewrites. Only one batch per agent is read for delivery at a time.
  *
- * This class is intentionally introduced beside BufferEngine first. The old live
- * pipeline stays untouched until the new engine's crash/fault tests are green.
+ * Transcript movement is part of the same durability boundary: the candidate cursor
+ * is committed in the session journal together with any batches produced by that
+ * observation. If the local transaction fails, the in-memory tracker is rolled back
+ * so the same messages are offered again instead of silently skipped.
  */
 export class DurableBufferEngine {
   readonly journal: DurableCaptureJournal;
@@ -115,6 +120,7 @@ export class DurableBufferEngine {
   private readonly processing = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
   private readonly failureActive = new Set<string>();
+  private readonly transcriptDeltas = new TranscriptDeltaTracker();
   private stopped = false;
   private persistFailureActive = false;
 
@@ -138,7 +144,7 @@ export class DurableBufferEngine {
     // An fsynced session intent is stronger than any in-memory state. Complete all
     // such local transactions before the first remote delivery can start.
     this.journal.recoverAll();
-    this.discoverSessions();
+    this.transcriptDeltas.restore(this.discoverSessions());
 
     this.timer = setInterval(() => {
       this.tick().catch((error: unknown) => this.opts.notifyPersistError?.(asError(error)));
@@ -180,8 +186,32 @@ export class DurableBufferEngine {
   }
 
   /**
-   * Durably ingest one transcript delta and its exact new cursor in one local transaction.
-   * On return every message is either in the session's partial buffer or a disk FIFO file.
+   * Observe one complete OpenClaw transcript snapshot and make its delta/cursor
+   * durable as one transaction. This is the production entry point for capture.
+   */
+  ingestTranscript(
+    agentId: string,
+    sessionKey: string,
+    snapshot: readonly BufferMessage[],
+  ): BufferMessage[] {
+    if (this.stopped) throw new Error("cannot add capture messages after DurableBufferEngine shutdown");
+
+    const delta = this.transcriptDeltas.take(agentId, sessionKey, snapshot);
+    const watermark = this.transcriptDeltas.pendingWatermark(agentId, sessionKey);
+    try {
+      if (delta.length > 0) this.ingest(agentId, sessionKey, delta, watermark);
+      else this.checkpointWatermark(agentId, sessionKey, watermark);
+      this.transcriptDeltas.commit(agentId, sessionKey);
+      return cloneMessages(delta);
+    } catch (error) {
+      this.transcriptDeltas.rollback(agentId, sessionKey);
+      throw error;
+    }
+  }
+
+  /**
+   * Low-level durable delta ingestion used by migration/fault tests. Production
+   * capture should call ingestTranscript so transcript movement cannot be forgotten.
    */
   ingest(
     agentId: string,
@@ -316,10 +346,11 @@ export class DurableBufferEngine {
     this.knownSessions.set(key, { agentId, sessionKey, lastActivityAt });
   }
 
-  /** Rebuild only the tiny timeout index. Queue bodies remain on disk. */
-  private discoverSessions(): void {
+  /** Rebuild only the tiny timeout index and return every durable transcript cursor. */
+  private discoverSessions(): SessionWatermark[] {
+    const watermarks: SessionWatermark[] = [];
     const sessionsRoot = join(this.journal.root, "sessions");
-    if (!existsSync(sessionsRoot)) return;
+    if (!existsSync(sessionsRoot)) return watermarks;
     for (const agentDir of readdirSync(sessionsRoot)) {
       const path = join(sessionsRoot, agentDir);
       for (const file of readdirSync(path)) {
@@ -337,11 +368,15 @@ export class DurableBufferEngine {
         const agentId = (raw as { agentId: string }).agentId;
         const sessionKey = (raw as { sessionKey: string }).sessionKey;
         const state = this.sessionState(agentId, sessionKey);
+        if (state.watermark) {
+          watermarks.push({ ...state.watermark, tailHashes: [...state.watermark.tailHashes] });
+        }
         if (state.active?.messages.length) {
           this.updateKnownSession(agentId, sessionKey, state.active.lastActivityAt);
         }
       }
     }
+    return watermarks;
   }
 
   private async tick(): Promise<void> {

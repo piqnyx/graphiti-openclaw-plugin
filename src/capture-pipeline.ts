@@ -310,9 +310,15 @@ export function createCapturePipeline(params: {
         );
       }
       if (!saga.integrityOk || saga.chainCount !== saga.episodeCount) {
-        throw new Error(
-          `Graphiti saga ${agentId}/${sessionKey} is structurally invalid: ${saga.integrityErrors.join("; ") || "chain count mismatch"}`,
-        );
+        logger.warn("capture_saga_integrity_warning", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          episodeCount: saga.episodeCount,
+          chainCount: saga.chainCount,
+          errors: saga.integrityErrors,
+          action: "continue_with_existing_saga_state",
+        });
       }
       if (saga.episodeCount > 0 && (!saga.firstEpisodeUuid || !saga.lastEpisodeUuid)) {
         throw new Error(

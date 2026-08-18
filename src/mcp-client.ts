@@ -4,8 +4,8 @@ export const CUSTOM_EXTRACTION_PROMPT = `This JSON is a conversation between the
 
 export const OPENCLAW_SOURCE_DESCRIPTION = "OpenClaw conversation batch";
 
-const DELIVERY_POLL_MS = 2_000;
-const DELIVERY_RESUBMIT_GRACE_MS = 120_000;
+const DEFAULT_DELIVERY_POLL_MS = 2_000;
+const DEFAULT_DELIVERY_RESUBMIT_GRACE_MS = 120_000;
 
 type JsonRpcResponse = {
   jsonrpc?: unknown;
@@ -38,6 +38,9 @@ export type QueueStatus = {
   queuedEpisodeUuids: string[];
 };
 
+class McpToolResultError extends Error {}
+class McpJsonRpcError extends Error {}
+
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -46,6 +49,10 @@ function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message;
   if (isObject(value) && typeof value.message === "string") return value.message;
   return String(value);
+}
+
+function isDefinitiveMcpError(value: unknown): boolean {
+  return value instanceof McpToolResultError || value instanceof McpJsonRpcError;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -80,7 +87,7 @@ function normalizeStructuredResult(value: JsonObject): JsonObject {
 }
 
 function decodeToolResult(result: unknown): JsonObject {
-  if (!isObject(result)) throw new Error("MCP tool call returned an invalid result");
+  if (!isObject(result)) throw new McpToolResultError("MCP tool call returned an invalid result");
   if (result.isError === true) {
     const text = Array.isArray(result.content)
       ? result.content
@@ -88,7 +95,7 @@ function decodeToolResult(result: unknown): JsonObject {
           .filter(Boolean)
           .join("\n")
       : "";
-    throw new Error(text || "Graphiti MCP tool returned isError=true");
+    throw new McpToolResultError(text || "Graphiti MCP tool returned isError=true");
   }
 
   if (isObject(result.structuredContent)) {
@@ -141,13 +148,25 @@ export class GraphitiMcpClient {
   private initializing?: Promise<void>;
   private nextId = 1;
   private readonly rawLogger?: (kind: "request" | "response", body: string) => void;
+  private readonly deliveryPollMs: number;
+  private readonly deliveryResubmitGraceMs: number;
 
   constructor(
     private readonly baseUrl: string,
     private readonly timeoutMs: number,
     rawLogger?: (kind: "request" | "response", body: string) => void,
+    deliveryOptions: { pollMs?: number; resubmitGraceMs?: number } = {},
   ) {
     this.rawLogger = rawLogger;
+    this.deliveryPollMs = deliveryOptions.pollMs ?? DEFAULT_DELIVERY_POLL_MS;
+    this.deliveryResubmitGraceMs =
+      deliveryOptions.resubmitGraceMs ?? DEFAULT_DELIVERY_RESUBMIT_GRACE_MS;
+    if (!Number.isFinite(this.deliveryPollMs) || this.deliveryPollMs < 0) {
+      throw new Error("delivery pollMs must be a non-negative finite number");
+    }
+    if (!Number.isFinite(this.deliveryResubmitGraceMs) || this.deliveryResubmitGraceMs < 0) {
+      throw new Error("delivery resubmitGraceMs must be a non-negative finite number");
+    }
   }
 
   /**
@@ -204,25 +223,27 @@ export class GraphitiMcpClient {
         if (await this.episodeExists(params.groupId, params.uuid)) {
           return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
         }
-      } catch {
+      } catch (error) {
+        if (isDefinitiveMcpError(error)) throw error;
         // If the backend cannot answer a read, it is not safe to guess that the
         // episode is absent and submit another copy. Wait for observability first.
-        await sleep(DELIVERY_POLL_MS);
+        await sleep(this.deliveryPollMs);
         continue;
       }
 
       let status: QueueStatus;
       try {
         status = await this.getQueueStatus(params.groupId);
-      } catch {
-        await sleep(DELIVERY_POLL_MS);
+      } catch (error) {
+        if (isDefinitiveMcpError(error)) throw error;
+        await sleep(this.deliveryPollMs);
         continue;
       }
 
       const backendOwnsUuid =
         status.episodeUuid === params.uuid || status.queuedEpisodeUuids.includes(params.uuid);
       const submissionOldEnough =
-        lastSubmissionAt === 0 || Date.now() - lastSubmissionAt >= DELIVERY_RESUBMIT_GRACE_MS;
+        lastSubmissionAt === 0 || Date.now() - lastSubmissionAt >= this.deliveryResubmitGraceMs;
 
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
@@ -231,16 +252,17 @@ export class GraphitiMcpClient {
           // next loop verifies graph/queue state before considering a resubmit.
           lastSubmissionResult = await this.callToolOnce("add_memory", args);
           if (typeof lastSubmissionResult.error === "string") {
-            throw new Error(lastSubmissionResult.error);
+            throw new McpToolResultError(lastSubmissionResult.error);
           }
-        } catch {
+        } catch (error) {
+          if (isDefinitiveMcpError(error)) throw error;
           // The outcome is ambiguous at the transport boundary. Remember that an
           // attempt happened and spend the grace period observing before retrying.
         }
         lastSubmissionAt = Date.now();
       }
 
-      await sleep(DELIVERY_POLL_MS);
+      await sleep(this.deliveryPollMs);
     }
   }
 
@@ -273,9 +295,9 @@ export class GraphitiMcpClient {
 
   async getQueueStatus(groupId: string): Promise<QueueStatus> {
     const result = await this.callTool("get_queue_status", { group_id: groupId });
-    if (typeof result.error === "string") throw new Error(result.error);
+    if (typeof result.error === "string") throw new McpToolResultError(result.error);
     if (typeof result.blocked !== "boolean") {
-      throw new Error("Graphiti get_queue_status returned invalid blocked");
+      throw new McpToolResultError("Graphiti get_queue_status returned invalid blocked");
     }
     return {
       groupId: requiredString(result.group_id, "group_id"),
@@ -337,7 +359,7 @@ export class GraphitiMcpClient {
       uuids: refs.uuids ?? [],
       names: refs.names ?? [],
     });
-    if (typeof result.error === "string") throw new Error(result.error);
+    if (typeof result.error === "string") throw new McpToolResultError(result.error);
     return Array.isArray(result.episodes)
       ? result.episodes.filter((episode): episode is JsonObject => isObject(episode))
       : [];
@@ -462,7 +484,7 @@ export class GraphitiMcpClient {
     const payload = { jsonrpc: "2.0", id, method, params };
     const response = await this.post(payload, includeProtocolHeader);
     if (isObject(response.error)) {
-      throw new Error(
+      throw new McpJsonRpcError(
         typeof response.error.message === "string"
           ? response.error.message
           : `MCP ${method} failed`,

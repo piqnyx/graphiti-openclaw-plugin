@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
+import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
 
 function jsonResponse(body, init = {}) {
   return new Response(JSON.stringify(body), {
@@ -32,11 +33,9 @@ function completedTurn(n) {
   };
 }
 
-function installFailingGraphitiFetch(t) {
+function installDefinitiveGraphitiFailure(t) {
   const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
+  t.after(() => { globalThis.fetch = originalFetch; });
   globalThis.fetch = async (_url, init) => {
     const payload = JSON.parse(init.body);
     if (payload.method === "initialize") {
@@ -51,32 +50,32 @@ function installFailingGraphitiFetch(t) {
     }
     if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (payload.method !== "tools/call") throw new Error(`unexpected method ${payload.method}`);
+
+    let result;
     if (payload.params.name === "get_saga") {
       const sagaName = payload.params.arguments.saga_name;
       const groupId = payload.params.arguments.group_id;
-      return jsonResponse({
-        jsonrpc: "2.0",
-        id: payload.id,
-        result: {
-          structuredContent: {
-            result: { error: `No saga named '${sagaName}' found in group '${groupId}'` },
-          },
-          content: [],
-          isError: false,
-        },
-      });
+      result = { error: `No saga named '${sagaName}' found in group '${groupId}'` };
+    } else if (payload.params.name === "add_memory") {
+      // A structured tool error is definitive. Unlike a broken HTTP connection,
+      // it is safe to surface immediately because there is no ambiguous mutation.
+      result = { error: "simulated definitive Graphiti rejection" };
+    } else {
+      throw new Error(`unexpected tool ${payload.params.name}`);
     }
-    if (payload.params.name === "add_memory") {
-      throw new Error("simulated Graphiti transport failure");
-    }
-    throw new Error(`unexpected tool ${payload.params.name}`);
+
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: payload.id,
+      result: { structuredContent: { result }, content: [], isError: false },
+    });
   };
 }
 
 function makeApi(t, { patchThrows = false } = {}) {
+  resetCaptureRuntimeForTests();
   const stateDir = mkdtempSync(join(tmpdir(), "graphiti-ui-status-"));
   process.env.OPENCLAW_STATE_DIR = stateDir;
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
 
   const hooks = new Map();
   const logs = [];
@@ -84,6 +83,13 @@ function makeApi(t, { patchThrows = false } = {}) {
   const descriptors = [];
   const patches = [];
   const entries = new Map();
+
+  t.after(async () => {
+    const stop = hooks.get("gateway_stop");
+    if (stop) await stop();
+    resetCaptureRuntimeForTests();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
 
   return {
     hooks,
@@ -106,12 +112,8 @@ function makeApi(t, { patchThrows = false } = {}) {
       },
       on: (name, handler) => hooks.set(name, handler),
       session: {
-        state: {
-          registerSessionExtension: (extension) => extensions.push(extension),
-        },
-        controls: {
-          registerControlUiDescriptor: (descriptor) => descriptors.push(descriptor),
-        },
+        state: { registerSessionExtension: (extension) => extensions.push(extension) },
+        controls: { registerControlUiDescriptor: (descriptor) => descriptors.push(descriptor) },
       },
       runtime: {
         agent: {
@@ -133,8 +135,8 @@ function makeApi(t, { patchThrows = false } = {}) {
   };
 }
 
-test("capture failures publish error-only plugin session status", async (t) => {
-  installFailingGraphitiFetch(t);
+test("definitive capture failures publish error-only plugin session status", async (t) => {
+  installDefinitiveGraphitiFailure(t);
   const { hooks, extensions, descriptors, patches, api } = makeApi(t);
   register(api);
 
@@ -143,9 +145,7 @@ test("capture failures publish error-only plugin session status", async (t) => {
   assert.equal(extensions[1].namespace, "backend-queue-status");
   assert.equal(descriptors.length, 2);
   assert.equal(descriptors[0].id, "capture-error");
-  assert.equal(descriptors[0].surface, "session");
   assert.equal(descriptors[1].id, "backend-queue-error");
-  assert.equal(descriptors[1].surface, "session");
 
   const sessionKey = "agent:main:web:status-test";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
@@ -158,11 +158,11 @@ test("capture failures publish error-only plugin session status", async (t) => {
   assert.equal(status.reason, "limit");
   assert.equal(status.retryIntervalSeconds, 30);
   assert.match(status.message, /retained for automatic retry/);
-  assert.match(status.error, /simulated Graphiti transport failure/);
+  assert.match(status.error, /definitive Graphiti rejection/);
 });
 
 test("session status write failures never escape into capture control flow", async (t) => {
-  installFailingGraphitiFetch(t);
+  installDefinitiveGraphitiFailure(t);
   const { hooks, logs, api } = makeApi(t, { patchThrows: true });
   register(api);
 

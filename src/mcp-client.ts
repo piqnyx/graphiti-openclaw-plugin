@@ -4,6 +4,9 @@ export const CUSTOM_EXTRACTION_PROMPT = `This JSON is a conversation between the
 
 export const OPENCLAW_SOURCE_DESCRIPTION = "OpenClaw conversation batch";
 
+const DELIVERY_POLL_MS = 2_000;
+const DELIVERY_RESUBMIT_GRACE_MS = 120_000;
+
 type JsonRpcResponse = {
   jsonrpc?: unknown;
   id?: unknown;
@@ -27,10 +30,12 @@ export type QueueStatus = {
   blocked: boolean;
   attempts: number;
   pending: number;
+  workerRunning?: boolean;
   lastError?: string;
   episodeUuid?: string;
   episodeName?: string;
   saga?: string;
+  queuedEpisodeUuids: string[];
 };
 
 function isObject(value: unknown): value is JsonObject {
@@ -41,6 +46,10 @@ function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message;
   if (isObject(value) && typeof value.message === "string") return value.message;
   return String(value);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseSseBody(body: string, requestId: number): JsonRpcResponse {
@@ -119,6 +128,12 @@ function requiredNonnegativeInteger(value: unknown, field: string): number {
   return value;
 }
 
+function optionalStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+    : [];
+}
+
 export class GraphitiMcpClient {
   private sessionId?: string;
   private protocolVersion = "2025-06-18";
@@ -135,6 +150,21 @@ export class GraphitiMcpClient {
     this.rawLogger = rawLogger;
   }
 
+  /**
+   * Submit one durable episode head and resolve only after the episode is actually
+   * visible in the graph.
+   *
+   * Graphiti's add_memory response means "queued", not "stored". Returning that
+   * response to BufferEngine used to pop the durable FIFO head and let later
+   * batches overtake an episode that could still fail in the backend. This method
+   * therefore owns the acknowledgement boundary: queued work stays in the caller's
+   * queue until get_episodes_by_ref proves that the exact UUID exists.
+   *
+   * If the backend process restarts, its RAM queue disappears. Once the backend is
+   * reachable again and reports that this UUID is neither active nor queued, the
+   * same UUID is resubmitted after a grace period. The server deduplicates active
+   * and queued UUIDs, so a lost MCP response cannot create a second execution.
+   */
   async addMemory(params: {
     uuid: string;
     name: string;
@@ -162,7 +192,61 @@ export class GraphitiMcpClient {
     if (params.sagaPreviousEpisodeUuid) {
       args.saga_previous_episode_uuid = params.sagaPreviousEpisodeUuid;
     }
-    return this.callTool("add_memory", args);
+
+    let lastSubmissionResult: JsonObject = {};
+    let lastSubmissionAt = 0;
+
+    while (true) {
+      // Confirmation always wins. This also makes replay after an OpenClaw restart
+      // cheap: if the previous process submitted successfully before dying, no LLM
+      // work is repeated.
+      try {
+        if (await this.episodeExists(params.groupId, params.uuid)) {
+          return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
+        }
+      } catch {
+        // If the backend cannot answer a read, it is not safe to guess that the
+        // episode is absent and submit another copy. Wait for observability first.
+        await sleep(DELIVERY_POLL_MS);
+        continue;
+      }
+
+      let status: QueueStatus;
+      try {
+        status = await this.getQueueStatus(params.groupId);
+      } catch {
+        await sleep(DELIVERY_POLL_MS);
+        continue;
+      }
+
+      const backendOwnsUuid =
+        status.episodeUuid === params.uuid || status.queuedEpisodeUuids.includes(params.uuid);
+      const submissionOldEnough =
+        lastSubmissionAt === 0 || Date.now() - lastSubmissionAt >= DELIVERY_RESUBMIT_GRACE_MS;
+
+      if (!backendOwnsUuid && submissionOldEnough) {
+        try {
+          // Side-effecting calls intentionally get no automatic transport replay.
+          // If the HTTP response is lost after the server accepted the task, the
+          // next loop verifies graph/queue state before considering a resubmit.
+          lastSubmissionResult = await this.callToolOnce("add_memory", args);
+          if (typeof lastSubmissionResult.error === "string") {
+            throw new Error(lastSubmissionResult.error);
+          }
+        } catch {
+          // The outcome is ambiguous at the transport boundary. Remember that an
+          // attempt happened and spend the grace period observing before retrying.
+        }
+        lastSubmissionAt = Date.now();
+      }
+
+      await sleep(DELIVERY_POLL_MS);
+    }
+  }
+
+  private async episodeExists(groupId: string, uuid: string): Promise<boolean> {
+    const episodes = await this.getEpisodesByRef(groupId, { uuids: [uuid] });
+    return episodes.some((episode) => episode.uuid === uuid);
   }
 
   async getSaga(sagaName: string, groupId: string): Promise<SagaState | undefined> {
@@ -198,10 +282,12 @@ export class GraphitiMcpClient {
       blocked: result.blocked,
       attempts: requiredNonnegativeInteger(result.attempts, "attempts"),
       pending: requiredNonnegativeInteger(result.pending, "pending"),
+      workerRunning: typeof result.worker_running === "boolean" ? result.worker_running : undefined,
       lastError: optionalString(result.last_error),
       episodeUuid: optionalString(result.episode_uuid),
       episodeName: optionalString(result.episode_name),
       saga: optionalString(result.saga),
+      queuedEpisodeUuids: optionalStringArray(result.queued_episode_uuids),
     };
   }
 
@@ -304,6 +390,12 @@ export class GraphitiMcpClient {
       : [];
   }
 
+  private async callToolOnce(name: string, args: JsonObject): Promise<JsonObject> {
+    await this.ensureInitialized();
+    const response = await this.rpc("tools/call", { name, arguments: args });
+    return decodeToolResult(response.result);
+  }
+
   private async callTool(name: string, args: JsonObject): Promise<JsonObject> {
     await this.ensureInitialized();
 
@@ -311,9 +403,9 @@ export class GraphitiMcpClient {
     try {
       response = await this.rpc("tools/call", { name, arguments: args });
     } catch (error) {
-      // Only a transport-level session loss may be retried. A tool that ran and
-      // answered with an error must never be re-sent: for add_memory that would
-      // submit the same episode twice.
+      // Read-only calls may safely repair a lost MCP session and retry. add_memory
+      // bypasses this method so a side effect is never replayed merely because an
+      // HTTP/MCP response went missing.
       if (!this.initialized) throw error;
       if (!/404|session/i.test(errorMessage(error))) throw error;
 

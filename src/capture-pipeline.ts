@@ -1,22 +1,30 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import {
-  BufferEngine,
   CHECK_INTERVAL_SEC,
-  type AgentSink,
   type EpisodeIdentity,
   type EpisodeJson,
-  type PersistedAgentCaptureState,
 } from "./buffer.js";
 import { CaptureLease } from "./capture-lease.js";
-import { CaptureSpool, type CaptureSpoolState } from "./capture-spool.js";
+import { resolveCaptureSpoolPath, resolveOpenClawStateDir } from "./capture-spool.js";
 import { DEFAULT_ACTORS, type GraphitiPluginConfig } from "./config.js";
+import {
+  DurableBufferEngine,
+  type DurableAgentSink,
+} from "./durable-buffer-engine.js";
 import { deriveEpisodeUuid, episodeNamePrefix, EpisodeSequenceTracker } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import type { GraphitiLogger } from "./logging.js";
-import { GraphitiMcpClient, OPENCLAW_SOURCE_DESCRIPTION, type QueueStatus, type SagaState } from "./mcp-client.js";
+import {
+  GraphitiMcpClient,
+  OPENCLAW_SOURCE_DESCRIPTION,
+  type QueueStatus,
+  type SagaState,
+} from "./mcp-client.js";
 import { matchSessionExclusion } from "./session-filter.js";
 import { extractConversationMessages } from "./text.js";
 import type { LocalCaptureState } from "./tools.js";
-import { TranscriptCursorError, TranscriptDeltaTracker } from "./transcript-delta.js";
+import { TranscriptCursorError } from "./transcript-delta.js";
 import type {
   AgentEndEvent,
   HookContext,
@@ -29,8 +37,13 @@ const CAPTURE_STATUS_DESCRIPTOR_ID = "capture-error";
 const BACKEND_STATUS_NAMESPACE = "backend-queue-status";
 const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
 const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
+const DURABLE_CAPTURE_DIR = "durable-capture-v1";
 
 type CaptureFailureReason = "limit" | "timeout" | "cursor" | "durability";
+
+export function resolveDurableCaptureRoot(): string {
+  return join(resolveOpenClawStateDir(), "graphiti-openclaw-plugin", DURABLE_CAPTURE_DIR);
+}
 
 export type CaptureStatusHost = {
   patchSessionEntry?: NonNullable<
@@ -40,11 +53,10 @@ export type CaptureStatusHost = {
 
 export type CapturePipeline = {
   client: GraphitiMcpClient;
-  engine: BufferEngine;
-  captureSpool: CaptureSpool;
+  engine: DurableBufferEngine;
+  durableRoot: string;
   captureLease: CaptureLease;
   statusHost: CaptureStatusHost;
-  restoredCaptureState: CaptureSpoolState | undefined;
   handleAgentEnd: (rawEvent: unknown, ctx?: HookContext) => void;
   shutdown: () => Promise<void>;
   captureNote: (agentId: string, sessionKey: string, note: string) => void;
@@ -60,25 +72,6 @@ function requireSessionKey(value: unknown): string {
     throw new Error("missing OpenClaw ctx.sessionKey");
   }
   return value;
-}
-
-function captureSnapshotStats(snapshot: { agents: PersistedAgentCaptureState[] } | undefined): {
-  agents: number;
-  activeBuffers: number;
-  queuedEntries: number;
-  messages: number;
-} {
-  if (!snapshot) return { agents: 0, activeBuffers: 0, queuedEntries: 0, messages: 0 };
-  let activeBuffers = 0;
-  let queuedEntries = 0;
-  let messages = 0;
-  for (const agent of snapshot.agents) {
-    activeBuffers += agent.activeBuffers.length;
-    queuedEntries += agent.queue.length;
-    messages += agent.activeBuffers.reduce((sum, buffer) => sum + buffer.messages.length, 0);
-    messages += agent.queue.reduce((sum, entry) => sum + entry.buffer.messages.length, 0);
-  }
-  return { agents: snapshot.agents.length, activeBuffers, queuedEntries, messages };
 }
 
 function acceptedEpisodeUuid(result: Record<string, unknown>): string {
@@ -111,47 +104,35 @@ export function createCapturePipeline(params: {
     );
   });
   const sequences = new EpisodeSequenceTracker();
-  const transcriptDeltas = new TranscriptDeltaTracker();
   const lastSessionByAgent = new Map<string, string>();
   const unconfiguredAgentsReported = new Set<string>();
   const backendReportedSessionByAgent = new Map<string, string>();
   const backendFingerprintByAgent = new Map<string, string>();
   const lastQueueStatusByAgent = new Map<string, QueueStatus>();
   const statusHost: CaptureStatusHost = {};
-  const captureSpool = new CaptureSpool();
-  const captureLease = new CaptureLease(captureSpool.path);
-  let restoredCaptureState: CaptureSpoolState | undefined;
-  let engine!: BufferEngine;
+  const durableRoot = resolveDurableCaptureRoot();
+  const legacySpoolPath = resolveCaptureSpoolPath();
+  const captureLease = new CaptureLease(join(durableRoot, "owner"));
+  let engine!: DurableBufferEngine;
   let queueHealthTimer: ReturnType<typeof setInterval> | undefined;
   let shutdownPromise: Promise<void> | undefined;
 
   try {
+    // Never silently start a second persistence architecture beside an old spool.
+    // The live deployment is intentionally upgraded only after the operator has
+    // either migrated or explicitly reset the old queue together with the graph.
+    if (existsSync(legacySpoolPath)) {
+      throw new Error(
+        `legacy Graphiti capture spool still exists at ${legacySpoolPath}; refusing to ignore queued data while starting ${durableRoot}`,
+      );
+    }
+
     captureLease.acquire();
-    logger.info("capture_spool_lease_acquired", { path: captureLease.path, pid: process.pid });
-
-    try {
-      restoredCaptureState = captureSpool.load();
-    } catch (error) {
-      logger.error("capture_spool_load_failed", {
-        path: captureSpool.path,
-        error: errorText(error),
-        action: "startup_aborted_to_preserve_spool",
-      });
-      throw error;
-    }
-
-    let restoredWatermarks = 0;
-    if (restoredCaptureState) {
-      restoredWatermarks = transcriptDeltas.restore(restoredCaptureState.sessions);
-    }
-    const restored = captureSnapshotStats(restoredCaptureState);
-    if (restored.messages > 0 || restoredWatermarks > 0) {
-      logger.info("capture_spool_restored", {
-        path: captureSpool.path,
-        ...restored,
-        sessionWatermarks: restoredWatermarks,
-      });
-    }
+    logger.info("capture_durable_lease_acquired", {
+      root: durableRoot,
+      path: captureLease.path,
+      pid: process.pid,
+    });
 
     api.session?.state?.registerSessionExtension({
       namespace: CAPTURE_STATUS_NAMESPACE,
@@ -245,7 +226,7 @@ export function createCapturePipeline(params: {
           reason === "cursor"
             ? "Graphiti capture stopped for this session because transcript position is ambiguous"
             : reason === "durability"
-              ? "Graphiti capture cannot make a durable checkpoint; remote delivery is stopped"
+              ? "Graphiti capture could not make a durable local transaction; transcript cursor was not advanced"
               : "Graphiti capture failed; durable FIFO head retained for automatic retry",
         error: errorText(error),
         reason,
@@ -435,7 +416,7 @@ export function createCapturePipeline(params: {
       return false;
     };
 
-    const sink: AgentSink = async (agentId, entry, reason) => {
+    const sink: DurableAgentSink = async (agentId, entry, reason, controls) => {
       const sessionKey = entry.buffer.sessionKey;
       const episode: EpisodeJson = entry.buffer.episode;
       const jsonBody = JSON.stringify(episode);
@@ -475,11 +456,9 @@ export function createCapturePipeline(params: {
             : {}),
           submittedAt: Date.now(),
         };
-        if (!engine.checkpoint()) {
-          throw new Error(
-            `could not durably checkpoint episode identity ${sequence.name}; remote delivery not started`,
-          );
-        }
+        // The deterministic Graphiti identity must exist on disk before the first
+        // local MCP side effect. A crash can then only replay the exact same UUID.
+        controls.checkpoint();
       }
 
       const referenceTime = new Date(entry.enqueuedAt).toISOString();
@@ -487,6 +466,8 @@ export function createCapturePipeline(params: {
         agentId,
         group_id: agentId,
         saga: sessionKey,
+        queueSequence: controls.sequence,
+        captureId: controls.captureId,
         name: sequence.name,
         batchNumber: sequence.batchNumber,
         uuid: sequence.episodeUuid,
@@ -502,6 +483,8 @@ export function createCapturePipeline(params: {
           agentId,
           group_id: agentId,
           saga: sessionKey,
+          queueSequence: controls.sequence,
+          captureId: controls.captureId,
           name: sequence.name,
           batchNumber: sequence.batchNumber,
           uuid: sequence.episodeUuid,
@@ -540,6 +523,8 @@ export function createCapturePipeline(params: {
         agentId,
         group_id: agentId,
         saga: sessionKey,
+        queueSequence: controls.sequence,
+        captureId: controls.captureId,
         name: sequence.name,
         batchNumber: sequence.batchNumber,
         uuid: committedUuid,
@@ -550,57 +535,61 @@ export function createCapturePipeline(params: {
       });
     };
 
-    engine = new BufferEngine(cfg.agents, cfg.bufferLimit, cfg.bufferTimeout, sink, {
-      initialState: restoredCaptureState,
-      onStateChange: (snapshot) =>
-        captureSpool.save({
-          version: 4,
-          agents: snapshot.agents,
-          sessions: transcriptDeltas.export(),
-        }),
-      notifyError: (agentId, sessionKey, reason, error) => {
-        logger.error("capture_flush_failed", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          reason,
-          error: errorText(error),
-          action: "durable_head_retained",
-          automaticRetry: true,
-          retryIntervalSeconds: CHECK_INTERVAL_SEC,
-        });
-        publishCaptureError(agentId, sessionKey, reason, error);
-      },
-      notifyRecovered: (agentId, sessionKey, reason) => {
-        logger.info("capture_flush_recovered", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          reason,
-        });
-        clearCaptureError(agentId, sessionKey);
-      },
-      notifyPersistError: (error) => {
-        logger.error("capture_spool_write_failed", {
-          path: captureSpool.path,
-          error: errorText(error),
-          action: "remote_delivery_stopped",
-          durableReplayRequired: true,
-        });
-        for (const [agentId, sessionKey] of lastSessionByAgent) {
-          publishCaptureError(agentId, sessionKey, "durability", error);
-        }
-      },
-      notifyPersistRecovered: () => {
-        logger.info("capture_spool_write_recovered", { path: captureSpool.path });
-        for (const [agentId, sessionKey] of lastSessionByAgent) {
+    engine = new DurableBufferEngine(
+      durableRoot,
+      cfg.agents,
+      cfg.bufferLimit,
+      cfg.bufferTimeout,
+      sink,
+      {
+        notifyError: (agentId, sessionKey, reason, error) => {
+          logger.error("capture_flush_failed", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            reason,
+            error: errorText(error),
+            action: "durable_head_retained",
+            automaticRetry: true,
+            retryIntervalSeconds: CHECK_INTERVAL_SEC,
+          });
+          publishCaptureError(agentId, sessionKey, reason, error);
+        },
+        notifyRecovered: (agentId, sessionKey, reason) => {
+          logger.info("capture_flush_recovered", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            reason,
+          });
           clearCaptureError(agentId, sessionKey);
-        }
+        },
+        notifyPersistError: (error) => {
+          logger.error("capture_durable_write_failed", {
+            root: durableRoot,
+            error: errorText(error),
+            action: "transcript_cursor_not_advanced",
+            durableReplayRequired: true,
+          });
+          for (const [agentId, sessionKey] of lastSessionByAgent) {
+            publishCaptureError(agentId, sessionKey, "durability", error);
+          }
+        },
+        notifyPersistRecovered: () => {
+          logger.info("capture_durable_write_recovered", { root: durableRoot });
+          for (const [agentId, sessionKey] of lastSessionByAgent) {
+            clearCaptureError(agentId, sessionKey);
+          }
+        },
       },
-    });
+    );
 
     const pollBackendQueueStatus = async (): Promise<void> => {
-      const agentIds = new Set([...Object.keys(cfg.agents), ...lastSessionByAgent.keys()]);
+      const agentIds = new Set([
+        ...Object.keys(cfg.agents),
+        ...engine.journal.queue.listAgents(),
+        ...lastSessionByAgent.keys(),
+      ]);
       for (const agentId of agentIds) {
         try {
           const status = await client.getQueueStatus(agentId);
@@ -629,7 +618,9 @@ export function createCapturePipeline(params: {
                 message: stranded
                   ? "Graphiti backend has queued work but no worker; self-healing/retry is required"
                   : `Graphiti backend is retrying the current FIFO head after ${status.attempts} failure(s)`,
-                error: status.lastError ?? (stranded ? "queue worker not running" : "backend retry in progress"),
+                error:
+                  status.lastError ??
+                  (stranded ? "queue worker not running" : "backend retry in progress"),
                 attempts: status.attempts,
                 pending: status.pending,
                 episodeUuid: status.episodeUuid ?? "",
@@ -667,7 +658,6 @@ export function createCapturePipeline(params: {
       void pollBackendQueueStatus();
     }, CHECK_INTERVAL_SEC * 1000);
     queueHealthTimer.unref?.();
-    engine.resumeRestored();
 
     const handleAgentEnd = (rawEvent: unknown, ctx?: HookContext): void => {
       const event = rawEvent as AgentEndEvent;
@@ -706,10 +696,12 @@ export function createCapturePipeline(params: {
         });
       }
 
-      const snapshot = extractConversationMessages(Array.isArray(event.messages) ? event.messages : []);
+      const snapshot = extractConversationMessages(
+        Array.isArray(event.messages) ? event.messages : [],
+      );
       let delta;
       try {
-        delta = transcriptDeltas.take(agentId, sessionKey, snapshot);
+        delta = engine.ingestTranscript(agentId, sessionKey, snapshot);
       } catch (error) {
         if (error instanceof TranscriptCursorError) {
           logger.error("capture_cursor_ambiguous", {
@@ -723,134 +715,96 @@ export function createCapturePipeline(params: {
           publishCaptureError(agentId, sessionKey, "cursor", error);
           return;
         }
-        throw error;
-      }
-
-      if (delta.length === 0) {
-        transcriptDeltas.commit(agentId, sessionKey);
-        if (!engine.checkpoint()) {
-          publishCaptureError(
-            agentId,
-            sessionKey,
-            "durability",
-            new Error("failed to checkpoint transcript cursor"),
-          );
-        } else {
-          clearCaptureError(agentId, sessionKey);
-        }
-        return;
-      }
-
-      logger.debugContent(
-        "capture_messages",
-        {
+        logger.error("capture_durable_transaction_failed", {
           agentId,
           group_id: agentId,
-          sessionKey,
-          messages: delta.length,
-          userMessages: delta.filter((message) => message.role === "user").length,
-          assistantMessages: delta.filter((message) => message.role === "assistant").length,
-          eventSuccess: event.success,
-          durationMs: event.durationMs,
-        },
-        { messages: delta },
-      );
-
-      try {
-        engine.addMessages(agentId, sessionKey, delta);
-      } catch (error) {
-        logger.warn("capture_skipped", {
-          agentId,
-          group_id: agentId,
-          sessionKey,
-          reason: "engine_rejected_messages",
-          messages: delta.length,
+          saga: sessionKey,
+          snapshotMessages: snapshot.length,
           error: errorText(error),
-          action: "watermark_not_advanced",
+          action: "transcript_cursor_rolled_back",
         });
-        return;
-      }
-      transcriptDeltas.commit(agentId, sessionKey);
-      if (!engine.checkpoint()) {
         publishCaptureError(
           agentId,
           sessionKey,
           "durability",
-          new Error("messages and transcript cursor remain only in memory until spool recovers"),
+          error instanceof Error ? error : new Error(String(error)),
         );
-      } else {
-        clearCaptureError(agentId, sessionKey);
+        return;
       }
+
+      if (delta.length > 0) {
+        logger.debugContent(
+          "capture_messages",
+          {
+            agentId,
+            group_id: agentId,
+            sessionKey,
+            messages: delta.length,
+            userMessages: delta.filter((message) => message.role === "user").length,
+            assistantMessages: delta.filter((message) => message.role === "assistant").length,
+            eventSuccess: event.success,
+            durationMs: event.durationMs,
+            durableQueueDepth: engine.queueDepth(agentId),
+          },
+          { messages: delta },
+        );
+      }
+      clearCaptureError(agentId, sessionKey);
     };
 
     const shutdown = (): Promise<void> => {
       shutdownPromise ??= (async () => {
         if (queueHealthTimer) clearInterval(queueHealthTimer);
         client.close();
-        const before = captureSnapshotStats(engine.snapshot());
         logger.info("capture_shutdown_checkpoint", {
-          path: captureSpool.path,
-          ...before,
+          root: durableRoot,
+          queuedBatches: engine.journal.queue
+            .listAgents()
+            .reduce((sum, agentId) => sum + engine.queueDepth(agentId), 0),
           graceMs: CAPTURE_SHUTDOWN_GRACE_MS,
         });
         await engine.shutdown(CAPTURE_SHUTDOWN_GRACE_MS);
-        const after = captureSnapshotStats(engine.snapshot());
         logger.info("capture_shutdown_complete", {
-          path: captureSpool.path,
-          ...after,
-          durableReplayRequired: after.messages > 0,
+          root: durableRoot,
+          durableReplayRequired: engine.journal.queue
+            .listAgents()
+            .some((agentId) => engine.queueDepth(agentId) > 0),
         });
         if (captureLease.isHeld()) {
           captureLease.release();
-          logger.info("capture_spool_lease_released", { path: captureLease.path });
+          logger.info("capture_durable_lease_released", { path: captureLease.path });
         }
       })();
       return shutdownPromise;
     };
 
     const captureNote = (agentId: string, sessionKey: string, note: string): void => {
-      engine.addMessages(agentId, sessionKey, [{ role: "assistant", text: note }]);
-      if (!engine.checkpoint()) {
-        throw new Error("note was not durably checkpointed; it was not reported as remembered");
-      }
+      engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: note });
     };
 
     const localCaptureState = (agentId: string): LocalCaptureState => {
-      const agent = engine.snapshot().agents.find((entry) => entry.agentId === agentId);
-      const buffers = agent?.activeBuffers ?? [];
-      const queue = agent?.queue ?? [];
-      const assigned = queue.filter((entry) => entry.episode !== undefined);
-      const oldestAwaiting = assigned.length > 0
-        ? Math.min(...assigned.map((entry) => entry.episode?.submittedAt ?? entry.enqueuedAt))
-        : undefined;
       const backend = lastQueueStatusByAgent.get(agentId);
+      const queuedBatches = engine.queueDepth(agentId);
       return {
-        awaitingConfirmation: assigned.length,
-        awaitingBytes: assigned.reduce((sum, entry) => sum + JSON.stringify(entry.buffer).length, 0),
-        ...(oldestAwaiting !== undefined
-          ? { oldestAwaitingMs: Date.now() - oldestAwaiting }
-          : {}),
+        awaitingConfirmation: queuedBatches,
+        awaitingBytes: 0,
         notLanding:
           backend && backend.attempts > 0 && backend.episodeName
             ? [{ name: backend.episodeName, attempts: backend.attempts, ageMs: 0 }]
             : [],
         droppedForSpace: 0,
-        bufferedMessages: buffers.reduce((sum, buffer) => sum + buffer.messages.length, 0),
-        queuedBatches: queue.length,
-        ...(buffers.length > 0
-          ? { oldestBufferAgeMs: Date.now() - Math.min(...buffers.map((buffer) => buffer.lastActivityAt)) }
-          : {}),
-        spoolPath: captureSpool.path,
+        bufferedMessages: engine.activeMessageCount(agentId),
+        queuedBatches,
+        spoolPath: durableRoot,
       };
     };
 
     return {
       client,
       engine,
-      captureSpool,
+      durableRoot,
       captureLease,
       statusHost,
-      restoredCaptureState,
       handleAgentEnd,
       shutdown,
       captureNote,
@@ -862,7 +816,7 @@ export function createCapturePipeline(params: {
       try {
         captureLease.release();
       } catch (releaseError) {
-        logger.error("capture_spool_lease_release_failed", {
+        logger.error("capture_durable_lease_release_failed", {
           path: captureLease.path,
           error: errorText(releaseError),
         });

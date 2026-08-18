@@ -200,11 +200,17 @@ export class PendingConfirmationTracker {
    * behind acceptance — and a lagging count hands the same number out twice. That
    * is how one dialog ended up with two different episodes both called `-22`.
    */
-  highestIssued(): Map<string, number> {
-    const highest = new Map<string, number>();
+  highestIssued(): Map<string, { batchNumber: number; uuid: string }> {
+    const highest = new Map<string, { batchNumber: number; uuid: string }>();
     for (const batch of this.pending.values()) {
       const key = sequenceKey(batch.agentId, batch.sessionKey);
-      highest.set(key, Math.max(highest.get(key) ?? 0, batch.batchNumber));
+      const current = highest.get(key);
+      if (!current || batch.batchNumber > current.batchNumber) {
+        // The uuid travels with the number because the two are inseparable: a
+        // sequence resumed at batch N must chain the next batch to N's episode,
+        // and the backend cannot supply that uuid precisely when it is behind.
+        highest.set(key, { batchNumber: batch.batchNumber, uuid: batch.uuid });
+      }
     }
     return highest;
   }

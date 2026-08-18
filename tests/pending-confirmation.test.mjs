@@ -104,8 +104,13 @@ test("the highest issued number per session survives a restart", () => {
   // The backend's episode count lags acceptance, and a lagging count hands the
   // same number out twice — which is how one dialog got two episodes named -22.
   const highest = restored.highestIssued();
-  assert.equal(highest.get(sequenceKey("main", "agent:main:telegram:1")), 23);
-  assert.equal(highest.get(sequenceKey("main", "agent:main:web:9")), 4);
+  // The uuid rides along with the number: a sequence resumed at batch N has to
+  // chain the next batch to N's episode, and the backend cannot supply that uuid
+  // exactly when it is the one lagging behind. Returning only the number left
+  // the sequence claiming batches with no predecessor, and capture stopped dead.
+  assert.equal(highest.get(sequenceKey("main", "agent:main:telegram:1")).batchNumber, 23);
+  assert.equal(highest.get(sequenceKey("main", "agent:main:telegram:1")).uuid, "u-23");
+  assert.equal(highest.get(sequenceKey("main", "agent:main:web:9")).batchNumber, 4);
 });
 
 test("a resubmission counts as an attempt and restarts the clock", () => {

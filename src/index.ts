@@ -447,8 +447,8 @@ export function register(api: OpenClawPluginApi): void {
       saga: SagaState | undefined,
     ): { acceptedBatches: number; lastEpisodeUuid?: string } => {
       const fromBackend = saga?.episodeCount ?? 0;
-      const issued = pendingConfirmation.highestIssued().get(sequenceKey(agentId, sessionKey)) ?? 0;
-      if (issued <= fromBackend) {
+      const issued = pendingConfirmation.highestIssued().get(sequenceKey(agentId, sessionKey));
+      if (!issued || issued.batchNumber <= fromBackend) {
         return { acceptedBatches: fromBackend, ...(saga?.lastEpisodeUuid ? { lastEpisodeUuid: saga.lastEpisodeUuid } : {}) };
       }
       logger.info("capture_sequence_ahead_of_backend", {
@@ -456,12 +456,18 @@ export function register(api: OpenClawPluginApi): void {
         group_id: agentId,
         saga: sessionKey,
         backendEpisodes: fromBackend,
-        issued,
+        issued: issued.batchNumber,
         action: "resumed_from_issued",
       });
-      // The predecessor still comes from the backend: linking to an episode it has
-      // not stored would produce an edge that silently fails to be created.
-      return { acceptedBatches: issued, ...(saga?.lastEpisodeUuid ? { lastEpisodeUuid: saga.lastEpisodeUuid } : {}) };
+      // The predecessor comes from the ledger too, and must: taking the number
+      // from one source and the predecessor from another produced a sequence
+      // claiming batches with nothing to chain them to, which the tracker
+      // rightly refused — and capture stopped entirely for that session.
+      //
+      // Chaining to an episode the backend has not stored yet is safe: the edge
+      // is written by MATCH, so it simply does not appear until that episode
+      // does, and appears correctly once the pending batch lands.
+      return { acceptedBatches: issued.batchNumber, lastEpisodeUuid: issued.uuid };
     };
 
     const ensureSequenceHydrated = async (agentId: string, sessionKey: string): Promise<void> => {

@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
-import { resolveCaptureSpoolPath } from "../dist/capture-spool.js";
+import { resolveDurableCaptureRoot } from "../dist/capture-pipeline.js";
+import { DurableQueueStore } from "../dist/durable-queue-store.js";
 
 function isolateStateDir(t) {
   const stateDir = mkdtempSync(join(tmpdir(), "graphiti-confirm-"));
@@ -24,10 +25,12 @@ async function waitFor(predicate, what, timeoutMs = 3000) {
 }
 
 function jsonResponse(body) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
-/** Drive the plugin through one captured turn and return what it sent. */
 function harness(t, handlers) {
   isolateStateDir(t);
   const calls = [];
@@ -35,10 +38,15 @@ function harness(t, handlers) {
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
+
   globalThis.fetch = async (_url, init) => {
     const payload = JSON.parse(init.body);
     if (payload.method === "initialize") {
-      return jsonResponse({ jsonrpc: "2.0", id: payload.id, result: { protocolVersion: "2025-06-18" } });
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: payload.id,
+        result: { protocolVersion: "2025-06-18" },
+      });
     }
     if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
     calls.push(payload.params);
@@ -53,17 +61,26 @@ function harness(t, handlers) {
 
   const hooks = new Map();
   register({
-    pluginConfig: { autoCapture: true, autoRecall: false, bufferLimit: 2, logLevel: "debug",
-      agents: { main: { user: "Вит", assistant: "Краб" } } },
+    pluginConfig: {
+      autoCapture: true,
+      autoRecall: false,
+      agentTools: false,
+      bufferLimit: 2,
+      logLevel: "debug",
+      agents: { main: { user: "Вит", assistant: "Краб" } },
+    },
     logger: { debug() {}, info() {}, warn() {}, error() {} },
     on: (event, handler) => hooks.set(event, handler),
-    registerTool: () => {},
   });
-  return { calls, hooks };
+
+  t.after(async () => {
+    const stop = hooks.get("gateway_stop");
+    if (stop) await stop();
+  });
+
+  return { calls, hooks, queue: new DurableQueueStore(resolveDurableCaptureRoot()) };
 }
 
-// The hook takes the event and the invocation context separately, and the
-// event carries the full transcript rather than a delta.
 const turn = (hooks) =>
   hooks.get("agent_end")(
     {
@@ -76,44 +93,97 @@ const turn = (hooks) =>
     { agentId: "main", sessionKey: "agent:main:telegram:1", trigger: "user" },
   );
 
-test("an accepted batch stays on the ledger until the episode is seen in the graph", async (t) => {
+function healthySaga(uuid) {
+  return {
+    uuid: "saga-1",
+    name: "agent:main:telegram:1",
+    group_id: "main",
+    summary: "",
+    first_episode_uuid: uuid,
+    last_episode_uuid: uuid,
+    episode_count: 1,
+    chain_count: 1,
+    integrity_ok: true,
+    integrity_errors: [],
+  };
+}
+
+test("queued is not delivery: durable head remains until exact Saga commit is visible", async (t) => {
   let episodeExists = false;
-  const { calls, hooks } = harness(t, {
-    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
-    add_memory: (args) => ({ message: "queued", uuid: args.uuid }),
-    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
-    // The episode is absent at first: Graphiti took the batch but has not
-    // extracted it yet, which is the state acceptance used to hide.
-    get_episodes_by_ref: () => ({ episodes: episodeExists ? [{ uuid: submittedUuid, name: "1-1" }] : [] }),
+  let submittedUuid;
+  const { calls, hooks, queue } = harness(t, {
+    get_saga: () =>
+      episodeExists && submittedUuid
+        ? healthySaga(submittedUuid)
+        : { error: "No saga named 'agent:main:telegram:1' found in group 'main'" },
+    add_memory: (args) => {
+      submittedUuid = args.uuid;
+      return { message: "queued", uuid: args.uuid };
+    },
+    get_queue_status: () => ({
+      group_id: "main",
+      blocked: false,
+      attempts: 0,
+      pending: 0,
+      worker_running: false,
+      queued_episode_uuids: [],
+    }),
+    get_episodes_by_ref: () => ({
+      episodes:
+        episodeExists && submittedUuid
+          ? [{ uuid: submittedUuid, name: "1-1", group_id: "main" }]
+          : [],
+    }),
   });
 
-  await turn(hooks);
-  await waitFor(() => calls.some((c) => c.name === "add_memory"), "the batch to be submitted");
-  const submittedUuid = calls.find((c) => c.name === "add_memory").arguments.uuid;
+  turn(hooks);
+  await waitFor(() => calls.some((call) => call.name === "add_memory"), "initial add_memory");
+  assert.equal(queue.approximateDepth("main"), 1, "MCP queued response must not remove disk head");
 
-  const spool = JSON.parse(readFileSync(resolveCaptureSpoolPath(), "utf8"));
-  assert.equal(spool.pending.length, 1, "an accepted batch must remain outstanding");
-  assert.equal(spool.pending[0].uuid, submittedUuid);
-  assert.ok(spool.pending[0].episodeBody.includes("привет"), "the body must be kept for a resubmission");
+  const head = queue.peekHead("main");
+  assert.equal(head.payload.episode.uuid, submittedUuid);
+  assert.ok(head.payload.buffer.messages.some((message) => message.text === "привет"));
+
   episodeExists = true;
+  await waitFor(() => queue.approximateDepth("main") === 0, "committed head removal");
 });
 
-test("the ledger keeps everything needed to resubmit the batch unchanged", async (t) => {
-  const { calls, hooks } = harness(t, {
-    get_saga: () => ({ error: "No saga named 'agent:main:telegram:1' found in group 'main'" }),
-    add_memory: (args) => ({ message: "queued", uuid: args.uuid }),
-    get_queue_status: () => ({ group_id: "main", blocked: false, attempts: 0, pending: 0 }),
-    get_episodes_by_ref: () => ({ episodes: [] }),
+test("deterministic Graphiti identity is fsynced into the head before remote submission", async (t) => {
+  let submittedUuid;
+  let episodeExists = false;
+  const { calls, hooks, queue } = harness(t, {
+    get_saga: () =>
+      episodeExists && submittedUuid
+        ? healthySaga(submittedUuid)
+        : { error: "No saga named 'agent:main:telegram:1' found in group 'main'" },
+    add_memory: (args) => {
+      submittedUuid = args.uuid;
+      return { message: "queued", uuid: args.uuid };
+    },
+    get_queue_status: () => ({
+      group_id: "main",
+      blocked: false,
+      attempts: 0,
+      pending: 0,
+      worker_running: false,
+      queued_episode_uuids: [],
+    }),
+    get_episodes_by_ref: () => ({
+      episodes: episodeExists && submittedUuid ? [{ uuid: submittedUuid }] : [],
+    }),
   });
 
-  await turn(hooks);
-  await waitFor(() => calls.some((c) => c.name === "add_memory"), "the batch to be submitted");
+  turn(hooks);
+  await waitFor(() => calls.some((call) => call.name === "add_memory"), "initial add_memory");
 
-  const sent = calls.find((c) => c.name === "add_memory").arguments;
-  const pending = JSON.parse(readFileSync(resolveCaptureSpoolPath(), "utf8")).pending[0];
-  // Regenerating any of these on retry would move the episode in the dialog's
-  // timeline or break its chain, so they are stored rather than recomputed.
-  assert.equal(pending.referenceTime, sent.reference_time);
-  assert.equal(pending.name, sent.name);
-  assert.deepEqual(pending.previousEpisodeUuids, sent.previous_episode_uuids);
+  const sent = calls.find((call) => call.name === "add_memory").arguments;
+  const head = queue.peekHead("main");
+  assert.equal(head.payload.episode.uuid, sent.uuid);
+  assert.equal(head.payload.episode.name, sent.name);
+  assert.equal(head.payload.episode.batchNumber, 1);
+  assert.equal(head.payload.episode.previousEpisodeUuid, undefined);
+  assert.equal(new Date(head.enqueuedAt).toISOString(), sent.reference_time);
+
+  episodeExists = true;
+  await waitFor(() => queue.approximateDepth("main") === 0, "committed head removal");
 });

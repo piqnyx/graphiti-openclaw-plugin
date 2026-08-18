@@ -1,44 +1,67 @@
+import { createHash } from "node:crypto";
 import type { ConversationMessage } from "./text.js";
 
-/** Messages kept in a durable session watermark. */
-export const WATERMARK_TAIL_MESSAGES = 12;
-/** Most recent sessions kept in the durable watermark set. */
-export const WATERMARK_MAX_SESSIONS = 64;
-/** Most recent sessions whose full transcript is held in memory for delta computation. */
-export const MAX_TRACKED_SESSIONS = 64;
-/** Watermarks older than this are dropped; an older session falls back to tail detection. */
-export const WATERMARK_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+/** Messages kept as a secondary compaction anchor. */
+export const WATERMARK_TAIL_MESSAGES = 32;
+/** Full transcripts are only an in-memory optimization; durable cursors are never evicted. */
+export const MAX_TRACKED_SESSIONS = 256;
 
 export type SessionWatermark = {
   agentId: string;
   sessionKey: string;
-  /** Hashes of the last observed messages; content itself never reaches the spool. */
+  /** SHA-256 hashes of the last observed messages, used only after transcript compaction/rewrite. */
   tailHashes: string[];
+  /** Number of messages in the exact transcript prefix committed with this cursor. */
   observedMessages: number;
+  /** SHA-256 of that exact prefix, including role/text boundaries. */
+  prefixDigest: string;
   updatedAt: number;
 };
+
+export class TranscriptCursorError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TranscriptCursorError";
+  }
+}
 
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
   return a.role === b.role && a.text === b.text;
 }
 
-/** Stable FNV-1a over role+text so a watermark written before a restart still matches after it. */
+function feedMessage(hash: ReturnType<typeof createHash>, message: ConversationMessage): void {
+  const role = Buffer.from(message.role, "utf8");
+  const text = Buffer.from(message.text, "utf8");
+  const lengths = Buffer.allocUnsafe(8);
+  lengths.writeUInt32BE(role.length, 0);
+  lengths.writeUInt32BE(text.length, 4);
+  hash.update(lengths);
+  hash.update(role);
+  hash.update(text);
+}
+
+/** Cryptographic message identity. Hash collision must not become transcript movement. */
 export function messageHash(message: ConversationMessage): string {
-  const text = `${message.role}|${message.text}`;
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
+  const hash = createHash("sha256");
+  feedMessage(hash, message);
+  return hash.digest("hex");
+}
+
+/** Identity of one exact observed transcript prefix. */
+export function transcriptDigest(messages: readonly ConversationMessage[]): string {
+  const hash = createHash("sha256");
+  const count = Buffer.allocUnsafe(8);
+  count.writeBigUInt64BE(BigInt(messages.length));
+  hash.update(count);
+  for (const message of messages) feedMessage(hash, message);
+  return hash.digest("hex");
 }
 
 function initialTail(snapshot: readonly ConversationMessage[]): ConversationMessage[] {
   if (snapshot.length === 0) return [];
 
-  // On first sight of a session (including after a gateway/plugin restart), do
-  // not replay the whole historical transcript. Capture only the current run's
-  // conversational tail: everything after the previous assistant boundary.
+  // A genuinely new/untracked session intentionally begins at the current turn,
+  // not at the beginning of an arbitrarily long pre-existing transcript.
   const lastIndex = snapshot.length - 1;
   const last = snapshot[lastIndex]!;
   let boundary = -1;
@@ -62,28 +85,39 @@ function initialTail(snapshot: readonly ConversationMessage[]): ConversationMess
   return snapshot.slice(boundary + 1).map((message) => ({ ...message }));
 }
 
-/**
- * Find where the durable watermark ends inside the current transcript.
- *
- * The longest stored suffix is tried first so a repeated short message cannot
- * anchor the delta too early. Compaction that dropped part of the stored tail
- * still matches through the shorter suffixes. Returns -1 when nothing matches.
- */
-function findWatermarkEnd(hashes: readonly string[], tailHashes: readonly string[]): number {
-  for (let length = Math.min(tailHashes.length, hashes.length); length > 0; length -= 1) {
-    const wanted = tailHashes.slice(tailHashes.length - length);
-    for (let start = hashes.length - length; start >= 0; start -= 1) {
-      let matches = true;
-      for (let i = 0; i < length; i += 1) {
-        if (hashes[start + i] !== wanted[i]) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) return start + length - 1;
-    }
+function tailMatchesAt(
+  hashes: readonly string[],
+  tailHashes: readonly string[],
+  start: number,
+): boolean {
+  if (start < 0 || start + tailHashes.length > hashes.length) return false;
+  for (let i = 0; i < tailHashes.length; i += 1) {
+    if (hashes[start + i] !== tailHashes[i]) return false;
   }
-  return -1;
+  return true;
+}
+
+/**
+ * Locate a compaction anchor only when it is unique.
+ *
+ * Picking the first/last occurrence of repeated dialogue is exactly how a cursor
+ * silently jumps backwards or forwards. Ambiguity is therefore an error, not a
+ * heuristic. The durable queue keeps everything already captured while the
+ * operator fixes the source transcript instead of Graphiti receiving a guess.
+ */
+function findUniqueTailEnd(hashes: readonly string[], tailHashes: readonly string[]): number {
+  if (tailHashes.length === 0 || hashes.length < tailHashes.length) return -1;
+  const matches: number[] = [];
+  for (let start = 0; start <= hashes.length - tailHashes.length; start += 1) {
+    if (tailMatchesAt(hashes, tailHashes, start)) matches.push(start + tailHashes.length - 1);
+  }
+  if (matches.length === 0) return -1;
+  if (matches.length > 1) {
+    throw new TranscriptCursorError(
+      `durable transcript tail occurs ${matches.length} times; refusing an ambiguous capture cursor`,
+    );
+  }
+  return matches[0]!;
 }
 
 function longestSuffixPrefixOverlap(
@@ -91,7 +125,9 @@ function longestSuffixPrefixOverlap(
   current: readonly ConversationMessage[],
 ): number {
   const max = Math.min(previous.length, current.length);
-  for (let size = max; size > 0; size -= 1) {
+  let best = 0;
+  let bestCount = 0;
+  for (let size = 1; size <= max; size += 1) {
     let matches = true;
     for (let i = 0; i < size; i += 1) {
       if (!sameMessage(previous[previous.length - size + i]!, current[i]!)) {
@@ -99,9 +135,16 @@ function longestSuffixPrefixOverlap(
         break;
       }
     }
-    if (matches) return size;
+    if (matches) {
+      if (size > best) {
+        best = size;
+        bestCount = 1;
+      } else if (size === best) {
+        bestCount += 1;
+      }
+    }
   }
-  return 0;
+  return bestCount === 1 ? best : 0;
 }
 
 function commonPrefixLength(
@@ -120,6 +163,17 @@ type PendingObservation = {
   messages: ConversationMessage[];
 };
 
+function watermarkFor(observation: PendingObservation): SessionWatermark {
+  return {
+    agentId: observation.agentId,
+    sessionKey: observation.sessionKey,
+    tailHashes: observation.messages.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
+    observedMessages: observation.messages.length,
+    prefixDigest: transcriptDigest(observation.messages),
+    updatedAt: Date.now(),
+  };
+}
+
 export class TranscriptDeltaTracker {
   private readonly snapshots = new Map<string, ConversationMessage[]>();
   private readonly watermarks = new Map<string, SessionWatermark>();
@@ -130,36 +184,52 @@ export class TranscriptDeltaTracker {
     const current = snapshot.map((message) => ({ ...message }));
     const previous = this.snapshots.get(key);
 
-    // Re-insert so Map iteration order stays least-recently-used first.
+    // Compute before publishing any new in-memory cursor state. If the transcript
+    // cannot be reconciled, a failed observation must not become tomorrow's trusted
+    // predecessor and silently skip the very messages we refused to guess about.
+    const delta = this.computeDelta(key, previous, current);
+
     this.snapshots.delete(key);
     this.snapshots.set(key, current);
     this.pendingObservations.set(key, { agentId, sessionKey, messages: current });
-    this.pruneSessions();
+    this.pruneSnapshots();
+    return delta;
+  }
 
-    return this.computeDelta(key, previous, current);
+  /** Build the candidate cursor without advancing the committed in-memory watermark. */
+  pendingWatermark(agentId: string, sessionKey: string): SessionWatermark {
+    const key = JSON.stringify([agentId, sessionKey]);
+    const observation = this.pendingObservations.get(key);
+    if (!observation) {
+      throw new TranscriptCursorError(
+        `no pending transcript observation for ${agentId}/${sessionKey}`,
+      );
+    }
+    return watermarkFor(observation);
+  }
+
+  /** Advance the in-memory cursor only after the caller made that candidate durable. */
+  commit(agentId: string, sessionKey: string): SessionWatermark | undefined {
+    const key = JSON.stringify([agentId, sessionKey]);
+    const observation = this.pendingObservations.get(key);
+    if (!observation) return undefined;
+
+    const watermark = watermarkFor(observation);
+    this.watermarks.set(key, watermark);
+    this.pendingObservations.delete(key);
+    return { ...watermark, tailHashes: [...watermark.tailHashes] };
   }
 
   /**
-   * Advance the durable watermark for a session.
+   * Forget an observation whose durable transaction failed.
    *
-   * Called only once the delta returned by take() is safely buffered. Observing
-   * a message is not the same as capturing it: if buffering failed, the
-   * watermark must stay behind so the next process re-observes those messages
-   * instead of treating them as already captured.
+   * The next call deliberately falls back to the last committed watermark rather
+   * than the unpersisted snapshot. That turns disk-full/crash uncertainty into a
+   * safe replay of the uncommitted delta instead of message loss.
    */
-  commit(agentId: string, sessionKey: string): void {
+  rollback(agentId: string, sessionKey: string): void {
     const key = JSON.stringify([agentId, sessionKey]);
-    const observation = this.pendingObservations.get(key);
-    if (!observation || observation.messages.length === 0) return;
-
-    this.watermarks.delete(key);
-    this.watermarks.set(key, {
-      agentId,
-      sessionKey,
-      tailHashes: observation.messages.slice(-WATERMARK_TAIL_MESSAGES).map(messageHash),
-      observedMessages: observation.messages.length,
-      updatedAt: Date.now(),
-    });
+    this.snapshots.delete(key);
     this.pendingObservations.delete(key);
   }
 
@@ -176,68 +246,63 @@ export class TranscriptDeltaTracker {
       return current.slice(prefix).map((message) => ({ ...message }));
     }
 
-    // Compaction/rewrite may remove or replace an older prefix. Preserve any
-    // overlapping tail and only emit what follows it.
     const overlap = longestSuffixPrefixOverlap(previous, current);
     if (overlap > 0) {
       return current.slice(overlap).map((message) => ({ ...message }));
     }
 
-    // No trustworthy overlap: fail conservatively by treating this like the
-    // first observation rather than replaying the entire historical transcript.
-    return initialTail(current);
+    throw new TranscriptCursorError(
+      "OpenClaw transcript changed with no trustworthy overlap; refusing to guess which messages are new",
+    );
   }
 
-  /**
-   * First observation inside this process. A durable watermark from before a
-   * restart tells us exactly how far the transcript was already observed, so the
-   * session resumes without replaying or skipping its own tail. Without one we
-   * fall back to boundary detection.
-   */
   private firstObservation(key: string, current: ConversationMessage[]): ConversationMessage[] {
     const watermark = this.watermarks.get(key);
-    if (!watermark || watermark.tailHashes.length === 0 || current.length === 0) {
-      return initialTail(current);
+    if (!watermark) return initialTail(current);
+    if (current.length === 0) return [];
+
+    // Normal restart path: prove that the first N messages are byte-for-byte the
+    // prefix committed before shutdown. This is exact and does not depend on a
+    // repeated tail phrase happening to be unique.
+    if (current.length >= watermark.observedMessages) {
+      const prefix = current.slice(0, watermark.observedMessages);
+      if (transcriptDigest(prefix) === watermark.prefixDigest) {
+        return current.slice(watermark.observedMessages).map((message) => ({ ...message }));
+      }
     }
 
-    const end = findWatermarkEnd(current.map(messageHash), watermark.tailHashes);
-    if (end < 0) return initialTail(current);
-    return current.slice(end + 1).map((message) => ({ ...message }));
+    // OpenClaw may compact old transcript history. Only then use the secondary
+    // tail anchor, and only if the whole stored tail occurs exactly once.
+    const end = findUniqueTailEnd(current.map(messageHash), watermark.tailHashes);
+    if (end >= 0) return current.slice(end + 1).map((message) => ({ ...message }));
+
+    throw new TranscriptCursorError(
+      "durable transcript cursor is not present in the current OpenClaw transcript; refusing to skip or replay messages",
+    );
   }
 
-  /**
-   * Full transcripts are held per session to compute deltas. Without a bound a
-   * long-lived gateway would keep every transcript it has ever seen, so the
-   * least recently used sessions are dropped; they fall back to the durable
-   * watermark, or to boundary detection, on their next observation.
-   */
-  private pruneSessions(): void {
+  private pruneSnapshots(): void {
     while (this.snapshots.size > MAX_TRACKED_SESSIONS) {
       const oldest = this.snapshots.keys().next().value;
       if (oldest === undefined) return;
       this.snapshots.delete(oldest);
       this.pendingObservations.delete(oldest);
     }
-    while (this.watermarks.size > WATERMARK_MAX_SESSIONS) {
-      const oldest = this.watermarks.keys().next().value;
-      if (oldest === undefined) return;
-      this.watermarks.delete(oldest);
-    }
   }
 
-  /** Bounded, content-free watermark set for the durable spool. */
-  export(now = Date.now()): SessionWatermark[] {
+  /** Durable cursors are tiny integrity metadata and are intentionally never aged out. */
+  export(): SessionWatermark[] {
     return [...this.watermarks.values()]
-      .filter((watermark) => now - watermark.updatedAt <= WATERMARK_MAX_AGE_MS)
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, WATERMARK_MAX_SESSIONS);
+      .map((watermark) => ({ ...watermark, tailHashes: [...watermark.tailHashes] }))
+      .sort((a, b) => a.agentId.localeCompare(b.agentId) || a.sessionKey.localeCompare(b.sessionKey));
   }
 
-  restore(watermarks: readonly SessionWatermark[], now = Date.now()): number {
+  restore(watermarks: readonly SessionWatermark[]): number {
     let restored = 0;
     for (const watermark of watermarks) {
-      if (now - watermark.updatedAt > WATERMARK_MAX_AGE_MS) continue;
-      if (watermark.tailHashes.length === 0) continue;
+      if (!Number.isInteger(watermark.observedMessages) || watermark.observedMessages < 0) continue;
+      if (!/^[0-9a-f]{64}$/i.test(watermark.prefixDigest)) continue;
+      if (!watermark.tailHashes.every((hash) => /^[0-9a-f]{64}$/i.test(hash))) continue;
       this.watermarks.set(JSON.stringify([watermark.agentId, watermark.sessionKey]), {
         ...watermark,
         tailHashes: [...watermark.tailHashes],

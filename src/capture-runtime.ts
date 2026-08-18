@@ -1,19 +1,14 @@
 /**
  * Process-wide ownership of the capture runtime.
  *
- * OpenClaw calls register() several times per process — once per host surface —
- * and may call it again on a plugin hot reload. Each call used to build its own
- * BufferEngine over the same durable spool, so a start with unsent messages gave
- * every instance the same buffer and every instance flushed it: one batch became
- * several episodes with the same name and different UUIDs.
+ * OpenClaw calls register() several times per process and may call it again on a
+ * hot reload. There must still be exactly one owner of the durable capture spool
+ * and exactly one BufferEngine consuming it. Two live runtimes over one spool can
+ * both observe the same restored head and manufacture different sequence state,
+ * which is a direct route to duplicated or reordered episodes.
  *
- * The capture pipeline is therefore owned per process, not per registration.
- * Every registration binds its hooks to the same runtime, so it does not matter
- * which host surface actually delivers events.
- *
- * State lives on a global symbol rather than in module scope because a hot
- * reload can re-import the module, which would otherwise hand the new copy a
- * fresh, empty registry while the previous engines keep running.
+ * State lives on a global symbol rather than in module scope because a hot reload
+ * can re-import this module while the previous copy is still alive.
  */
 const RUNTIME_KEY = Symbol.for("graphiti-openclaw-plugin/capture-runtime.v1");
 
@@ -26,7 +21,12 @@ type RuntimeHost<T> = {
   [RUNTIME_KEY]?: RuntimeSlot<T>;
 };
 
-export type AcquireOutcome = "created" | "reused" | "replaced_stopped" | "replaced_reconfigured";
+export type AcquireOutcome =
+  | "created"
+  | "reused"
+  | "reused_config_mismatch"
+  | "replaced_stopped"
+  | "replaced_reconfigured";
 
 export type AcquireResult<T> = {
   runtime: T;
@@ -34,34 +34,38 @@ export type AcquireResult<T> = {
 };
 
 /**
- * Return the process-wide runtime, creating it only when there is none, when the
- * previous one has been shut down, or when the plugin configuration changed.
+ * Return the single process-wide runtime.
  *
- * A configuration change deliberately replaces the runtime instead of silently
- * reusing one built from different settings.
+ * A live runtime is NEVER replaced merely because a hot reload presents a new
+ * configuration fingerprint. Replacing it would orphan its timers/in-flight
+ * delivery while a second runtime starts consuming the same durable spool. The
+ * current runtime therefore remains authoritative until it is stopped; changed
+ * capture configuration takes effect on the next clean runtime creation.
  */
 export function acquireCaptureRuntime<T>(params: {
   fingerprint: string;
   isStopped: (runtime: T) => boolean;
   create: () => T;
-  dispose?: (runtime: T) => void;
 }): AcquireResult<T> {
   const host = globalThis as RuntimeHost<T>;
   const existing = host[RUNTIME_KEY];
 
   if (existing) {
-    if (existing.fingerprint !== params.fingerprint) {
-      params.dispose?.(existing.value);
-      const runtime = params.create();
-      host[RUNTIME_KEY] = { fingerprint: params.fingerprint, value: runtime };
-      return { runtime, outcome: "replaced_reconfigured" };
-    }
     if (!params.isStopped(existing.value)) {
-      return { runtime: existing.value, outcome: "reused" };
+      return {
+        runtime: existing.value,
+        outcome:
+          existing.fingerprint === params.fingerprint ? "reused" : "reused_config_mismatch",
+      };
     }
+
     const runtime = params.create();
+    const sameConfiguration = existing.fingerprint === params.fingerprint;
     host[RUNTIME_KEY] = { fingerprint: params.fingerprint, value: runtime };
-    return { runtime, outcome: "replaced_stopped" };
+    return {
+      runtime,
+      outcome: sameConfiguration ? "replaced_stopped" : "replaced_reconfigured",
+    };
   }
 
   const runtime = params.create();

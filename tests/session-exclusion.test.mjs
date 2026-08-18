@@ -4,15 +4,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileSessionPatterns, matchSessionExclusion } from "../dist/session-filter.js";
-import { DEFAULT_CONFIG } from "../dist/config.js";
-import { parseConfig } from "../dist/config.js";
+import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 import { register } from "../dist/index.js";
+import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-exclusion-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
 
 let instance = 0;
-function makeRuntime(pluginConfig) {
+function makeRuntime(t, pluginConfig) {
+  resetCaptureRuntimeForTests();
   process.env.OPENCLAW_STATE_DIR = join(stateRoot, `api-${instance++}`);
   const hooks = new Map();
   const logs = [];
@@ -25,6 +26,11 @@ function makeRuntime(pluginConfig) {
       error: (message) => logs.push(message),
     },
     on: (name, handler) => hooks.set(name, handler),
+  });
+  t.after(async () => {
+    const stop = hooks.get("gateway_stop");
+    if (stop) await stop();
+    resetCaptureRuntimeForTests();
   });
   return { hooks, logs };
 }
@@ -55,7 +61,6 @@ test("patterns are regular expressions tested against the session key", () => {
 
 test("the same list also excludes by run trigger", () => {
   const patterns = compileSessionPatterns(["^heartbeat$"]);
-
   assert.deepEqual(
     matchSessionExclusion({ sessionKey: "agent:main:web:plain-key", trigger: "heartbeat" }, patterns),
     { pattern: "^heartbeat$", matched: "trigger" },
@@ -75,7 +80,6 @@ test("stateful regex flags cannot desynchronise repeated matching", () => {
 
 test("excludeSessionPatterns defaults reproduce the old hardcoded filtering", () => {
   const patterns = compileSessionPatterns(parseConfig({}).excludeSessionPatterns);
-
   for (const sessionKey of [
     "agent:main:cron:nightly",
     "agent:main:heartbeat:1",
@@ -87,11 +91,9 @@ test("excludeSessionPatterns defaults reproduce the old hardcoded filtering", ()
   for (const trigger of ["cron", "heartbeat"]) {
     assert.ok(matchSessionExclusion({ sessionKey: "agent:main:web:x", trigger }, patterns), trigger);
   }
-
   assert.equal(
     matchSessionExclusion({ sessionKey: "agent:main:telegram:42", trigger: "user" }, patterns),
     undefined,
-    "a real dialog is never excluded by the defaults",
   );
 });
 
@@ -110,99 +112,84 @@ test("excludeSessionPatterns is validated as regular expressions", () => {
   );
 });
 
-test("an excluded session is skipped by capture and by recall", async () => {
+test("an excluded session is skipped by capture and by recall", async (t) => {
   const calls = [];
   const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
   globalThis.fetch = async (_url, init) => {
     calls.push(JSON.parse(init.body));
     throw new Error("an excluded session must never reach Graphiti");
   };
 
-  try {
-    const { hooks, logs } = makeRuntime(
-      baseConfig({ excludeSessionPatterns: ["^agent:[^:]+:dreaming-"] }),
-    );
-    const ctx = {
-      agentId: "main",
-      sessionKey: "agent:main:dreaming-narrative-memory-core-v2-rem-f00ca3560c6a",
-      trigger: "user",
-    };
+  const { hooks, logs } = makeRuntime(
+    t,
+    baseConfig({ excludeSessionPatterns: ["^agent:[^:]+:dreaming-"] }),
+  );
+  const ctx = {
+    agentId: "main",
+    sessionKey: "agent:main:dreaming-narrative-memory-core-v2-rem-f00ca3560c6a",
+    trigger: "user",
+  };
 
-    hooks.get("agent_end")(
-      {
-        success: true,
-        messages: [
-          { role: "user", content: "dreaming input" },
-          { role: "assistant", content: "dreaming output" },
-        ],
-      },
-      ctx,
-    );
-    const recall = await hooks.get("before_prompt_build")({ prompt: "что я помню?", messages: [] }, ctx);
+  hooks.get("agent_end")(
+    {
+      success: true,
+      messages: [
+        { role: "user", content: "dreaming input" },
+        { role: "assistant", content: "dreaming output" },
+      ],
+    },
+    ctx,
+  );
+  const recall = await hooks.get("before_prompt_build")({ prompt: "что я помню?", messages: [] }, ctx);
 
-    assert.equal(recall, undefined, "no context is injected into an excluded session");
-    assert.deepEqual(calls, [], "no MCP traffic at all for an excluded session");
-    assert.ok(logs.some((line) => line.includes("event=capture_skipped") && line.includes('reason="excluded_session"')));
-    assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="excluded_session"')));
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal(recall, undefined);
+  assert.deepEqual(calls, []);
+  assert.ok(logs.some((line) => line.includes("event=capture_skipped") && line.includes('reason="excluded_session"')));
+  assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="excluded_session"')));
 });
 
-test("background runs never receive capture or recall by default", async () => {
+test("background runs never receive capture or recall by default", async (t) => {
   const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
   globalThis.fetch = async () => {
     throw new Error("a background run must never reach Graphiti");
   };
 
-  try {
-    const { hooks, logs } = makeRuntime(baseConfig());
-    const ctx = { agentId: "main", sessionKey: "agent:main:heartbeat:1", trigger: "heartbeat" };
+  const { hooks, logs } = makeRuntime(t, baseConfig());
+  const ctx = { agentId: "main", sessionKey: "agent:main:heartbeat:1", trigger: "heartbeat" };
 
-    hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "tick" }] }, ctx);
-    const result = await hooks.get("before_prompt_build")({ prompt: "heartbeat prompt", messages: [] }, ctx);
+  hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "tick" }] }, ctx);
+  const result = await hooks.get("before_prompt_build")({ prompt: "heartbeat prompt", messages: [] }, ctx);
 
-    assert.equal(result, undefined);
-    assert.ok(logs.some((line) => line.includes("event=capture_skipped") && line.includes('reason="excluded_session"')));
-    assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="excluded_session"')));
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal(result, undefined);
+  assert.ok(logs.some((line) => line.includes("event=capture_skipped") && line.includes('reason="excluded_session"')));
+  assert.ok(logs.some((line) => line.includes("event=recall_skipped") && line.includes('reason="excluded_session"')));
 });
 
-test("capturing for an agent missing from the config is reported once", async () => {
+test("capturing for an agent missing from the config is reported once", (t) => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    throw new Error("offline");
-  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => { throw new Error("offline"); };
 
-  try {
-    const { hooks, logs } = makeRuntime(baseConfig());
-    const ctx = { agentId: "purple", sessionKey: "agent:purple:web:1", trigger: "user" };
+  const { hooks, logs } = makeRuntime(t, baseConfig());
+  const ctx = { agentId: "purple", sessionKey: "agent:purple:web:1", trigger: "user" };
 
-    hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "hi" }] }, ctx);
-    hooks.get("agent_end")(
-      { success: true, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] },
-      ctx,
-    );
+  hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "hi" }] }, ctx);
+  hooks.get("agent_end")(
+    { success: true, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] },
+    ctx,
+  );
 
-    const warnings = logs.filter((line) => line.includes("event=capture_agent_unconfigured"));
-    assert.equal(warnings.length, 1, "reported once per agent, not per turn");
-    assert.match(warnings[0], /agentId="purple"/);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const warnings = logs.filter((line) => line.includes("event=capture_agent_unconfigured"));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /agentId="purple"/);
 });
 
 test("the shipped defaults exclude OpenClaw's own setup probes", () => {
   const patterns = compileSessionPatterns(DEFAULT_CONFIG.excludeSessionPatterns);
-
-  // Seen in a live graph: a model-setup probe wrote its own saga, because the
-  // defaults only knew about cron, heartbeats and subagents.
   const probe = "agent:main:setup-inference:incognito-probe-setup-inference-044674ec-d610-49e5-816b-daf90ef954e7";
-  assert.ok(matchSessionExclusion({ sessionKey: probe }, patterns), "a setup probe is not a conversation");
-
-  // A real dialog is untouched by the new patterns.
+  assert.ok(matchSessionExclusion({ sessionKey: probe }, patterns));
   assert.equal(
     matchSessionExclusion({ sessionKey: "agent:main:telegram:direct:8248439450" }, patterns),
     undefined,

@@ -26,11 +26,7 @@ export type Buffer = {
 
 export type FlushReason = "limit" | "timeout";
 
-/**
- * The Graphiti episode identity reserved for a batch before it is submitted.
- * Persisting it lets a restarted gateway ask Graphiti whether the batch already
- * landed instead of replaying it blindly under a fresh UUID.
- */
+/** Stable identity reserved for a queue head before its first side effect. */
 export type EpisodeIdentity = {
   uuid: string;
   name: string;
@@ -118,20 +114,21 @@ function restoreBuffer(buffer: PersistedBuffer): Buffer {
 }
 
 /**
- * Per-session message buffers + one FIFO queue per agent.
- * User and assistant messages are buffered exactly in observed order. A failed
- * queue head is retained and retried; later entries can never overtake it.
+ * Per-session buffers feeding one FIFO per agent.
  *
- * When onStateChange is configured, every mutation that can affect unaccepted
- * capture data is synchronously checkpointed by the caller before new queued
- * work is allowed to overtake it.
+ * The disk checkpoint is the authority. No remote side effect starts until the
+ * state that describes it is durable, and no later queue head starts until the
+ * checkpoint removing a committed predecessor succeeds. This is deliberately
+ * slower than an in-memory queue and deliberately much harder to corrupt.
  */
 export class BufferEngine {
   private readonly captureStates = new Map<string, AgentCaptureState>();
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly bufferTimeoutMs: number;
+  private readonly pendingPumps = new Set<string>();
   private stopped = false;
   private persistFailureActive = false;
+  private bulkCheckpointScheduled = false;
 
   constructor(
     private readonly agents: Record<string, AgentActors>,
@@ -167,7 +164,31 @@ export class BufferEngine {
 
   addMessage(agentId: string, sessionKey: string, role: MessageRole, text: string): void {
     if (this.stopped) throw new Error("cannot add capture messages after BufferEngine shutdown");
+    this.appendMessage(agentId, sessionKey, role, text);
+    this.checkpoint();
+  }
 
+  /**
+   * Add one observed transcript delta as one local transaction.
+   *
+   * The old implementation called addMessage() repeatedly, checkpointing after
+   * every message. The transcript watermark is advanced by the caller only after
+   * this method returns, so SIGKILL between those writes could leave messages on
+   * disk with the old watermark; after restart the same messages were observed
+   * again and duplicated/split across batches. Bulk additions therefore perform
+   * no intermediate write. The caller's immediate checkpoint persists the whole
+   * delta and its advanced watermark together. A microtask is only a fallback for
+   * callers that do not explicitly checkpoint.
+   */
+  addMessages(agentId: string, sessionKey: string, messages: readonly BufferMessage[]): void {
+    if (this.stopped) throw new Error("cannot add capture messages after BufferEngine shutdown");
+    for (const message of messages) {
+      this.appendMessage(agentId, sessionKey, message.role, message.text);
+    }
+    this.scheduleBulkCheckpoint();
+  }
+
+  private appendMessage(agentId: string, sessionKey: string, role: MessageRole, text: string): void {
     const clean = text.trim();
     if (!clean) return;
 
@@ -179,13 +200,10 @@ export class BufferEngine {
     }
 
     const now = Date.now();
-    let shouldPump = false;
 
-    // Flush an idle non-empty buffer before accepting fresh activity for the
-    // same session. This keeps the timeout boundary deterministic.
     if (now - buffer.lastActivityAt >= this.bufferTimeoutMs && this.isNonEmpty(buffer)) {
       agent.queue.push({ buffer, enqueuedAt: now, reason: "timeout" });
-      shouldPump = true;
+      this.pendingPumps.add(agentId);
       buffer = this.createBuffer(sessionKey, agentId);
       agent.activeBuffers.set(sessionKey, buffer);
     }
@@ -196,18 +214,19 @@ export class BufferEngine {
     if (buffer.messages.length >= this.bufferLimit) {
       agent.queue.push({ buffer, enqueuedAt: now, reason: "limit" });
       agent.activeBuffers.set(sessionKey, this.createBuffer(sessionKey, agentId));
-      shouldPump = true;
+      this.pendingPumps.add(agentId);
     }
-
-    // Persist the detached queue head / active tail before starting new delivery.
-    this.persistState();
-    if (shouldPump) void this.pump(agent);
   }
 
-  addMessages(agentId: string, sessionKey: string, messages: readonly BufferMessage[]): void {
-    for (const message of messages) {
-      this.addMessage(agentId, sessionKey, message.role, message.text);
-    }
+  private scheduleBulkCheckpoint(): void {
+    if (this.bulkCheckpointScheduled) return;
+    this.bulkCheckpointScheduled = true;
+    queueMicrotask(() => {
+      this.bulkCheckpointScheduled = false;
+      // An explicit caller checkpoint normally ran already. Calling this again is
+      // harmless and gives direct addMessages() users the same durability contract.
+      this.checkpoint();
+    });
   }
 
   private actorsFor(agentId: string): AgentActors {
@@ -275,6 +294,7 @@ export class BufferEngine {
               : {}),
           })),
       );
+      if (agent.queue.length > 0) this.pendingPumps.add(agent.agentId);
     }
   }
 
@@ -297,22 +317,35 @@ export class BufferEngine {
         if (now - buffer.lastActivityAt >= this.bufferTimeoutMs) {
           agent.activeBuffers.delete(sessionKey);
           agent.queue.push({ buffer, enqueuedAt: now, reason: "timeout" });
+          this.pendingPumps.add(agent.agentId);
           changed = true;
         }
       }
     }
 
-    // A timeout transition must be durable before its queue entry is delivered.
-    if (changed) this.persistState();
+    // A previous disk error is retried even if no new mutation happened. No queue
+    // is allowed to advance until the authoritative checkpoint is writable again.
+    const durable = changed || this.persistFailureActive ? this.persistState() : true;
+    if (!durable) return;
+
+    this.flushPendingPumps();
     for (const agent of this.captureStates.values()) void this.pump(agent);
   }
 
   private async pump(agent: AgentCaptureState): Promise<void> {
-    if (this.stopped || agent.processing || Date.now() < agent.retryAfter) return;
+    if (
+      this.stopped ||
+      this.persistFailureActive ||
+      agent.processing ||
+      Date.now() < agent.retryAfter
+    ) {
+      return;
+    }
+
     agent.processing = true;
     try {
-      while (!this.stopped && agent.queue.length > 0) {
-        const entry = agent.queue[0];
+      while (!this.stopped && !this.persistFailureActive && agent.queue.length > 0) {
+        const entry = agent.queue[0]!;
         const reason = entry.reason;
         try {
           await this.sink(agent.agentId, entry, reason);
@@ -322,16 +355,23 @@ export class BufferEngine {
             this.opts.notifyError?.(agent.agentId, entry.buffer.sessionKey, reason, asError(error));
           }
           agent.failureActive = true;
-          // Keep the failed entry at queue[0]. The next ticker retries the same
-          // content, reason and saga order.
           break;
         }
 
-        // Delivery succeeded. The checkpoint below is deliberately outside the
-        // delivery try/catch: a local write failure is a spool problem, never a
-        // capture failure, and must not be reported to the user as one.
+        // shutdown/hot-reload may have happened while the remote call was in
+        // flight. Leaving the committed head on disk is safe: the next process
+        // confirms its UUID and removes it without repeating the graph mutation.
+        if (this.stopped) {
+          this.persistState();
+          break;
+        }
+
         agent.queue.shift();
-        this.persistState();
+        // Do not expose the next head remotely until removal of the committed
+        // predecessor is durable. If this write fails the old disk image still
+        // contains the predecessor, which is exactly the recoverable state.
+        if (!this.persistState()) break;
+
         if (agent.failureActive) {
           this.opts.notifyRecovered?.(agent.agentId, entry.buffer.sessionKey, reason);
         }
@@ -340,6 +380,16 @@ export class BufferEngine {
       }
     } finally {
       agent.processing = false;
+    }
+  }
+
+  private flushPendingPumps(): void {
+    if (this.stopped || this.persistFailureActive) return;
+    const ids = [...this.pendingPumps];
+    this.pendingPumps.clear();
+    for (const agentId of ids) {
+      const agent = this.captureStates.get(agentId);
+      if (agent) void this.pump(agent);
     }
   }
 
@@ -371,24 +421,27 @@ export class BufferEngine {
     return { agents };
   }
 
-  /** True once shutdown() or stop() has run; a stopped engine accepts no new capture. */
   isStopped(): boolean {
     return this.stopped;
   }
 
-  /** Checkpoint state that changed outside the engine (transcript watermarks, episode identity). */
+  /**
+   * Persist all local capture state first, then release any queue head that became
+   * eligible. Callers use this after advancing transcript watermarks or reserving
+   * an episode identity so those mutations share the same durable boundary.
+   */
   checkpoint(): void {
-    this.persistState();
+    if (this.persistState()) this.flushPendingPumps();
   }
 
   /**
-   * Durable checkpointing must never destroy the capture it exists to protect.
-   * A failed write keeps every message in memory and is reported once; the next
-   * mutation retries the checkpoint and reports recovery.
+   * Return whether the current in-memory state is durably represented on disk.
+   * A write failure never starts/continues remote delivery; future mutations and
+   * the periodic tick keep retrying the checkpoint until it recovers.
    */
-  private persistState(): void {
+  private persistState(): boolean {
     const onStateChange = this.opts.onStateChange;
-    if (!onStateChange) return;
+    if (!onStateChange) return true;
     try {
       onStateChange(this.snapshot());
     } catch (error) {
@@ -396,19 +449,15 @@ export class BufferEngine {
         this.persistFailureActive = true;
         this.opts.notifyPersistError?.(asError(error));
       }
-      return;
+      return false;
     }
     if (this.persistFailureActive) {
       this.persistFailureActive = false;
       this.opts.notifyPersistRecovered?.();
     }
+    return true;
   }
 
-  /**
-   * Freeze capture and durably checkpoint the remaining tail. Existing in-flight
-   * delivery gets a short grace period to finish; no new queue head is started.
-   * Anything still unaccepted stays in the spool for the next gateway start.
-   */
   async shutdown(graceMs = 4_000): Promise<void> {
     if (!this.stopped) {
       this.stopped = true;

@@ -315,8 +315,6 @@ export function createCapturePipeline(params: {
           group_id: agentId,
           saga: sessionKey,
           integrityErrors: saga.integrityErrors,
-          episodeCount: saga.episodeCount,
-          chainCount: saga.chainCount,
         });
       }
       if (saga.episodeCount > 0 && (!saga.firstEpisodeUuid || !saga.lastEpisodeUuid)) {

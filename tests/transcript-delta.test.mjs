@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BufferEngine } from "../dist/buffer.js";
-import { TranscriptDeltaTracker } from "../dist/transcript-delta.js";
+import {
+  TranscriptCursorError,
+  TranscriptDeltaTracker,
+  WATERMARK_TAIL_MESSAGES,
+  messageHash,
+} from "../dist/transcript-delta.js";
 
 const agents = { main: { user: "Вит", assistant: "Краб" } };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -17,7 +22,7 @@ async function waitFor(predicate, timeoutMs = 2000) {
 const u = (text) => ({ role: "user", text });
 const a = (text) => ({ role: "assistant", text });
 
-test("first observation captures only current tail, including consecutive users", () => {
+test("first observation captures only the current tail, including consecutive users", () => {
   const tracker = new TranscriptDeltaTracker();
   const delta = tracker.take("main", "s1", [
     u("old-u"), a("old-a"), u("u1"), u("u2"), u("u3"), a("a1"),
@@ -28,8 +33,11 @@ test("first observation captures only current tail, including consecutive users"
 test("successive snapshots emit only new user/assistant messages", () => {
   const tracker = new TranscriptDeltaTracker();
   assert.deepEqual(tracker.take("main", "s1", [u("u1")]), [u("u1")]);
+  tracker.commit("main", "s1");
   assert.deepEqual(tracker.take("main", "s1", [u("u1"), u("u2")]), [u("u2")]);
+  tracker.commit("main", "s1");
   assert.deepEqual(tracker.take("main", "s1", [u("u1"), u("u2"), u("u3")]), [u("u3")]);
+  tracker.commit("main", "s1");
   assert.deepEqual(
     tracker.take("main", "s1", [u("u1"), u("u2"), u("u3"), a("a1")]),
     [a("a1")],
@@ -82,99 +90,114 @@ test("one lonely user message is eligible for timeout flush", async (t) => {
   assert.deepEqual(entries[0].entry.buffer.messages, [u("lonely-user")]);
 });
 
+test("pending watermark is a candidate until durable capture commits it", () => {
+  const tracker = new TranscriptDeltaTracker();
+  tracker.take("main", "s1", [u("u1"), a("a1")]);
+
+  const candidate = tracker.pendingWatermark("main", "s1");
+  assert.equal(candidate.observedMessages, 2);
+  assert.deepEqual(tracker.export(), [], "preparing a cursor must not advance durable truth");
+
+  const committed = tracker.commit("main", "s1");
+  assert.equal(committed.observedMessages, 2);
+  assert.deepEqual(tracker.export(), [committed]);
+});
+
+test("rollback after a local durability failure replays the uncommitted delta", () => {
+  const tracker = new TranscriptDeltaTracker();
+  tracker.take("main", "s1", [u("u1"), a("a1")]);
+  tracker.commit("main", "s1");
+
+  assert.deepEqual(
+    tracker.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
+    [u("u2"), a("a2")],
+  );
+  tracker.rollback("main", "s1");
+
+  assert.deepEqual(
+    tracker.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
+    [u("u2"), a("a2")],
+    "messages whose disk transaction failed must be offered again",
+  );
+});
+
+test("an ambiguous transcript failure does not poison the next cursor", () => {
+  const tracker = new TranscriptDeltaTracker();
+  tracker.take("main", "s1", [u("u1"), a("a1")]);
+  tracker.commit("main", "s1");
+
+  assert.throws(
+    () => tracker.take("main", "s1", [u("completely rewritten")]),
+    TranscriptCursorError,
+  );
+
+  // Because the rejected snapshot was never published as in-memory truth, the
+  // original committed transcript still accepts its real continuation.
+  assert.deepEqual(
+    tracker.take("main", "s1", [u("u1"), a("a1"), u("u2")]),
+    [u("u2")],
+  );
+});
+
 test("a durable watermark resumes an aborted user-only tail without replaying it", () => {
   const before = new TranscriptDeltaTracker();
-  // Run ended on a user message with no assistant reply, then the gateway stopped.
   assert.deepEqual(before.take("main", "s1", [u("old-u"), a("old-a"), u("u1")]), [u("u1")]);
   before.commit("main", "s1");
   const carried = before.export();
-  assert.equal(carried.length, 1);
-  assert.equal(carried[0].sessionKey, "s1");
 
   const after = new TranscriptDeltaTracker();
   assert.equal(after.restore(carried), 1);
   assert.deepEqual(
     after.take("main", "s1", [u("old-u"), a("old-a"), u("u1"), u("u2"), a("a2")]),
     [u("u2"), a("a2")],
-    "u1 was already captured before the restart and must not be captured twice",
   );
 });
 
-test("a durable watermark recovers a turn that was never observed before the restart", () => {
-  const before = new TranscriptDeltaTracker();
-  before.take("main", "s1", [u("u1"), a("a1")]);
-  before.commit("main", "s1");
-  const carried = before.export();
+test("compacted transcript resumes only from a unique durable tail", () => {
+  const previous = [u("old-u"), a("old-a"), u("anchor-u"), a("anchor-a")];
+  const tracker = new TranscriptDeltaTracker();
+  tracker.restore([
+    {
+      agentId: "main",
+      sessionKey: "s1",
+      tailHashes: [messageHash(u("anchor-u")), messageHash(a("anchor-a"))],
+      observedMessages: previous.length,
+      prefixDigest: "f".repeat(64),
+      updatedAt: Date.now(),
+    },
+  ]);
 
-  const after = new TranscriptDeltaTracker();
-  after.restore(carried);
   assert.deepEqual(
-    after.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
-    [u("u2"), a("a2")],
+    tracker.take("main", "s1", [u("anchor-u"), a("anchor-a"), u("new-u"), a("new-a")]),
+    [u("new-u"), a("new-a")],
   );
 });
 
-test("watermarks are content free, bounded and expire", () => {
+test("durable watermarks contain no text, keep a bounded tail, and do not age out", () => {
   const tracker = new TranscriptDeltaTracker();
   const long = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? u(`u${i}`) : a(`a${i}`)));
   tracker.take("main", "s1", long);
   tracker.commit("main", "s1");
 
   const [watermark] = tracker.export();
-  assert.equal(watermark.tailHashes.length, 12, "only a bounded tail is persisted");
+  assert.equal(watermark.tailHashes.length, WATERMARK_TAIL_MESSAGES);
   assert.equal(watermark.observedMessages, 40);
   assert.match(JSON.stringify(watermark), /^[^а-яА-Я]*$/);
-  assert.ok(!JSON.stringify(watermark).includes("u38"), "message text never reaches the spool");
+  assert.ok(!JSON.stringify(watermark).includes("u38"));
 
-  const expired = new TranscriptDeltaTracker();
+  const yearsLater = new TranscriptDeltaTracker();
   assert.equal(
-    expired.restore([{ ...watermark, updatedAt: Date.now() - 30 * 24 * 60 * 60 * 1000 }]),
-    0,
-    "a stale watermark is dropped instead of anchoring an old transcript",
+    yearsLater.restore([{ ...watermark, updatedAt: Date.now() - 10 * 365 * 24 * 60 * 60 * 1000 }]),
+    1,
+    "durable conversation cursors must survive long-term memory retention",
   );
 });
 
-test("a rewritten transcript with no watermark match falls back to tail detection", () => {
+test("durable session cursors are not evicted with the in-memory snapshot cache", () => {
   const tracker = new TranscriptDeltaTracker();
-  tracker.restore([
-    {
-      agentId: "main",
-      sessionKey: "s1",
-      tailHashes: ["00000000", "11111111"],
-      observedMessages: 2,
-      updatedAt: Date.now(),
-    },
-  ]);
-  assert.deepEqual(
-    tracker.take("main", "s1", [u("old-u"), a("old-a"), u("u1"), a("a1")]),
-    [u("u1"), a("a1")],
-  );
-});
-
-test("an uncommitted observation leaves the watermark behind", () => {
-  const tracker = new TranscriptDeltaTracker();
-  tracker.take("main", "s1", [u("u1"), a("a1")]);
-  tracker.commit("main", "s1");
-  const committed = tracker.export();
-
-  // Observed but never buffered: the watermark must not move.
-  tracker.take("main", "s1", [u("u1"), a("a1"), u("u2")]);
-  assert.deepEqual(tracker.export(), committed);
-
-  const after = new TranscriptDeltaTracker();
-  after.restore(committed);
-  assert.deepEqual(
-    after.take("main", "s1", [u("u1"), a("a1"), u("u2"), a("a2")]),
-    [u("u2"), a("a2")],
-    "the unbuffered message is observed again by the next process",
-  );
-});
-
-test("tracked sessions are bounded", () => {
-  const tracker = new TranscriptDeltaTracker();
-  for (let i = 0; i < 80; i += 1) {
+  for (let i = 0; i < 300; i += 1) {
     tracker.take("main", `s${i}`, [u(`u${i}`), a(`a${i}`)]);
     tracker.commit("main", `s${i}`);
   }
-  assert.equal(tracker.export().length, 64);
+  assert.equal(tracker.export().length, 300);
 });

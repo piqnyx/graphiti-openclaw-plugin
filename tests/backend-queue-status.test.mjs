@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GraphitiMcpClient } from "../dist/mcp-client.js";
 import { register } from "../dist/index.js";
+import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
 
-/** register() with autoCapture touches the durable spool; never let that be the real state dir. */
 function isolateStateDir(t) {
   const stateDir = mkdtempSync(join(tmpdir(), "graphiti-backend-status-"));
   process.env.OPENCLAW_STATE_DIR = stateDir;
@@ -32,9 +32,7 @@ async function waitFor(predicate, timeoutMs = 2000) {
 
 test("getQueueStatus maps terminal backend failure metadata", async (t) => {
   const originalFetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = originalFetch;
-  });
+  t.after(() => { globalThis.fetch = originalFetch; });
 
   globalThis.fetch = async (_url, init) => {
     const payload = JSON.parse(init.body);
@@ -73,6 +71,7 @@ test("getQueueStatus maps terminal backend failure metadata", async (t) => {
     blocked: true,
     attempts: 5,
     pending: 2,
+    queuedEpisodeUuids: [],
     lastError: "provider timeout",
     episodeUuid: "episode-7",
     episodeName: "6bc2a77c6957-7",
@@ -81,6 +80,7 @@ test("getQueueStatus maps terminal backend failure metadata", async (t) => {
 });
 
 test("backend poll publishes errors only to the failed saga session", async (t) => {
+  resetCaptureRuntimeForTests();
   isolateStateDir(t);
   const originalFetch = globalThis.fetch;
   const originalSetInterval = globalThis.setInterval;
@@ -90,6 +90,7 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
   t.after(() => {
     globalThis.fetch = originalFetch;
     globalThis.setInterval = originalSetInterval;
+    resetCaptureRuntimeForTests();
   });
 
   globalThis.setInterval = (fn, ms) => {
@@ -118,6 +119,7 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
               episode_uuid: "episode-7",
               episode_name: "6bc2a77c6957-7",
               saga: "agent:main:web:failed-saga",
+              queued_episode_uuids: [],
             },
           },
           content: [],
@@ -161,7 +163,7 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
   };
 
   register(api);
-  assert.equal(intervals.length, 2, "BufferEngine ticker plus backend queue health ticker");
+  assert.equal(intervals.length, 2, "durable capture ticker plus backend queue health ticker");
   assert.equal(intervals[1].ms, 30_000);
 
   intervals[1].fn();

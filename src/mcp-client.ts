@@ -23,7 +23,7 @@ export type SagaState = {
   firstEpisodeUuid?: string;
   lastEpisodeUuid?: string;
   episodeCount: number;
-  chainCount: number;
+  chainCount?: number;
   integrityOk: boolean;
   integrityErrors: string[];
 };
@@ -344,7 +344,10 @@ export class GraphitiMcpClient {
       firstEpisodeUuid: optionalString(result.first_episode_uuid),
       lastEpisodeUuid: optionalString(result.last_episode_uuid),
       episodeCount: requiredNonnegativeInteger(result.episode_count, "episode_count"),
-      chainCount: requiredNonnegativeInteger(result.chain_count, "chain_count"),
+      chainCount:
+      typeof result.chain_count === "number"
+      ? result.chain_count
+      : undefined,
       integrityOk: requiredBoolean(result.integrity_ok, "integrity_ok"),
       integrityErrors: optionalStringArray(result.integrity_errors),
     };

@@ -309,7 +309,7 @@ export function createCapturePipeline(params: {
           `Graphiti get_saga identity mismatch: requested ${agentId}/${sessionKey}, got ${saga.groupId}/${saga.name}`,
         );
       }
-      if (!saga.integrityOk || saga.chainCount !== saga.episodeCount) {
+      if (!saga.integrityOk) {
         logger.warn("capture_saga_integrity_warning", {
           agentId,
           group_id: agentId,

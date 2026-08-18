@@ -249,7 +249,12 @@ export class GraphitiMcpClient {
 
     let lastSubmissionResult: JsonObject = {};
     let lastSubmissionAt = Date.now();
+
     try {
+      if (await this.episodeCommitted(params)) {
+        return { uuid: params.uuid, persisted: true };
+      }
+
       lastSubmissionResult = await this.callToolOnce("add_memory", args);
       if (typeof lastSubmissionResult.error === "string") {
         throw new McpToolResultError(lastSubmissionResult.error);

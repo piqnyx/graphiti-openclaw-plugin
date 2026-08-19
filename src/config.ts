@@ -27,6 +27,23 @@ export type GraphitiPluginConfig = {
   logModelInput: boolean;
   bufferLimit: number;
   bufferTimeout: number;
+  /**
+   * Where an agent's transcript store lives; `{agentId}` is substituted.
+   *
+   * Configurable because the capture reads the gateway's own database, and a
+   * deployment that moves ~/.openclaw must be able to say so without a rebuild.
+   */
+  agentDbPath: string;
+  /**
+   * Skip whatever a session already holds the first time it is seen.
+   *
+   * Off, because a conversation that starts now is written and read in the same
+   * turn: skipping "existing history" would drop the opening exchange of every new
+   * dialog. Turn it on for the one case that needs it -- the plugin's own state was
+   * discarded while the memory it fed still holds that history, where reading from
+   * the beginning would duplicate every episode instead of recovering anything.
+   */
+  adoptExistingHistoryOnFirstSight: boolean;
   excludeSessionPatterns: string[];
   agentTools: boolean;
   browseChars: number;
@@ -57,6 +74,8 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logModelInput: false,
   bufferLimit: 4,
   bufferTimeout: 900,
+  agentDbPath: "",
+  adoptExistingHistoryOnFirstSight: false,
   // Defaults reproduce the background/slug-generator filtering that used to be
   // hardcoded. They are ordinary config: override or extend them freely.
   agentTools: true,
@@ -190,7 +209,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools",
+    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
     "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
   ]);
 
@@ -217,6 +236,12 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logModelInput: booleanValue(raw.logModelInput, DEFAULT_CONFIG.logModelInput, "logModelInput"),
     bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
+    agentDbPath: typeof raw.agentDbPath === "string" ? raw.agentDbPath.trim() : DEFAULT_CONFIG.agentDbPath,
+    adoptExistingHistoryOnFirstSight: booleanValue(
+      raw.adoptExistingHistoryOnFirstSight,
+      DEFAULT_CONFIG.adoptExistingHistoryOnFirstSight,
+      "adoptExistingHistoryOnFirstSight",
+    ),
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
     agentTools: booleanValue(raw.agentTools, DEFAULT_CONFIG.agentTools, "agentTools"),
     browseChars: integerValue(raw.browseChars, DEFAULT_CONFIG.browseChars, "browseChars", 128, 200_000),

@@ -279,6 +279,16 @@ function limitParam(params: Record<string, unknown>, key: string, fallback: numb
 /** What the local pipeline is holding for one agent right now. */
 export type LocalCaptureState = {
   bufferedMessages: number;
+  /**
+   * Where capture reads the conversation from, and whether it can.
+   *
+   * Capture is a read of the gateway's own transcript store, so "is the store
+   * readable and does it still look the way we read it" is the first question
+   * when the graph stops growing. Reported here so a scheduled status check can
+   * answer it without anyone opening a log.
+   */
+  storePath?: string;
+  storeReadable?: boolean;
   queuedBatches: number;
   /** Age of the least recently touched buffer, or undefined when nothing is buffered. */
   oldestBufferAgeMs?: number;
@@ -785,6 +795,16 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         const local = localCaptureState(resolved.agentId);
         details.bufferedMessages = local.bufferedMessages;
         details.queuedBatches = local.queuedBatches;
+        // Capture reads the gateway's transcript store. If that read is broken,
+        // everything below reports zero and looks calm, so it is said first.
+        if (local.storeReadable === false) {
+          details.storeReadable = false;
+          lines.push(
+            "Capture cannot read the conversation store" +
+              (local.storePath ? ` at ${local.storePath}` : "") +
+              "; nothing new is reaching memory until that is fixed. Nothing is lost meanwhile — the store keeps everything and capture resumes from where it stopped.",
+          );
+        }
         const untilFlush = cfg.bufferLimit - local.bufferedMessages;
         lines.push(
           local.bufferedMessages === 0 && local.queuedBatches === 0

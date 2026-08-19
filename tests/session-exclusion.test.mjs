@@ -7,6 +7,16 @@ import { compileSessionPatterns, matchSessionExclusion } from "../dist/session-f
 import { DEFAULT_CONFIG, parseConfig } from "../dist/config.js";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
+
+// The gateway writes its transcript and then fires the hook; capture reads the
+// store, not the hook payload. Tests still describe a turn as a message list, so
+// the fixture writes it first and the hook only says "a turn ended".
+const agentEnd = (runtime, event, context) => {
+  agentStore.deliver(context?.agentId ?? "main", context?.sessionKey ?? "", event?.messages ?? []);
+  return runtime.hooks.get("agent_end")(event, context);
+};
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-exclusion-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
@@ -39,6 +49,7 @@ const baseConfig = (overrides = {}) => ({
   bufferLimit: 4,
   bufferTimeout: 30,
   logLevel: "debug",
+  agentDbPath: agentStore.agentDbPath,
   agents: { main: { user: "Вит", assistant: "Краб" } },
   ...overrides,
 });
@@ -131,7 +142,7 @@ test("an excluded session is skipped by capture and by recall", async (t) => {
     trigger: "user",
   };
 
-  hooks.get("agent_end")(
+  agentEnd({ hooks }, 
     {
       success: true,
       messages: [
@@ -159,7 +170,7 @@ test("background runs never receive capture or recall by default", async (t) => 
   const { hooks, logs } = makeRuntime(t, baseConfig());
   const ctx = { agentId: "main", sessionKey: "agent:main:heartbeat:1", trigger: "heartbeat" };
 
-  hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "tick" }] }, ctx);
+  agentEnd({ hooks }, { success: true, messages: [{ role: "user", content: "tick" }] }, ctx);
   const result = await hooks.get("before_prompt_build")({ prompt: "heartbeat prompt", messages: [] }, ctx);
 
   assert.equal(result, undefined);
@@ -175,8 +186,8 @@ test("capturing for an agent missing from the config is reported once", (t) => {
   const { hooks, logs } = makeRuntime(t, baseConfig());
   const ctx = { agentId: "purple", sessionKey: "agent:purple:web:1", trigger: "user" };
 
-  hooks.get("agent_end")({ success: true, messages: [{ role: "user", content: "hi" }] }, ctx);
-  hooks.get("agent_end")(
+  agentEnd({ hooks }, { success: true, messages: [{ role: "user", content: "hi" }] }, ctx);
+  agentEnd({ hooks }, 
     { success: true, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] },
     ctx,
   );

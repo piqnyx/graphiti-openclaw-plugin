@@ -27,12 +27,9 @@ function rootFor(t) {
 
 function watermark(observedMessages) {
   return {
-    agentId: "main",
-    sessionKey: "session",
-    tailHashes: [String(observedMessages).padStart(64, "0")],
-    observedMessages,
-    prefixDigest: "f".repeat(64),
-    updatedAt: Date.now(),
+    sessionId: "session",
+    lastSeq: observedMessages - 1,
+    capturedEventIds: Array.from({ length: observedMessages }, (_, i) => `e${i}`),
   };
 }
 

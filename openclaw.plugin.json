@@ -149,6 +149,14 @@
         "minimum": 1000,
         "maximum": 1000000,
         "description": "Total size of one graphiti_browse reply. What does not fit is reported as omitted rather than silently dropped."
+      },
+      "agentDbPath": {
+        "type": "string",
+        "description": "Path to an agent's OpenClaw transcript store; {agentId} is substituted. Empty uses ~/.openclaw/agents/{agentId}/agent/openclaw-agent.sqlite."
+      },
+      "adoptExistingHistoryOnFirstSight": {
+        "type": "boolean",
+        "description": "Skip a session's existing rows the first time it is seen. Off by default; only correct when that history is already in memory and reading it again would duplicate episodes."
       }
     }
   }

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
 import { TOOL_NAMES, TOOL_PREFIX, inspectEpisodeNumbering, renderEpisode, splitEpisodeName } from "../dist/tools.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-tools-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
@@ -49,6 +51,7 @@ function makeRuntime(overrides = {}) {
       autoCapture: false,
       autoRecall: false,
       logLevel: "debug",
+      agentDbPath: agentStore.agentDbPath,
       agents: { main: { user: "Вит", assistant: "Краб" }, igor: { user: "Игорь", assistant: "Краб" } },
       ...overrides,
     },

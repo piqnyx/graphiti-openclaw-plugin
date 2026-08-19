@@ -6,6 +6,16 @@ import { join } from "node:path";
 import { register } from "../dist/index.js";
 import { resolveDurableCaptureRoot } from "../dist/capture-pipeline.js";
 import { DurableQueueStore } from "../dist/durable-queue-store.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
+
+// The gateway writes its transcript and then fires the hook; capture reads the
+// store, not the hook payload. Tests still describe a turn as a message list, so
+// the fixture writes it first and the hook only says "a turn ended".
+const agentEnd = (runtime, event, context) => {
+  agentStore.deliver(context?.agentId ?? "main", context?.sessionKey ?? "", event?.messages ?? []);
+  return runtime.hooks.get("agent_end")(event, context);
+};
 
 function isolateStateDir(t) {
   const stateDir = mkdtempSync(join(tmpdir(), "graphiti-confirm-"));
@@ -67,6 +77,7 @@ function harness(t, handlers) {
       agentTools: false,
       bufferLimit: 2,
       logLevel: "debug",
+      agentDbPath: agentStore.agentDbPath,
       agents: { main: { user: "Вит", assistant: "Краб" } },
     },
     logger: { debug() {}, info() {}, warn() {}, error() {} },
@@ -82,7 +93,7 @@ function harness(t, handlers) {
 }
 
 const turn = (hooks) =>
-  hooks.get("agent_end")(
+  agentEnd({ hooks }, 
     {
       success: true,
       messages: [

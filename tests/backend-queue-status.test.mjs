@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { GraphitiMcpClient } from "../dist/mcp-client.js";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
 
 function isolateStateDir(t) {
   const stateDir = mkdtempSync(join(tmpdir(), "graphiti-backend-status-"));
@@ -137,6 +139,7 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
       autoRecall: false,
       bufferLimit: 6,
       bufferTimeout: 300,
+      agentDbPath: agentStore.agentDbPath,
       agents: { main: { user: "Вит", assistant: "Краб" } },
     },
     logger: { debug() {}, info() {}, warn() {}, error() {} },

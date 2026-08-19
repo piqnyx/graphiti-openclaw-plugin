@@ -83,7 +83,6 @@ test("reading resumes strictly after the given seq", (t) => {
   for (let seq = 0; seq < 5; seq += 1) addEvent(db, "s", seq, say(`e${seq}`, "user", `m${seq}`));
   const store = new TranscriptStore(path);
   assert.deepEqual(store.readAfter("s", 2).rows.map((row) => row.seq), [3, 4]);
-  assert.equal(store.maxSeq("s"), 4);
   assert.deepEqual(store.readAfter("s", 4).rows, []);
   // Nothing kept, but the scan still reports where it looked.
   assert.equal(store.readAfter("s", 2).scannedThrough, 4);

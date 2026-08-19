@@ -131,14 +131,6 @@ export class TranscriptStore {
     return typeof row?.id === "string" ? row.id : undefined;
   }
 
-  /** Highest seq stored for a session, or -1 when it has no events yet. */
-  maxSeq(sessionId: string): number {
-    const row = this.db
-      .prepare("SELECT MAX(seq) AS seq FROM transcript_events WHERE session_id = ?")
-      .get(sessionId) as { seq?: unknown } | undefined;
-    return typeof row?.seq === "number" ? row.seq : -1;
-  }
-
   /**
    * Conversation rows after `afterSeq`, oldest first.
    *

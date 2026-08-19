@@ -32,11 +32,6 @@ export function emptyCursor(sessionId: string): SessionCursor {
   return { sessionId, lastSeq: -1, capturedEventIds: [] };
 }
 
-/** True when this row has already been taken, in this session or an earlier one. */
-export function alreadyCaptured(cursor: SessionCursor, row: TranscriptRow): boolean {
-  return cursor.capturedEventIds.includes(row.eventId);
-}
-
 /**
  * Move the cursor over rows that have now been made durable.
  *

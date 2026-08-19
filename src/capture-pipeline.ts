@@ -22,7 +22,7 @@ import {
   type SagaState,
 } from "./mcp-client.js";
 import { matchSessionExclusion } from "./session-filter.js";
-import { advanceCursor, alreadyCaptured, emptyCursor } from "./capture-cursor.js";
+import { advanceCursor, emptyCursor } from "./capture-cursor.js";
 import { defaultAgentDbPath, TranscriptStore, type TranscriptRow } from "./transcript-store.js";
 import { extractConversationMessages, type ConversationMessage } from "./text.js";
 import type { LocalCaptureState } from "./tools.js";
@@ -807,18 +807,23 @@ export function createCapturePipeline(params: {
           // start after it. Only correct when that history is already in memory
           // from before this cursor existed, which is why it is not the default --
           // a conversation that begins now is written and read in the same turn.
-          const existing = store.readAfter(sessionId, -1, Number.MAX_SAFE_INTEGER);
-          engine.checkpointCursor(
-            agentId,
-            sessionKey,
-            advanceCursor(emptyCursor(sessionId), sessionId, existing.rows, existing.scannedThrough),
-          );
+          // Sliced like any other read: adopting a long session must not pull its
+          // every row, base64 photographs and all, into memory at once.
+          let adopted = emptyCursor(sessionId);
+          let seenRows = 0;
+          for (;;) {
+            const slice = store.readAfter(sessionId, adopted.lastSeq);
+            if (slice.scannedThrough <= adopted.lastSeq) break;
+            seenRows += slice.rows.length;
+            adopted = advanceCursor(adopted, sessionId, slice.rows, slice.scannedThrough);
+          }
+          engine.checkpointCursor(agentId, sessionKey, adopted);
           logger.info("capture_session_adopted", {
             agentId,
             group_id: agentId,
             saga: sessionKey,
-            existingRows: existing.rows.length,
-            fromSeq: existing.scannedThrough,
+            existingRows: seenRows,
+            fromSeq: adopted.lastSeq,
             action: "history_left_to_whatever_already_holds_it",
           });
           return;

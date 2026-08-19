@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   advanceCursor,
-  alreadyCaptured,
   emptyCursor,
   parseCursor,
   MAX_REMEMBERED_EVENT_IDS,
@@ -16,7 +15,8 @@ test("a rewind re-reads the copied prefix without capturing it twice", () => {
   const before = advanceCursor(emptyCursor("old"), "old", [row(0, "e0"), row(1, "e1")], 1);
 
   const copied = [row(0, "e0"), row(1, "e1"), row(2, "e2")];
-  const fresh = copied.filter((candidate) => !alreadyCaptured(before, candidate));
+  const taken = new Set(before.capturedEventIds);
+  const fresh = copied.filter((candidate) => !taken.has(candidate.eventId));
   assert.deepEqual(fresh.map((r) => r.eventId), ["e2"]);
 
   const after = advanceCursor(before, "new", copied, 2);

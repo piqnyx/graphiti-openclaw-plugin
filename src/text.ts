@@ -61,9 +61,35 @@ const TRANSCRIPT_PREFIX_RE = /(^|\n)[ \t]*\[[^\]\n]{0,160}transcript[^\]\n]{0,16
  * assistant actually uttered, so only its markers go and the words stay — the
  * same rule already applied to transcription markers.
  */
-const TTS_DIRECTIVE_RE = /\[\[tts:(?!text\]\])[^\]]*\]\]/gi;
-const TTS_TEXT_MARKER_RE = /\[\[\/?tts:text\]\]/gi;
-const AUDIO_AS_VOICE_RE = /\[\[audio_as_voice\]\]/gi;
+/**
+ * Delivery machinery the model writes into its own reply.
+ *
+ * The vocabulary is closed and taken from the gateway itself: `[[tts …]]` and
+ * `[[/tts:text]]` (src/tts/directives.ts), and `[[audio_as_voice]]`,
+ * `[[reply_to_current]]`, `[[reply_to: id]]` (src/utils/directive-tags.ts, which
+ * also allows padding inside the brackets). Matching that vocabulary rather than
+ * "anything bracketed" keeps prose that merely uses double brackets intact.
+ *
+ * `[[reply_to_current]]` is why this matters beyond tidiness: OpenClaw briefly
+ * stores an assistant message whose whole body is that tag and then replaces it
+ * with the real reply, so captured verbatim it mutates under the delta.
+ *
+ * The `[[tts:text]]…[[/tts:text]]` pair is speech the assistant actually uttered,
+ * so its markers go first and the words between them stay.
+ */
+const TTS_TEXT_MARKER_RE = /\[\[\s*\/?\s*tts\s*:\s*text\s*\]\]/gi;
+const TTS_DIRECTIVE_RE = /\[\[\s*\/?\s*tts\b[^\]\n]*\]\]/gi;
+const DELIVERY_DIRECTIVE_RE =
+  /\[\[\s*(?:audio_as_voice|reply_to_current|reply_to\s*:\s*[^\]\n]*)\s*\]\]/gi;
+const TOOL_CALL_BLOCK_RE = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+const TOOL_CALL_TEXT_PARAM_RE = /<parameter=text>([\s\S]*?)<\/parameter>/i;
+
+function unwrapToolCallBlocks(text: string): string {
+  return text.replace(TOOL_CALL_BLOCK_RE, (_whole, inner: string) => {
+    const spoken = TOOL_CALL_TEXT_PARAM_RE.exec(inner);
+    return spoken ? spoken[1]! : "";
+  });
+}
 const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
@@ -151,7 +177,7 @@ function stripTranscriptWrapper(text: string): string {
 
 export function sanitizeConversationText(text: string): string {
   return stripTranscriptWrapper(
-    stripInjectedContexts(text)
+    unwrapToolCallBlocks(stripInjectedContexts(text))
       .replace(OPENCLAW_INTERNAL_CONTEXT_RE, "")
       .replace(OPENCLAW_UNCLOSED_CONTEXT_RE, "")
       .replace(CONVERSATION_METADATA_RE, "\n")
@@ -159,9 +185,11 @@ export function sanitizeConversationText(text: string): string {
       // Removed outright rather than replaced by a space: a directive already
       // sits on its own or next to one, and substituting would leave a double
       // space in the middle of the sentence it was attached to.
-      .replace(TTS_DIRECTIVE_RE, "")
+      // Markers first: the pair around spoken words must go before the rule that
+      // removes whole tts directives, or the words between them go with it.
       .replace(TTS_TEXT_MARKER_RE, "")
-      .replace(AUDIO_AS_VOICE_RE, "")
+      .replace(TTS_DIRECTIVE_RE, "")
+      .replace(DELIVERY_DIRECTIVE_RE, "")
       .replace(LEADING_TIMESTAMP_RE, ""),
   )
     .replace(/\u0000/g, "")

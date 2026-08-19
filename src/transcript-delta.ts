@@ -29,22 +29,39 @@ export class TranscriptCursorError extends Error {
   }
 }
 
+/**
+ * The bytes that identify a message across observations.
+ *
+ * Not its text. OpenClaw rewrites message text between turns -- a voice turn's
+ * `[Audio transcript ...]` marker moves out of first position once the message is
+ * stored, and assistant replies lose their blank lines in the rendered copy -- so
+ * a text hash reports movement that never happened and capture stalls.
+ *
+ * The gateway assigns `timestamp` at creation and does not rewrite it, which makes
+ * it the one field that answers "is this the same message". Text remains the
+ * fallback for any channel that somehow omits it: worse, but never worse than
+ * before this existed.
+ */
+function identityOf(message: ConversationMessage): string {
+  return message.timestamp === undefined ? `t:${message.text}` : `@${message.timestamp}`;
+}
+
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
-  return a.role === b.role && a.text === b.text;
+  return a.role === b.role && identityOf(a) === identityOf(b);
 }
 
 function feedMessage(hash: ReturnType<typeof createHash>, message: ConversationMessage): void {
   const role = Buffer.from(message.role, "utf8");
-  const text = Buffer.from(message.text, "utf8");
+  const identity = Buffer.from(identityOf(message), "utf8");
   const lengths = Buffer.allocUnsafe(8);
   lengths.writeUInt32BE(role.length, 0);
-  lengths.writeUInt32BE(text.length, 4);
+  lengths.writeUInt32BE(identity.length, 4);
   hash.update(lengths);
   hash.update(role);
-  hash.update(text);
+  hash.update(identity);
 }
 
-/** Cryptographic message identity. Hash collision must not become transcript movement. */
+/** Cryptographic message identity. A hash collision must not become transcript movement. */
 export function messageHash(message: ConversationMessage): string {
   const hash = createHash("sha256");
   feedMessage(hash, message);

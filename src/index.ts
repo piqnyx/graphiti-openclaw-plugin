@@ -64,7 +64,6 @@ export function register(api: OpenClawPluginApi): void {
     capture = acquired.runtime;
     captureOutcome = acquired.outcome;
     client = capture.client;
-    capture.statusHost.patchSessionEntry = api.runtime?.agent?.session?.patchSessionEntry;
 
     api.on("agent_end", capture.handleAgentEnd);
     api.on(

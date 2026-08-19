@@ -64,7 +64,6 @@ export function register(api: OpenClawPluginApi): void {
     capture = acquired.runtime;
     captureOutcome = acquired.outcome;
     client = capture.client;
-    capture.statusHost.patchSessionEntry = api.runtime?.agent?.session?.patchSessionEntry;
 
     api.on("agent_end", capture.handleAgentEnd);
     api.on(
@@ -157,9 +156,15 @@ export function register(api: OpenClawPluginApi): void {
           return;
         }
 
+        // History comes from the transcript store, the same source capture reads.
+        // The hook payload repeats the current message and renders a voice turn as
+        // "(no content)", and both used to end up in the search query.
+        const history = capture
+          ? capture.recentConversation(agentId, ctx?.sessionKey ?? "", cfg.recallHistoryMaxMessages)
+          : [];
         const query = buildRecallQuery(
           currentPrompt,
-          Array.isArray(event.messages) ? event.messages : [],
+          history,
           {
             useHistory: cfg.recallUseHistory,
             historyMaxMessages: cfg.recallHistoryMaxMessages,

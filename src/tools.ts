@@ -14,6 +14,7 @@ export const TOOL_NAMES = [
   "graphiti_search",
   "graphiti_browse",
   "graphiti_note",
+  "graphiti_repair",
   "graphiti_status",
 ] as const;
 
@@ -503,9 +504,13 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               uuidCounts.set(uuid, (uuidCounts.get(uuid) ?? 0) + 1);
             }
           }
-          const names = await resolveEpisodeNames(client, resolved.agentId, [
-            ...uuidCounts.keys(),
-          ]);
+          // Entities carry their own episodes, and those uuids have to be resolved
+          // too -- a name that never reached this map renders as no source at all.
+          const referenced = new Set(uuidCounts.keys());
+          for (const entity of entities) {
+            for (const uuid of asStrings(entity.episodes)) referenced.add(uuid);
+          }
+          const names = await resolveEpisodeNames(client, resolved.agentId, [...referenced]);
 
           const anchorsFor = (uuids: string[]): string => {
             const seen = new Map<string, number>();
@@ -518,15 +523,21 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
               .slice(0, anchorLimit);
             return ordered.length > 0
-              ? `\n  episodes: ${ordered.map(([name, hits]) => `${name} ×${hits}`).join(", ")}`
+              ? `\n  -> Source episodes: ${ordered.map(([name, hits]) => (hits > 1 ? `${name} (${hits})` : name)).join(", ")}`
               : "";
           };
 
-          // An entity has no episodes of its own; the facts touching it do.
-          const entityAnchors = (uuid: string): string[] =>
-            facts
+          // The backend reports where an entity was mentioned. Falling back to the
+          // facts that touch it covers an older server, and leaves an entity whose
+          // facts did not rank in this result without a source rather than wrong.
+          const entityAnchors = (entity: Record<string, unknown>): string[] => {
+            const own = asStrings(entity.episodes);
+            if (own.length > 0) return own;
+            const uuid = text(entity.uuid);
+            return facts
               .filter((fact) => text(fact.source_node_uuid) === uuid || text(fact.target_node_uuid) === uuid)
               .flatMap((fact) => asStrings(fact.episodes));
+          };
 
           const lines: string[] = [];
           for (const fact of facts) {
@@ -540,7 +551,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             const summary = sanitizeConversationText(text(entity.summary));
             lines.push(
               `[entity ${formatScore(entity.score)}] ${text(entity.name)}${summary ? ` — ${summary}` : ""}` +
-                anchorsFor(entityAnchors(text(entity.uuid))),
+                anchorsFor(entityAnchors(entity)),
             );
           }
           for (const episode of episodes) {
@@ -676,17 +687,19 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_note",
       label: "Note something to remember (Graphiti)",
       description:
-        "Record one lasting fact, or correct one memory has wrong. The conversation is captured automatically, " +
-        "so do NOT use this for things merely said — only when the user asks you to remember, or states a lasting " +
-        "preference or rule. Write it so it still makes sense months later: full names, no pronouns. " +
-        "Correcting? Give the right version and say what was wrong in the same sentence — that contradiction is what " +
-        "retires the old fact instead of keeping both. It joins this conversation and is searchable once the batch commits.",
+        "Note one lasting fact worth remembering — the moment you would say 'ah, I'll remember that'. " +
+        "The conversation is captured automatically, so not for things merely said: only when asked to remember, " +
+        "or for a lasting preference, rule or trait. " +
+        "Write a statement about the world, in the third person, as an encyclopedia would: 'Vit calls OpenViking \"viking\" for short'. " +
+        "Never address memory and never describe your own actions — 'the user asked me to record' is not a fact about " +
+        "the world and becomes a wrong one once stored. Full names, no pronouns, still true months from now. " +
+        "It joins this conversation and is searchable once the batch commits.",
       parameters: {
         type: "object",
         properties: {
           note: {
             type: "string",
-            description: "The fact to remember, as one or a few self-contained sentences.",
+            description: "The fact, stated in the third person as one or a few self-contained sentences.",
           },
           title: {
             type: "string",
@@ -734,6 +747,79 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           );
         } catch (error) {
           return failed("graphiti_note", resolved.agentId, error);
+        }
+      },
+    },
+
+    {
+      name: "graphiti_repair",
+      label: "Repair memory (Graphiti)",
+      description:
+        "Repair the shape of memory, when a note cannot. A note states a fact; this changes the graph itself. " +
+        "mode=\"merge\": one thing is recorded twice under different names — everything attached to `duplicate` moves " +
+        "onto `canonical` and `duplicate` ceases to exist. Use it when search returns the same subject twice under " +
+        "different spellings, or a name in the wrong grammatical case. " +
+        "Not for the opposite case: if two similar names are genuinely different things, say so in a graphiti_note " +
+        "instead — nothing needs repairing, and the statement keeps them from being merged later. " +
+        "Names must be exactly as memory holds them; check with graphiti_search first. " +
+        "preview=true reports what would move without moving it. This destroys one entity, so use it when something " +
+        "is actually wrong — not to tidy.",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["merge"], description: "What to repair. Only merge for now." },
+          duplicate: { type: "string", description: "The name to fold away, exactly as memory holds it." },
+          canonical: { type: "string", description: "The name to keep, exactly as memory holds it." },
+          preview: { type: "boolean", description: "Report what would move without changing anything." },
+        },
+        required: ["mode", "duplicate", "canonical"],
+      },
+      async execute(_toolCallId, params, ctx) {
+        const resolved = resolve("graphiti_repair", ctx);
+        if ("refusal" in resolved) return resolved.refusal;
+
+        const mode = stringParam(params, "mode").trim();
+        if (mode !== "merge") {
+          return errorResult(`graphiti_repair does not know mode "${mode}". The only mode is merge.`, {
+            tool: "graphiti_repair",
+            reason: "unknown_mode",
+            mode,
+          });
+        }
+
+        const duplicate = sanitizeConversationText(stringParam(params, "duplicate")).trim();
+        const canonical = sanitizeConversationText(stringParam(params, "canonical")).trim();
+        if (!duplicate || !canonical) {
+          return errorResult("graphiti_repair needs both duplicate and canonical names.", {
+            tool: "graphiti_repair",
+            reason: "missing_names",
+          });
+        }
+
+        const preview = params.preview === true;
+        try {
+          const result = await client.mergeEntities(resolved.agentId, duplicate, canonical, preview);
+          const moved = (result.moved ?? result.would_move) as Record<string, unknown> | undefined;
+          const counts = moved
+            ? `${moved.mentions ?? 0} mention(s), ${moved.outgoing_facts ?? 0} outgoing and ${moved.incoming_facts ?? 0} incoming fact(s)`
+            : "nothing";
+          logger.info("tool_repair", {
+            agentId: resolved.agentId,
+            group_id: resolved.agentId,
+            mode,
+            duplicate,
+            canonical,
+            preview,
+            applied: result.applied === true,
+          });
+          return textResult(
+            preview
+              ? `Folding "${duplicate}" into "${canonical}" would move ${counts}. Nothing changed yet.`
+              : `"${duplicate}" is now part of "${canonical}"; ${counts} moved across. Existing fact sentences keep their original wording.`,
+            { tool: "graphiti_repair", mode, duplicate, canonical, preview, ok: true },
+          );
+        } catch (error) {
+          return failed("graphiti_repair", resolved.agentId, error);
         }
       },
     },

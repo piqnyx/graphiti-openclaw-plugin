@@ -255,14 +255,14 @@ function formatRecallMessage(
 }
 
 function prepareRecallHistory(
-  messages: unknown[],
+  messages: readonly ConversationMessage[],
   maxMessages: number,
   maxChars: number,
   currentPrompt: string,
   userName?: string,
   assistantName?: string,
 ): string {
-  const conversation = extractConversationMessages(messages).slice(-maxMessages);
+  const conversation = messages.slice(-maxMessages);
   if (
     conversation.length > 0 &&
     conversation[conversation.length - 1]?.role === "user" &&
@@ -276,9 +276,18 @@ function prepareRecallHistory(
   return keepTail(history, maxChars).trim();
 }
 
+/**
+ * The search query for one turn: recent history, then what was just said.
+ *
+ * History arrives already extracted rather than as raw hook messages, because the
+ * caller now reads it from the transcript store. That is the same text capture
+ * stored in the graph, so the query is phrased in the words the graph was built
+ * from -- and it no longer carries the delivered payload's repeated message and
+ * "(no content)" placeholder.
+ */
 export function buildRecallQuery(
   prompt: string,
-  messages: unknown[],
+  history: readonly ConversationMessage[],
   options: RecallQueryOptions,
 ): string {
   const currentPrompt = sanitizeConversationText(prompt);
@@ -288,16 +297,16 @@ export function buildRecallQuery(
     return keepTail(currentPrompt, options.maxChars).trim();
   }
 
-  const history = prepareRecallHistory(
-    messages,
+  const rendered = prepareRecallHistory(
+    history,
     options.historyMaxMessages,
     options.historyMaxChars,
     currentPrompt,
     options.userName,
     options.assistantName,
   );
-  const combined = history
-    ? `${history}\n[user] ${currentPrompt}`
+  const combined = rendered
+    ? `${rendered}\n[user] ${currentPrompt}`
     : currentPrompt;
   return keepTail(combined, options.maxChars).trim();
 }

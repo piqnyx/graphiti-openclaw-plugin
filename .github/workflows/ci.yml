@@ -21,7 +21,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # 24, because capture reads the transcript store through node:sqlite,
+          # which needs --experimental-sqlite on 22 and is built in from 24. The
+          # gateway this plugin runs inside is on 24 as well; testing on 22 would
+          # test a configuration nobody runs.
+          node-version: 24
           cache: npm
 
       - name: Install dependencies

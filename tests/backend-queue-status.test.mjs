@@ -88,6 +88,7 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
   const originalSetInterval = globalThis.setInterval;
   const intervals = [];
   const patches = [];
+  const logs = [];
   const entries = new Map();
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -142,7 +143,12 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
       agentDbPath: agentStore.agentDbPath,
       agents: { main: { user: "Вит", assistant: "Краб" } },
     },
-    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    logger: {
+      debug: (line) => logs.push(line),
+      info: (line) => logs.push(line),
+      warn: (line) => logs.push(line),
+      error: (line) => logs.push(line),
+    },
     on: (name, handler) => hooks.set(name, handler),
     session: {
       state: { registerSessionExtension() {} },
@@ -170,14 +176,14 @@ test("backend poll publishes errors only to the failed saga session", async (t) 
   assert.equal(intervals[1].ms, 30_000);
 
   intervals[1].fn();
-  await waitFor(() => patches.length === 1);
+  // Reported to the log, and named with the saga it belongs to: a stalled backend
+  // is invisible otherwise, and the session it stalled on is the whole point.
+  await waitFor(() => logs.some((line) => line.includes("event=backend_queue_degraded")));
 
-  assert.equal(patches[0].sessionKey, "agent:main:web:failed-saga");
-  const status = patches[0].entry.pluginExtensions["graphiti-openclaw-plugin"]["backend-queue-status"];
-  assert.equal(status.status, "error");
-  assert.equal(status.source, "backend_queue");
-  assert.equal(status.attempts, 5);
-  assert.equal(status.pending, 3);
-  assert.equal(status.episodeUuid, "episode-7");
-  assert.match(status.error, /deepseek failed permanently/);
+  const line = logs.find((entry) => entry.includes("event=backend_queue_degraded"));
+  assert.match(line, /saga="agent:main:web:failed-saga"/);
+  assert.match(line, /attempts=5/);
+  assert.match(line, /pending=3/);
+  assert.match(line, /episodeUuid="episode-7"/);
+  assert.match(line, /deepseek failed permanently/);
 });

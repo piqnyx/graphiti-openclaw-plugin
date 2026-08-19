@@ -208,13 +208,16 @@ test("runtime registers capture and recall; recall is agent-scoped and sanitized
 
   assert.ok(hooks.has("agent_end"));
   assert.ok(hooks.has("before_prompt_build"));
+  // Recall reads history from the store now, not from the hook payload, so the
+  // conversation has to exist there for it to be part of the query.
+  agentStore.deliver("main", "agent:main:web:conversation-b", [
+    { role: "user", content: "previous user context" },
+    { role: "assistant", content: "previous assistant context <graphiti-context>hidden old memory</graphiti-context>" },
+  ]);
   const recallResult = await hooks.get("before_prompt_build")(
     {
       prompt: "alpha? <openviking-context>hidden recall input</openviking-context>",
-      messages: [
-        { role: "user", content: "previous user context" },
-        { role: "assistant", content: "previous assistant context <graphiti-context>hidden old memory</graphiti-context>" },
-      ],
+      messages: [],
     },
     { agentId: "main", sessionKey: "agent:main:web:conversation-b", trigger: "user" },
   );

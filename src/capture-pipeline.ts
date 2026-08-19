@@ -33,34 +33,28 @@ import type {
   PluginJsonValue,
 } from "./types.js";
 
-const CAPTURE_STATUS_NAMESPACE = "capture-status";
-const CAPTURE_STATUS_DESCRIPTOR_ID = "capture-error";
-const BACKEND_STATUS_NAMESPACE = "backend-queue-status";
-const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
+/** Prefix that tells extraction this line is a written record, not speech. */
+const NOTE_MARKER = "[note]";
+
 const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
 const DURABLE_CAPTURE_DIR = "durable-capture-v1";
 
-type CaptureFailureReason = "limit" | "timeout" | "durability";
 
 export function resolveDurableCaptureRoot(): string {
   return join(resolveOpenClawStateDir(), "graphiti-openclaw-plugin", DURABLE_CAPTURE_DIR);
 }
 
-export type CaptureStatusHost = {
-  patchSessionEntry?: NonNullable<
-    NonNullable<NonNullable<OpenClawPluginApi["runtime"]>["agent"]>["session"]
-  >["patchSessionEntry"];
-};
 
 export type CapturePipeline = {
   client: GraphitiMcpClient;
   engine: DurableBufferEngine;
   durableRoot: string;
   captureLease: CaptureLease;
-  statusHost: CaptureStatusHost;
   handleAgentEnd: (rawEvent: unknown, ctx?: HookContext) => void;
   shutdown: () => Promise<void>;
   captureNote: (agentId: string, sessionKey: string, note: string) => void;
+  /** The last few conversation messages of a session, straight from the store. */
+  recentConversation: (agentId: string, sessionKey: string, limit: number) => ConversationMessage[];
   localCaptureState: (agentId: string) => LocalCaptureState;
 };
 
@@ -191,7 +185,6 @@ export function createCapturePipeline(params: {
     logger.info("capture_store_opened", { agentId, group_id: agentId, path });
     return store;
   };
-  const statusHost: CaptureStatusHost = {};
   const durableRoot = resolveDurableCaptureRoot();
   const legacySpoolPath = resolveCaptureSpoolPath();
   const captureLease = new CaptureLease(join(durableRoot, "owner"));
@@ -222,161 +215,15 @@ export function createCapturePipeline(params: {
     // them afterwards, and the handles accumulate with every reload.
     for (const agentId of Object.keys(cfg.agents)) storeFor(agentId);
 
-    api.session?.state?.registerSessionExtension({
-      namespace: CAPTURE_STATUS_NAMESPACE,
-      description: "Graphiti durable capture error state for this OpenClaw session",
-      project: ({ state }) => state,
-    });
-    api.session?.state?.registerSessionExtension({
-      namespace: BACKEND_STATUS_NAMESPACE,
-      description: "Graphiti asynchronous backend processing error state for this OpenClaw session",
-      project: ({ state }) => state,
-    });
-    api.session?.controls?.registerControlUiDescriptor({
-      id: CAPTURE_STATUS_DESCRIPTOR_ID,
-      surface: "session",
-      label: "Graphiti capture",
-      description: "Shows durable capture or transcript cursor failures for the current session",
-      schema: {
-        type: "object",
-        properties: {
-          status: { const: "error" },
-          message: { type: "string" },
-          error: { type: "string" },
-          reason: { enum: ["limit", "timeout", "durability"] },
-          retryIntervalSeconds: { type: "integer" },
-          occurredAt: { type: "string" },
-        },
-        required: ["status", "message", "reason", "retryIntervalSeconds", "occurredAt"],
-      },
-    });
-    api.session?.controls?.registerControlUiDescriptor({
-      id: BACKEND_STATUS_DESCRIPTOR_ID,
-      surface: "session",
-      label: "Graphiti backend",
-      description: "Shows provider/backend retries or health failures",
-      schema: {
-        type: "object",
-        properties: {
-          status: { const: "error" },
-          source: { enum: ["backend_queue", "backend_health"] },
-          message: { type: "string" },
-          error: { type: "string" },
-          attempts: { type: "integer" },
-          pending: { type: "integer" },
-          episodeUuid: { type: "string" },
-          episodeName: { type: "string" },
-          occurredAt: { type: "string" },
-        },
-        required: ["status", "source", "message", "occurredAt"],
-      },
-    });
+    // No session-status surface. Capture and backend failures go to the log, which
+    // is where they are read from: graphiti_status answers "is memory working" on
+    // demand, and a per-session banner duplicated that through a publishing path
+    // that could fail on its own and then needed guarding against failing.
 
-    const patchSessionStatus = async (
-      agentId: string,
-      sessionKey: string,
-      namespace: string,
-      value: PluginJsonValue | undefined,
-    ): Promise<void> => {
-      const patchSessionEntry = statusHost.patchSessionEntry;
-      if (!patchSessionEntry || !sessionKey || agentId === "__tick__") return;
-      await patchSessionEntry({
-        agentId,
-        sessionKey,
-        preserveActivity: true,
-        update: (entry) => {
-          const pluginExtensions = { ...(entry.pluginExtensions ?? {}) };
-          const pluginState = { ...(pluginExtensions["graphiti-openclaw-plugin"] ?? {}) };
-          if (value === undefined) delete pluginState[namespace];
-          else pluginState[namespace] = value;
-          if (Object.keys(pluginState).length > 0) {
-            pluginExtensions["graphiti-openclaw-plugin"] = pluginState;
-          } else {
-            delete pluginExtensions["graphiti-openclaw-plugin"];
-          }
-          return {
-            pluginExtensions:
-              Object.keys(pluginExtensions).length > 0 ? pluginExtensions : undefined,
-          };
-        },
-      });
-    };
 
-    const publishCaptureError = (
-      agentId: string,
-      sessionKey: string,
-      reason: CaptureFailureReason,
-      error: Error,
-    ): void => {
-      const value: PluginJsonValue = {
-        status: "error",
-        message:
-          reason === "durability"
-            ? "Graphiti capture could not read the transcript store or make a durable local transaction; the cursor was not advanced"
-            : "Graphiti capture failed; durable FIFO head retained for automatic retry",
-        error: errorText(error),
-        reason,
-        retryIntervalSeconds: CHECK_INTERVAL_SEC,
-        occurredAt: new Date().toISOString(),
-      };
-      void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, value).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "publish_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
 
-    const clearCaptureError = (agentId: string, sessionKey: string): void => {
-      void patchSessionStatus(agentId, sessionKey, CAPTURE_STATUS_NAMESPACE, undefined).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "clear_capture_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
 
-    const publishBackendError = (
-      agentId: string,
-      sessionKey: string,
-      value: PluginJsonValue,
-    ): void => {
-      void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, value).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "publish_backend_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
 
-    const clearBackendError = (agentId: string, sessionKey: string): void => {
-      void patchSessionStatus(agentId, sessionKey, BACKEND_STATUS_NAMESPACE, undefined).catch(
-        (statusError) => {
-          logger.warn("capture_ui_status_failed", {
-            agentId,
-            group_id: agentId,
-            saga: sessionKey,
-            action: "clear_backend_error",
-            error: errorText(statusError),
-          });
-        },
-      );
-    };
 
     const fetchSagaState = async (
       agentId: string,
@@ -642,7 +489,6 @@ export function createCapturePipeline(params: {
             automaticRetry: true,
             retryIntervalSeconds: CHECK_INTERVAL_SEC,
           });
-          publishCaptureError(agentId, sessionKey, reason, error);
         },
         notifyRecovered: (agentId, sessionKey, reason) => {
           logger.info("capture_flush_recovered", {
@@ -651,7 +497,6 @@ export function createCapturePipeline(params: {
             saga: sessionKey,
             reason,
           });
-          clearCaptureError(agentId, sessionKey);
         },
         notifyPersistError: (error) => {
           logger.error("capture_durable_write_failed", {
@@ -661,13 +506,11 @@ export function createCapturePipeline(params: {
             durableReplayRequired: true,
           });
           for (const [agentId, sessionKey] of lastSessionByAgent) {
-            publishCaptureError(agentId, sessionKey, "durability", error);
           }
         },
         notifyPersistRecovered: () => {
           logger.info("capture_durable_write_recovered", { root: durableRoot });
           for (const [agentId, sessionKey] of lastSessionByAgent) {
-            clearCaptureError(agentId, sessionKey);
           }
         },
       },
@@ -697,13 +540,13 @@ export function createCapturePipeline(params: {
             const fingerprint = `retry:${status.episodeUuid ?? ""}:${status.attempts}:${status.pending}:${status.workerRunning}:${status.lastError ?? ""}`;
             const previousSession = backendReportedSessionByAgent.get(agentId);
             if (previousSession && sessionKey && previousSession !== sessionKey) {
-              clearBackendError(agentId, previousSession);
             }
             if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
               const stranded = status.pending > 0 && status.workerRunning === false;
-              publishBackendError(agentId, sessionKey, {
-                status: "error",
-                source: "backend_queue",
+              logger.warn("backend_queue_degraded", {
+                agentId,
+                group_id: agentId,
+                saga: sessionKey,
                 message: stranded
                   ? "Graphiti backend has queued work but no worker; self-healing/retry is required"
                   : `Graphiti backend is retrying the current FIFO head after ${status.attempts} failure(s)`,
@@ -722,19 +565,18 @@ export function createCapturePipeline(params: {
             continue;
           }
           const previousSession = backendReportedSessionByAgent.get(agentId);
-          if (previousSession) clearBackendError(agentId, previousSession);
           backendReportedSessionByAgent.delete(agentId);
           backendFingerprintByAgent.delete(agentId);
         } catch (error) {
           const sessionKey = lastSessionByAgent.get(agentId);
           const fingerprint = `health:${errorText(error)}`;
           if (sessionKey && backendFingerprintByAgent.get(agentId) !== fingerprint) {
-            publishBackendError(agentId, sessionKey, {
-              status: "error",
-              source: "backend_health",
+            logger.warn("backend_health_failed", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
               message: "Graphiti backend health check failed; durable head remains local",
               error: errorText(error),
-              occurredAt: new Date().toISOString(),
             });
             backendReportedSessionByAgent.set(agentId, sessionKey);
             backendFingerprintByAgent.set(agentId, fingerprint);
@@ -892,18 +734,11 @@ export function createCapturePipeline(params: {
           error: errorText(error),
           action: "cursor_not_advanced",
         });
-        publishCaptureError(
-          agentId,
-          sessionKey,
-          "durability",
-          error instanceof Error ? error : new Error(String(error)),
-        );
         return;
       }
 
       // A read that worked ends any error the session is still showing; without
       // this a single transient store failure leaves a permanent red flag.
-      clearCaptureError(agentId, sessionKey);
 
       if (delta.length > 0) {
         logger.debugContent(
@@ -953,8 +788,54 @@ export function createCapturePipeline(params: {
       return shutdownPromise;
     };
 
+    /**
+     * A note joins the batch marked as what it is.
+     *
+     * It has to travel as a message, because that is what a batch holds, and the
+     * assistant role is the only honest one available -- but it is not something
+     * the assistant said. Left unmarked, extraction attributed it like speech and
+     * produced records of protocol rather than of the world: "Ева will update the
+     * files", "Вит requests that Graphiti record the shorthand". The marker is what
+     * the extraction instructions key on to read it as a statement instead, and it
+     * is dropped from the facts themselves.
+     *
+     * Marking it here rather than in the tool keeps the marker out of the text the
+     * agent authored, so it cannot be quoted back, doubled, or forgotten.
+     */
     const captureNote = (agentId: string, sessionKey: string, note: string): void => {
-      engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: note });
+      engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: `${NOTE_MARKER} ${note}` });
+    };
+
+    /**
+     * Recent history for recall, read where capture reads it.
+     *
+     * The hook payload is a rendering of the transcript, not the transcript: it
+     * repeats the current message and shows a voice turn as "(no content)", and
+     * both went into every search query. Reading the store gives recall the same
+     * text the graph was built from, which is what makes the query match it.
+     */
+    const recentConversation = (
+      agentId: string,
+      sessionKey: string,
+      limit: number,
+    ): ConversationMessage[] => {
+      try {
+        const store = storeFor(agentId);
+        const sessionId = store?.currentSessionId(sessionKey);
+        if (!store || !sessionId) return [];
+        return store
+          .readTail(sessionId, limit)
+          .flatMap((row) => extractConversationMessages([row.message]));
+      } catch (error) {
+        // Recall degrades to a query without history; capture is unaffected.
+        logger.debug("recall_history_unavailable", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          error: errorText(error),
+        });
+        return [];
+      }
     };
 
     const localCaptureState = (agentId: string): LocalCaptureState => {
@@ -997,8 +878,8 @@ export function createCapturePipeline(params: {
       engine,
       durableRoot,
       captureLease,
-      statusHost,
       handleAgentEnd,
+      recentConversation,
       shutdown,
       captureNote,
       localCaptureState,

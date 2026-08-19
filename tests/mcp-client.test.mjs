@@ -227,18 +227,33 @@ test("episode existence alone is insufficient when Saga integrity is broken", as
     throw new Error(`unexpected tool ${name}`);
   };
 
-  await assert.rejects(
-    fastClient().addMemory({
-      uuid,
-      name: "s-1",
-      jsonBody: "{}",
-      groupId: "main",
-      saga: "session",
-      referenceTime: "2026-08-18T00:00:00.000Z",
-      previousEpisodeUuids: [],
-    }),
-    /failed integrity validation/,
+  // A broken chain is not an error to raise, it is a delivery that has not
+  // happened: the episode exists but the Saga it belongs to cannot be proven, so
+  // the caller keeps its durable head and waits. Raising here would drop the head
+  // of a batch that may still land, which is what f10b8e0 and ccda792 removed.
+  const client = new GraphitiMcpClient(
+    "http://127.0.0.1:8000/mcp/",
+    1000,
+    undefined,
+    { pollMs: 60_000, resubmitGraceMs: 60_000 },
   );
+  const pending = client.addMemory({
+    uuid,
+    name: "s-1",
+    jsonBody: "{}",
+    groupId: "main",
+    saga: "session",
+    referenceTime: "2026-08-18T00:00:00.000Z",
+    previousEpisodeUuids: [],
+  });
+  const settledFirst = await Promise.race([
+    pending.then(() => "settled", () => "settled"),
+    new Promise((resolve) => setTimeout(() => resolve("still waiting"), 50)),
+  ]);
+  assert.equal(settledFirst, "still waiting");
+
+  client.close();
+  await assert.rejects(pending, /shutting down/);
 });
 
 test("a queued UUID is not submitted again while a live backend worker owns it", async (t) => {

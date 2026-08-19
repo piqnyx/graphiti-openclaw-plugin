@@ -59,3 +59,12 @@ test("durable state that is not a cursor is refused rather than half-read", () =
     capturedEventIds: ["a"],
   });
 });
+
+test("a session that is entirely machinery still moves the cursor", () => {
+  // The heartbeat session holds only an internal poll and the reply to it, both
+  // discarded before they reach here. Leaving the cursor at -1 would re-read and
+  // re-discard the whole session on every tick for as long as the agent lives.
+  const cursor = advanceCursor(emptyCursor("s"), "s", [], 41);
+  assert.equal(cursor.lastSeq, 41);
+  assert.deepEqual(cursor.capturedEventIds, []);
+});

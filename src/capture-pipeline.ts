@@ -833,7 +833,11 @@ export function createCapturePipeline(params: {
         rowsRead = rows.length;
 
         const fresh = rows.filter((row: TranscriptRow) => !alreadyCaptured(cursor, row));
-        const observedSeq = rows.length > 0 ? rows[rows.length - 1]!.seq : cursor.lastSeq;
+        // Where the read got to, not where the last kept row was. A session can be
+        // entirely machinery -- the heartbeat is -- and stopping the cursor at the
+        // last conversational row would re-read and re-discard the whole session on
+        // every turn, forever.
+        const observedSeq = Math.max(store.maxSeq(sessionId), cursor.lastSeq);
 
         let logged = 0;
         for (const row of fresh) {
@@ -865,7 +869,7 @@ export function createCapturePipeline(params: {
         if (delta.length > 0) engine.ingest(agentId, sessionKey, delta, advanced);
         // A read that saw nothing new has nothing to make durable; writing the same
         // cursor again would cost an fsync on every idle turn of every session.
-        else if (rows.length > 0 || cursor.sessionId !== sessionId) {
+        else if (observedSeq > cursor.lastSeq || cursor.sessionId !== sessionId) {
           engine.checkpointCursor(agentId, sessionKey, advanced);
         }
       } catch (error) {

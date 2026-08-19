@@ -207,6 +207,28 @@ function longestSuffixPrefixOverlap(
   return bestCount === 1 ? best : 0;
 }
 
+/**
+ * Where a known message sits now, but only if the answer is beyond doubt.
+ *
+ * Two occurrences mean the cursor could land in either place, and picking one is
+ * exactly how a capture silently replays or skips a stretch of conversation. The
+ * search starts at the common prefix because a message cannot have moved to
+ * before ground both observations already agree on.
+ */
+function uniqueIndexOf(
+  messages: readonly ConversationMessage[],
+  needle: ConversationMessage,
+  from: number,
+): number {
+  let found = -1;
+  for (let i = from; i < messages.length; i += 1) {
+    if (!sameMessage(messages[i]!, needle)) continue;
+    if (found >= 0) return -1;
+    found = i;
+  }
+  return found;
+}
+
 function commonPrefixLength(
   previous: readonly ConversationMessage[],
   current: readonly ConversationMessage[],
@@ -388,6 +410,20 @@ export class TranscriptDeltaTracker {
     const prefix = commonPrefixLength(previous, current);
     if (prefix === previous.length) {
       return current.slice(prefix).map((message) => ({ ...message }));
+    }
+
+    // The transcript grows in the middle, not only at the end. One voice turn
+    // expands into several entries -- the placeholder, the transcript, and a
+    // "(no content)" stub -- inserted *before* the reply that answered it, so the
+    // common prefix breaks at the first insertion while every message it named is
+    // still present, merely shifted. Observed as commonPrefix=1 of 2 with the
+    // assistant reply alive at index 3 under its original responseId.
+    //
+    // So look for the last message of the previous observation where it is now.
+    // Everything after it is new, whatever was spliced in ahead of it.
+    const anchor = uniqueIndexOf(current, previous[previous.length - 1]!, prefix);
+    if (anchor >= 0) {
+      return current.slice(anchor + 1).map((message) => ({ ...message }));
     }
 
     const overlap = longestSuffixPrefixOverlap(previous, current);

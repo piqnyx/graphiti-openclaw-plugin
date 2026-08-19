@@ -122,6 +122,8 @@ function describeContent(message: unknown): string {
 
 /** Enough of a message to recognise it in the log without flooding the journal. */
 const LOG_TEXT_CHARS = 2000;
+/** Per-turn ceiling on per-row logging; the remainder is counted, not printed. */
+const MAX_LOGGED_ROWS = 50;
 
 export function createCapturePipeline(params: {
   api: OpenClawPluginApi;
@@ -153,14 +155,38 @@ export function createCapturePipeline(params: {
    * only way to actually lose conversation.
    */
   const storesByAgent = new Map<string, TranscriptStore>();
-  const storeFor = (agentId: string): TranscriptStore => {
+  const missingStoresReported = new Set<string>();
+  const agentDbPathFor = (agentId: string): string =>
+    cfg.agentDbPath ? cfg.agentDbPath.replaceAll("{agentId}", agentId) : defaultAgentDbPath(agentId);
+
+  /**
+   * The store for an agent, or nothing when that agent has never spoken.
+   *
+   * Absence and disagreement are different failures and must not share an outcome.
+   * A configured agent with no store yet is ordinary -- the gateway creates the
+   * file on its first turn -- and refusing to load over it would take capture down
+   * for every other agent too. A store that exists but no longer matches the shape
+   * we read is the loud one, and it is left to throw.
+   */
+  const storeFor = (agentId: string): TranscriptStore | undefined => {
     const existing = storesByAgent.get(agentId);
     if (existing) return existing;
-    const path = cfg.agentDbPath
-      ? cfg.agentDbPath.replaceAll("{agentId}", agentId)
-      : defaultAgentDbPath(agentId);
+    const path = agentDbPathFor(agentId);
+    if (!existsSync(path)) {
+      if (!missingStoresReported.has(agentId)) {
+        missingStoresReported.add(agentId);
+        logger.info("capture_store_absent", {
+          agentId,
+          group_id: agentId,
+          path,
+          action: "waiting_for_first_turn",
+        });
+      }
+      return undefined;
+    }
     const store = new TranscriptStore(path);
     store.verify();
+    missingStoresReported.delete(agentId);
     storesByAgent.set(agentId, store);
     logger.info("capture_store_opened", { agentId, group_id: agentId, path });
     return store;
@@ -763,6 +789,7 @@ export function createCapturePipeline(params: {
       let rowsRead = 0;
       try {
         const store = storeFor(agentId);
+        if (!store) return;
         const sessionId = store.currentSessionId(sessionKey);
         if (!sessionId) {
           logger.debug("capture_skipped", {
@@ -775,6 +802,28 @@ export function createCapturePipeline(params: {
         }
 
         const previous = engine.sessionCursor(agentId, sessionKey);
+        if (!previous && cfg.adoptExistingHistoryOnFirstSight) {
+          // Asked for explicitly: take note of what the session already holds and
+          // start after it. Only correct when that history is already in memory
+          // from before this cursor existed, which is why it is not the default --
+          // a conversation that begins now is written and read in the same turn.
+          const existing = store.readAfter(sessionId, -1);
+          const head = existing.length > 0 ? existing[existing.length - 1]!.seq : store.maxSeq(sessionId);
+          engine.checkpointCursor(
+            agentId,
+            sessionKey,
+            advanceCursor(emptyCursor(sessionId), sessionId, existing, head),
+          );
+          logger.info("capture_session_adopted", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            existingRows: existing.length,
+            fromSeq: head,
+            action: "history_left_to_whatever_already_holds_it",
+          });
+          return;
+        }
         // A rewind repoints the key at a new session whose opening rows are copies
         // of the old ones, so a changed id means read from the beginning and let
         // the captured-id set discard what has already been taken.
@@ -786,23 +835,39 @@ export function createCapturePipeline(params: {
         const fresh = rows.filter((row: TranscriptRow) => !alreadyCaptured(cursor, row));
         const observedSeq = rows.length > 0 ? rows[rows.length - 1]!.seq : cursor.lastSeq;
 
+        let logged = 0;
         for (const row of fresh) {
           const [message] = extractConversationMessages([row.message]);
-          logger.debugContent(
-            "capture_row",
-            { agentId, group_id: agentId, saga: sessionKey, seq: row.seq, eventId: row.eventId },
-            {
-              rawText: describeContent(row.message),
-              sanitized: message?.text ?? "",
-              verdict: message ? "captured" : "dropped_by_sanitisation",
-            },
-          );
+          if (logged < MAX_LOGGED_ROWS) {
+            logged += 1;
+              logger.debugContent(
+              "capture_row",
+              { agentId, group_id: agentId, saga: sessionKey, seq: row.seq, eventId: row.eventId },
+              {
+                rawText: describeContent(row.message),
+                sanitized: message?.text ?? "",
+                verdict: message ? "captured" : "dropped_by_sanitisation",
+              },
+            );
+          }
           if (message) delta.push(message);
+        }
+        if (fresh.length > MAX_LOGGED_ROWS) {
+          logger.debug("capture_rows_not_logged", {
+            agentId,
+            group_id: agentId,
+            saga: sessionKey,
+            suppressed: fresh.length - MAX_LOGGED_ROWS,
+          });
         }
 
         const advanced = advanceCursor(cursor, sessionId, rows, observedSeq);
         if (delta.length > 0) engine.ingest(agentId, sessionKey, delta, advanced);
-        else engine.checkpointCursor(agentId, sessionKey, advanced);
+        // A read that saw nothing new has nothing to make durable; writing the same
+        // cursor again would cost an fsync on every idle turn of every session.
+        else if (rows.length > 0 || cursor.sessionId !== sessionId) {
+          engine.checkpointCursor(agentId, sessionKey, advanced);
+        }
       } catch (error) {
         logger.error("capture_durable_transaction_failed", {
           agentId,
@@ -845,6 +910,8 @@ export function createCapturePipeline(params: {
       shutdownPromise ??= (async () => {
         if (queueHealthTimer) clearInterval(queueHealthTimer);
         client.close();
+        for (const store of storesByAgent.values()) store.close();
+        storesByAgent.clear();
         logger.info("capture_shutdown_checkpoint", {
           root: durableRoot,
           queuedBatches: engine.journal.queue
@@ -878,9 +945,11 @@ export function createCapturePipeline(params: {
       let storeReadable = false;
       try {
         const store = storeFor(agentId);
-        storePath = store.path;
-        store.verify();
-        storeReadable = true;
+        storePath = store?.path ?? agentDbPathFor(agentId);
+        if (store) {
+          store.verify();
+          storeReadable = true;
+        }
       } catch (error) {
         logger.warn("capture_store_unreadable", {
           agentId,

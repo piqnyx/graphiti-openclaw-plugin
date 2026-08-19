@@ -37,8 +37,10 @@ test("a schema without the columns we read refuses to open", (t) => {
   assert.throws(() => new TranscriptStore(path).verify(), TranscriptSchemaError);
 });
 
-test("a missing store is named, not guessed at", (t) => {
-  assert.throws(() => new TranscriptStore(join(tmpdir(), "no-such-agent.sqlite")), TranscriptSchemaError);
+test("a store that cannot be opened fails loudly rather than reading nothing", () => {
+  // Absence is handled a level up, where an agent that has not spoken yet is
+  // ordinary; anything that gets this far and still will not open is a real fault.
+  assert.throws(() => new TranscriptStore(join(tmpdir(), "graphiti-no-such-dir", "agent.sqlite")));
 });
 
 test("only user and assistant messages are conversation", (t) => {

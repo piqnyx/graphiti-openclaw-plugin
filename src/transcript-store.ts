@@ -1,7 +1,6 @@
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { resolveOpenClawStateDir } from "./capture-spool.js";
 
 /**
  * The gateway's own transcript, read where it is written.
@@ -41,9 +40,15 @@ export class TranscriptSchemaError extends Error {
   }
 }
 
-/** Default location of an agent's store; overridable because deployments move. */
+/**
+ * Default location of an agent's store.
+ *
+ * Resolved through the same state directory the rest of the plugin uses, so a
+ * deployment that moves ~/.openclaw moves this with it instead of leaving capture
+ * reading a path nobody writes to.
+ */
 export function defaultAgentDbPath(agentId: string): string {
-  return join(homedir(), ".openclaw", "agents", agentId, "agent", "openclaw-agent.sqlite");
+  return join(resolveOpenClawStateDir(), "agents", agentId, "agent", "openclaw-agent.sqlite");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,11 +61,9 @@ export class TranscriptStore {
   private readonly internalCache = new Map<string, boolean>();
 
   constructor(readonly path: string) {
-    if (!existsSync(path)) {
-      throw new TranscriptSchemaError(`agent transcript store not found at ${path}`);
-    }
     // Read-only, so a bug here can never damage the gateway's own state. The store
-    // runs in WAL mode, which is what makes concurrent reading safe at all.
+    // runs in WAL mode, where a reader sees a consistent snapshot without blocking
+    // the gateway's writes or being blocked by them.
     this.db = new DatabaseSync(path, { readOnly: true });
   }
 
@@ -165,6 +168,9 @@ export class TranscriptStore {
     }
   }
 
+  /** Beyond this the oldest verdicts are forgotten; they are cheap to ask again. */
+  private static readonly MAX_CACHED_VERDICTS = 20_000;
+
   /** Is this event the gateway talking to itself? */
   private isInternal(sessionId: string, eventId: string, known?: Record<string, unknown>): boolean {
     const cached = this.internalCache.get(eventId);
@@ -188,6 +194,10 @@ export class TranscriptStore {
 
     const provenance = message?.provenance;
     const internal = isRecord(provenance) && provenance.kind === "internal_system";
+    if (this.internalCache.size >= TranscriptStore.MAX_CACHED_VERDICTS) {
+      const oldest = this.internalCache.keys().next().value;
+      if (oldest !== undefined) this.internalCache.delete(oldest);
+    }
     this.internalCache.set(eventId, internal);
     return internal;
   }

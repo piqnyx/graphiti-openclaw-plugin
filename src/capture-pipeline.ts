@@ -191,7 +191,6 @@ export function createCapturePipeline(params: {
     logger.info("capture_store_opened", { agentId, group_id: agentId, path });
     return store;
   };
-  for (const agentId of Object.keys(cfg.agents)) storeFor(agentId);
   const statusHost: CaptureStatusHost = {};
   const durableRoot = resolveDurableCaptureRoot();
   const legacySpoolPath = resolveCaptureSpoolPath();
@@ -216,6 +215,12 @@ export function createCapturePipeline(params: {
       path: captureLease.path,
       pid: process.pid,
     });
+
+    // Only now, holding the lease. OpenClaw calls register() several times per
+    // process, and a call that will be turned away as a second writer must not
+    // have opened four databases on its way to being refused -- nothing closes
+    // them afterwards, and the handles accumulate with every reload.
+    for (const agentId of Object.keys(cfg.agents)) storeFor(agentId);
 
     api.session?.state?.registerSessionExtension({
       namespace: CAPTURE_STATUS_NAMESPACE,
@@ -1000,6 +1005,9 @@ export function createCapturePipeline(params: {
     };
   } catch (error) {
     client.close();
+    // Registration that does not complete leaves nothing open behind it.
+    for (const store of storesByAgent.values()) store.close();
+    storesByAgent.clear();
     if (captureLease.isHeld()) {
       try {
         captureLease.release();

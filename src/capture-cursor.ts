@@ -33,6 +33,20 @@ export function emptyCursor(sessionId: string): SessionCursor {
 }
 
 /**
+ * Follow the session key to a new session without forgetting what was captured.
+ *
+ * A rewind is the only thing that does this, and it is precisely the moment the
+ * id set earns its keep: the new session opens with copies of the old rows, under
+ * their original ids. Carrying the ids and restarting the row count is therefore
+ * the whole trick -- read the copied prefix again, recognise it, keep only what is
+ * new. Starting from an empty cursor instead captures the entire prefix twice.
+ */
+export function rebaseCursor(previous: SessionCursor, sessionId: string): SessionCursor {
+  if (previous.sessionId === sessionId) return previous;
+  return { sessionId, lastSeq: -1, capturedEventIds: [...previous.capturedEventIds] };
+}
+
+/**
  * Move the cursor over rows that have now been made durable.
  *
  * The seq comes from the rows themselves rather than from the caller's read

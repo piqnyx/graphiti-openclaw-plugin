@@ -22,7 +22,7 @@ import {
   type SagaState,
 } from "./mcp-client.js";
 import { matchSessionExclusion } from "./session-filter.js";
-import { advanceCursor, emptyCursor } from "./capture-cursor.js";
+import { advanceCursor, emptyCursor, rebaseCursor } from "./capture-cursor.js";
 import { defaultAgentDbPath, TranscriptStore, type TranscriptRow } from "./transcript-store.js";
 import { extractConversationMessages, type ConversationMessage } from "./text.js";
 import type { LocalCaptureState } from "./tools.js";
@@ -831,8 +831,9 @@ export function createCapturePipeline(params: {
         // A rewind repoints the key at a new session whose opening rows are copies
         // of the old ones, so a changed id means read from the beginning and let
         // the captured-id set discard what has already been taken.
-        const cursor =
-          previous && previous.sessionId === sessionId ? previous : emptyCursor(sessionId);
+        // Follow a rewind without forgetting: the ids come along, the row count
+        // restarts, and the copied prefix is recognised instead of captured again.
+        const cursor = previous ? rebaseCursor(previous, sessionId) : emptyCursor(sessionId);
         const read = store.readAfter(sessionId, cursor.lastSeq);
         const rows = read.rows;
         rowsRead = rows.length;
@@ -874,7 +875,7 @@ export function createCapturePipeline(params: {
         if (delta.length > 0) engine.ingest(agentId, sessionKey, delta, advanced);
         // A read that saw nothing new has nothing to make durable; writing the same
         // cursor again would cost an fsync on every idle turn of every session.
-        else if (observedSeq > cursor.lastSeq || cursor.sessionId !== sessionId) {
+        else if (observedSeq > cursor.lastSeq) {
           engine.checkpointCursor(agentId, sessionKey, advanced);
         }
       } catch (error) {
@@ -894,6 +895,10 @@ export function createCapturePipeline(params: {
         );
         return;
       }
+
+      // A read that worked ends any error the session is still showing; without
+      // this a single transient store failure leaves a permanent red flag.
+      clearCaptureError(agentId, sessionKey);
 
       if (delta.length > 0) {
         logger.debugContent(

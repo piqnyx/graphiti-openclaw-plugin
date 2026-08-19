@@ -427,6 +427,23 @@ export class GraphitiMcpClient {
       : [];
   }
 
+  /** Fold a duplicate entity into the name it is a variant of. */
+  async mergeEntities(
+    groupId: string,
+    duplicateName: string,
+    canonicalName: string,
+    dryRun: boolean,
+  ): Promise<JsonObject> {
+    const result = await this.callTool("merge_entities", {
+      group_id: groupId,
+      duplicate_name: duplicateName,
+      canonical_name: canonicalName,
+      dry_run: dryRun,
+    });
+    if (typeof result.error === "string") throw new McpToolResultError(result.error);
+    return result;
+  }
+
   async searchCombined(
     query: string,
     groupId: string,

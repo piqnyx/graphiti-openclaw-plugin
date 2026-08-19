@@ -446,7 +446,7 @@ test("search returns every type with scores and episode anchors", async (t) => {
   assert.match(result.content[0].text, /\[fact 0\.54\]/);
   assert.match(result.content[0].text, /\[entity 0\.48\]/);
   assert.match(result.content[0].text, /\[episode 0\.37\]/);
-  assert.match(result.content[0].text, /8248439450-17 ×2/);
+  assert.match(result.content[0].text, /8248439450-17 \(2\)/);
 });
 
 test("a superseded fact is hidden unless explicitly requested", async (t) => {

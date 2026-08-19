@@ -14,6 +14,7 @@
       "graphiti_search",
       "graphiti_browse",
       "graphiti_note",
+      "graphiti_repair",
       "graphiti_status"
     ]
   },

@@ -42,23 +42,46 @@ export class TranscriptCursorError extends Error {
  * fallback for any channel that somehow omits it: worse, but never worse than
  * before this existed.
  */
-function identityOf(message: ConversationMessage): string {
-  return message.timestamp === undefined ? `t:${message.text}` : `@${message.timestamp}`;
-}
-
+/**
+ * Is this the same message seen again?
+ *
+ * Two independent witnesses, and either one is enough, because each covers what
+ * the other misses. OpenClaw supplies `timestamp` only on the turn that just
+ * happened -- observed live: `timestamped=2` against `snapshotMessages=24` -- so
+ * identity cannot rest on it alone. And it rewrites message text between
+ * observations -- a voice turn's `[Audio transcript ...]` marker moves out of
+ * first position once stored -- so it cannot rest on the text alone either.
+ *
+ * Requiring both to agree fails every message that lost its timestamp on the way
+ * into history, which is nearly all of them. Accepting either means a text turn
+ * is matched by its unchanged text and a rewritten voice turn by its timestamp.
+ * Only a message that has lost both is genuinely unrecognisable.
+ */
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
-  return a.role === b.role && identityOf(a) === identityOf(b);
+  if (a.role !== b.role) return false;
+  if (a.text === b.text) return true;
+  return (
+    a.timestamp !== undefined && b.timestamp !== undefined && a.timestamp === b.timestamp
+  );
 }
 
+/**
+ * Durable cursors hash the text, not the timestamp.
+ *
+ * A one-sided hash cannot express "either witness will do": it must commit to one
+ * field, and the timestamp is the field that goes missing. Text keeps the stored
+ * prefix digest and tail anchor comparable with whatever comes back after a
+ * restart, and the in-memory path above is what tolerates the rewrites.
+ */
 function feedMessage(hash: ReturnType<typeof createHash>, message: ConversationMessage): void {
   const role = Buffer.from(message.role, "utf8");
-  const identity = Buffer.from(identityOf(message), "utf8");
+  const text = Buffer.from(message.text, "utf8");
   const lengths = Buffer.allocUnsafe(8);
   lengths.writeUInt32BE(role.length, 0);
-  lengths.writeUInt32BE(identity.length, 4);
+  lengths.writeUInt32BE(text.length, 4);
   hash.update(lengths);
   hash.update(role);
-  hash.update(identity);
+  hash.update(text);
 }
 
 /** Cryptographic message identity. A hash collision must not become transcript movement. */

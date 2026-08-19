@@ -210,6 +210,27 @@ export class DurableBufferEngine {
   }
 
   /**
+   * Drop the volatile snapshot of a session whose transcript could not be reconciled.
+   *
+   * take() computes the delta before publishing the new snapshot, and it runs before
+   * ingestTranscript's own try block, so a cursor error leaves the previous snapshot
+   * installed as the trusted predecessor and every later turn fails against that same
+   * stale comparison forever. The durable watermark is deliberately left alone: the
+   * next observation re-derives from it through firstObservation().
+   */
+  rollbackTranscriptSnapshot(agentId: string, sessionKey: string): void {
+    this.transcriptDeltas.rollback(agentId, sessionKey);
+  }
+
+  /** Consume the record of the last resume that had to drop transcript history. */
+  takeWatermarkRecovery(
+    agentId: string,
+    sessionKey: string,
+  ): Record<string, unknown> | undefined {
+    return this.transcriptDeltas.takeWatermarkRecovery(agentId, sessionKey);
+  }
+
+  /**
    * Low-level durable delta ingestion used by migration/fault tests. Production
    * capture should call ingestTranscript so transcript movement cannot be forgotten.
    */

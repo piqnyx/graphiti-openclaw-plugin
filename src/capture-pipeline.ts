@@ -713,13 +713,17 @@ export function createCapturePipeline(params: {
         delta = engine.ingestTranscript(agentId, sessionKey, snapshot);
       } catch (error) {
         if (error instanceof TranscriptCursorError) {
+          // Without this the stale snapshot stays the trusted predecessor and the
+          // session never captures again. The durable watermark is not touched.
+          engine.rollbackTranscriptSnapshot(agentId, sessionKey);
           logger.error("capture_cursor_ambiguous", {
             agentId,
             group_id: agentId,
             saga: sessionKey,
             snapshotMessages: snapshot.length,
             error: errorText(error),
-            action: "capture_stopped_without_advancing_cursor",
+            action: "snapshot_rolled_back_resuming_from_durable_watermark",
+            ...(error.details ?? {}),
           });
           publishCaptureError(agentId, sessionKey, "cursor", error);
           return;
@@ -739,6 +743,18 @@ export function createCapturePipeline(params: {
           error instanceof Error ? error : new Error(String(error)),
         );
         return;
+      }
+
+      const recovery = engine.takeWatermarkRecovery(agentId, sessionKey);
+      if (recovery) {
+        logger.warn("capture_resumed_from_current_turn", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          snapshotMessages: snapshot.length,
+          action: "transcript_history_before_this_turn_was_not_captured",
+          ...recovery,
+        });
       }
 
       if (delta.length > 0) {

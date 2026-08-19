@@ -19,9 +19,13 @@ export type SessionWatermark = {
 };
 
 export class TranscriptCursorError extends Error {
-  constructor(message: string) {
+  /** Shape of the divergence, for operator logs. Never carries message text. */
+  readonly details?: Record<string, unknown>;
+
+  constructor(message: string, details?: Record<string, unknown>) {
     super(message);
     this.name = "TranscriptCursorError";
+    this.details = details;
   }
 }
 
@@ -157,6 +161,47 @@ function commonPrefixLength(
   return i;
 }
 
+/** Short enough to read in a log line, long enough to compare by eye. */
+const HASH_PREVIEW_CHARS = 16;
+
+function edgeHashes(
+  messages: readonly ConversationMessage[],
+): { first?: string; last?: string } {
+  if (messages.length === 0) return {};
+  return {
+    first: messageHash(messages[0]!).slice(0, HASH_PREVIEW_CHARS),
+    last: messageHash(messages[messages.length - 1]!).slice(0, HASH_PREVIEW_CHARS),
+  };
+}
+
+/**
+ * Describe why two snapshots would not reconcile.
+ *
+ * Refusing to guess is correct, but the log carried no way to tell whether the
+ * gateway rewrote a message or our own sanitisation produced a different result
+ * for stored history than for the live turn. Hashes only: the transcript itself
+ * does not belong in the operational log.
+ */
+function describeDivergence(
+  previous: readonly ConversationMessage[],
+  current: readonly ConversationMessage[],
+  commonPrefix: number,
+  overlap: number,
+): Record<string, unknown> {
+  const before = edgeHashes(previous);
+  const after = edgeHashes(current);
+  return {
+    previousMessages: previous.length,
+    currentMessages: current.length,
+    commonPrefix,
+    overlap,
+    previousFirstHash: before.first,
+    previousLastHash: before.last,
+    currentFirstHash: after.first,
+    currentLastHash: after.last,
+  };
+}
+
 type PendingObservation = {
   agentId: string;
   sessionKey: string;
@@ -178,6 +223,7 @@ export class TranscriptDeltaTracker {
   private readonly snapshots = new Map<string, ConversationMessage[]>();
   private readonly watermarks = new Map<string, SessionWatermark>();
   private readonly pendingObservations = new Map<string, PendingObservation>();
+  private readonly watermarkRecoveries = new Map<string, Record<string, unknown>>();
 
   take(agentId: string, sessionKey: string, snapshot: readonly ConversationMessage[]): ConversationMessage[] {
     const key = JSON.stringify([agentId, sessionKey]);
@@ -194,6 +240,14 @@ export class TranscriptDeltaTracker {
     this.pendingObservations.set(key, { agentId, sessionKey, messages: current });
     this.pruneSnapshots();
     return delta;
+  }
+
+  /** Consume the record of the last resume that had to drop transcript history. */
+  takeWatermarkRecovery(agentId: string, sessionKey: string): Record<string, unknown> | undefined {
+    const key = JSON.stringify([agentId, sessionKey]);
+    const recovery = this.watermarkRecoveries.get(key);
+    if (recovery) this.watermarkRecoveries.delete(key);
+    return recovery;
   }
 
   /** Build the candidate cursor without advancing the committed in-memory watermark. */
@@ -231,6 +285,9 @@ export class TranscriptDeltaTracker {
     const key = JSON.stringify([agentId, sessionKey]);
     this.snapshots.delete(key);
     this.pendingObservations.delete(key);
+    // The recovery describes an observation that is being discarded; reporting it
+    // later, against a different observation, would be a lie.
+    this.watermarkRecoveries.delete(key);
   }
 
   private computeDelta(
@@ -253,6 +310,7 @@ export class TranscriptDeltaTracker {
 
     throw new TranscriptCursorError(
       "OpenClaw transcript changed with no trustworthy overlap; refusing to guess which messages are new",
+      describeDivergence(previous, current, prefix, overlap),
     );
   }
 
@@ -281,9 +339,19 @@ export class TranscriptDeltaTracker {
      * committed prefix nor the tail anchor survives. Do not block capture
      * forever. Start from the current logical turn instead.
      *
-     * This intentionally prefers possible replay over permanent capture loss.
+     * This intentionally prefers possible replay over permanent capture loss --
+     * so it is recorded rather than taken silently. Everything before the resumed
+     * turn is dropped, and until now nothing said so.
      */
-    return initialTail(current);
+    const tail = initialTail(current);
+    this.watermarkRecoveries.set(key, {
+      reason: "prefix_digest_and_tail_anchor_missing",
+      watermarkMessages: watermark.observedMessages,
+      currentMessages: current.length,
+      resumedMessages: tail.length,
+      droppedBeforeResume: Math.max(0, current.length - tail.length),
+    });
+    return tail;
   }
 
   private pruneSnapshots(): void {

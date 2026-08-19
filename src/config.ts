@@ -27,6 +27,13 @@ export type GraphitiPluginConfig = {
   logModelInput: boolean;
   bufferLimit: number;
   bufferTimeout: number;
+  /**
+   * Where an agent's transcript store lives; `{agentId}` is substituted.
+   *
+   * Configurable because the capture reads the gateway's own database, and a
+   * deployment that moves ~/.openclaw must be able to say so without a rebuild.
+   */
+  agentDbPath: string;
   excludeSessionPatterns: string[];
   agentTools: boolean;
   browseChars: number;
@@ -57,6 +64,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   logModelInput: false,
   bufferLimit: 4,
   bufferTimeout: 900,
+  agentDbPath: "",
   // Defaults reproduce the background/slug-generator filtering that used to be
   // hardcoded. They are ordinary config: override or extend them freely.
   agentTools: true,
@@ -190,7 +198,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "excludeSessionPatterns", "agentTools",
+    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "excludeSessionPatterns", "agentTools",
     "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
   ]);
 
@@ -217,6 +225,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     logModelInput: booleanValue(raw.logModelInput, DEFAULT_CONFIG.logModelInput, "logModelInput"),
     bufferLimit: integerValue(raw.bufferLimit, DEFAULT_CONFIG.bufferLimit, "bufferLimit", 1, 1_000),
     bufferTimeout: integerValue(raw.bufferTimeout, DEFAULT_CONFIG.bufferTimeout, "bufferTimeout", MIN_BUFFER_TIMEOUT_SEC, 7 * 24 * 60 * 60),
+    agentDbPath: typeof raw.agentDbPath === "string" ? raw.agentDbPath.trim() : DEFAULT_CONFIG.agentDbPath,
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
     agentTools: booleanValue(raw.agentTools, DEFAULT_CONFIG.agentTools, "agentTools"),
     browseChars: integerValue(raw.browseChars, DEFAULT_CONFIG.browseChars, "browseChars", 128, 200_000),

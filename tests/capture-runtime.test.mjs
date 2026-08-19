@@ -5,6 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
+
+// The gateway writes its transcript and then fires the hook; capture reads the
+// store, not the hook payload. Tests still describe a turn as a message list, so
+// the fixture writes it first and the hook only says "a turn ended".
+const agentEnd = (runtime, event, context) => {
+  agentStore.deliver(context?.agentId ?? "main", context?.sessionKey ?? "", event?.messages ?? []);
+  return runtime.hooks.get("agent_end")(event, context);
+};
 
 const stateRoot = mkdtempSync(join(tmpdir(), "graphiti-runtime-share-"));
 process.on("exit", () => rmSync(stateRoot, { recursive: true, force: true }));
@@ -108,6 +118,7 @@ const config = (overrides = {}) => ({
   bufferLimit: 4,
   bufferTimeout: 30,
   logLevel: "debug",
+  agentDbPath: agentStore.agentDbPath,
   agents: {
     main: { user: "Вит", assistant: "Краб" },
     igor: { user: "Игорь", assistant: "Краб" },
@@ -158,8 +169,8 @@ test("repeated registrations in one process share one capture pipeline", async (
   assert.equal(second.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0);
   assert.equal(third.logs.filter((l) => l.includes("event=capture_pipeline")).length, 0);
 
-  first.hooks.get("agent_end")(turn(1), ctx);
-  third.hooks.get("agent_end")(
+  agentEnd(first, turn(1), ctx);
+  agentEnd(third, 
     { success: true, messages: [...turn(1).messages, ...turn(2).messages] },
     ctx,
   );
@@ -178,7 +189,7 @@ test("a restart with a partial buffer flushes it exactly once after continuation
   const firstCalls = installFetch(t);
 
   const before = registerRuntime(dir, { bufferLimit: 6 });
-  before.hooks.get("agent_end")(turn(1), ctx);
+  agentEnd(before, turn(1), ctx);
   await before.hooks.get("gateway_stop")();
   assert.equal(firstCalls.filter((c) => c.name === "add_memory").length, 0);
 
@@ -198,7 +209,7 @@ test("a restart with a partial buffer flushes it exactly once after continuation
     "only one live runtime owns the restored durable journal",
   );
 
-  restored[0].hooks.get("agent_end")(
+  agentEnd(restored[0], 
     { success: true, messages: [...turn(1).messages, ...turn(2).messages, ...turn(3).messages] },
     ctx,
   );
@@ -222,7 +233,7 @@ test("a stopped pipeline is replaced rather than reused", async (t) => {
 
   const second = registerRuntime(dir);
   assert.ok(second.logs.some((l) => l.includes('event=capture_pipeline outcome="replaced_stopped"')));
-  second.hooks.get("agent_end")(turn(1), ctx);
+  agentEnd(second, turn(1), ctx);
   assert.ok(!second.logs.some((l) => l.includes("engine_rejected_messages")));
   await second.hooks.get("gateway_stop")();
 });
@@ -250,11 +261,11 @@ test("durable state for several agents never mixes their conversations", async (
   const beforeCalls = installFetch(t);
 
   const gateway = registerRuntime(dir, { bufferLimit: 6 });
-  gateway.hooks.get("agent_end")(
+  agentEnd(gateway, 
     { success: true, messages: [{ role: "user", content: "секрет вита" }] },
     { agentId: "main", sessionKey: "agent:main:telegram:1", trigger: "user" },
   );
-  gateway.hooks.get("agent_end")(
+  agentEnd(gateway, 
     { success: true, messages: [{ role: "user", content: "секрет игоря" }] },
     { agentId: "igor", sessionKey: "agent:igor:telegram:2", trigger: "user" },
   );
@@ -264,7 +275,7 @@ test("durable state for several agents never mixes their conversations", async (
   resetCaptureRuntimeForTests();
   const calls = installFetch(t);
   const after = registerRuntime(dir, { bufferLimit: 2 });
-  after.hooks.get("agent_end")(
+  agentEnd(after, 
     {
       success: true,
       messages: [

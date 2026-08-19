@@ -9,6 +9,7 @@ import type {
   PersistedBuffer,
   QueueEntry,
 } from "./buffer.js";
+import { parseCursor, type SessionCursor } from "./capture-cursor.js";
 import { CHECK_INTERVAL_SEC, MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
 import type { AgentActors } from "./config.js";
 import { DEFAULT_ACTORS } from "./config.js";
@@ -17,13 +18,9 @@ import {
   type JournalBatch,
 } from "./durable-capture-journal.js";
 import type { DurableQueueRecord } from "./durable-queue-store.js";
-import {
-  TranscriptDeltaTracker,
-  type SessionWatermark,
-} from "./transcript-delta.js";
 
 export type DurableCaptureSessionState = {
-  watermark?: SessionWatermark;
+  cursor?: SessionCursor;
   active?: PersistedBuffer;
 };
 
@@ -120,7 +117,6 @@ export class DurableBufferEngine {
   private readonly processing = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
   private readonly failureActive = new Set<string>();
-  private readonly transcriptDeltas = new TranscriptDeltaTracker();
   private stopped = false;
   private persistFailureActive = false;
 
@@ -144,7 +140,7 @@ export class DurableBufferEngine {
     // An fsynced session intent is stronger than any in-memory state. Complete all
     // such local transactions before the first remote delivery can start.
     this.journal.recoverAll();
-    this.transcriptDeltas.restore(this.discoverSessions());
+    this.discoverSessions();
 
     this.timer = setInterval(() => {
       this.tick().catch((error: unknown) => this.opts.notifyPersistError?.(asError(error)));
@@ -186,59 +182,22 @@ export class DurableBufferEngine {
   }
 
   /**
-   * Observe one complete OpenClaw transcript snapshot and make its delta/cursor
-   * durable as one transaction. This is the production entry point for capture.
-   */
-  ingestTranscript(
-    agentId: string,
-    sessionKey: string,
-    snapshot: readonly BufferMessage[],
-  ): BufferMessage[] {
-    if (this.stopped) throw new Error("cannot add capture messages after DurableBufferEngine shutdown");
-
-    const delta = this.transcriptDeltas.take(agentId, sessionKey, snapshot);
-    const watermark = this.transcriptDeltas.pendingWatermark(agentId, sessionKey);
-    try {
-      if (delta.length > 0) this.ingest(agentId, sessionKey, delta, watermark);
-      else this.checkpointWatermark(agentId, sessionKey, watermark);
-      this.transcriptDeltas.commit(agentId, sessionKey);
-      return cloneMessages(delta);
-    } catch (error) {
-      this.transcriptDeltas.rollback(agentId, sessionKey);
-      throw error;
-    }
-  }
-
-  /**
-   * Drop the volatile snapshot of a session whose transcript could not be reconciled.
+   * How far this session has already been read, as last made durable.
    *
-   * take() computes the delta before publishing the new snapshot, and it runs before
-   * ingestTranscript's own try block, so a cursor error leaves the previous snapshot
-   * installed as the trusted predecessor and every later turn fails against that same
-   * stale comparison forever. The durable watermark is deliberately left alone: the
-   * next observation re-derives from it through firstObservation().
+   * Read from disk on every call rather than cached in memory: the cursor is the
+   * one piece of state whose staleness costs duplicated or skipped conversation,
+   * and the file is authoritative even after a crash mid-turn.
    */
-  rollbackTranscriptSnapshot(agentId: string, sessionKey: string): void {
-    this.transcriptDeltas.rollback(agentId, sessionKey);
+  sessionCursor(agentId: string, sessionKey: string): SessionCursor | undefined {
+    return parseCursor(this.sessionState(agentId, sessionKey).cursor);
   }
 
-  /** Consume the record of the last resume that had to drop transcript history. */
-  takeWatermarkRecovery(
-    agentId: string,
-    sessionKey: string,
-  ): Record<string, unknown> | undefined {
-    return this.transcriptDeltas.takeWatermarkRecovery(agentId, sessionKey);
-  }
-
-  /**
-   * Low-level durable delta ingestion used by migration/fault tests. Production
-   * capture should call ingestTranscript so transcript movement cannot be forgotten.
-   */
+  /** Make new conversation messages durable and move the session cursor with them. */
   ingest(
     agentId: string,
     sessionKey: string,
     messages: readonly BufferMessage[],
-    watermark: SessionWatermark,
+    cursor: SessionCursor,
   ): void {
     if (this.stopped) throw new Error("cannot add capture messages after DurableBufferEngine shutdown");
 
@@ -273,7 +232,7 @@ export class DurableBufferEngine {
     }
 
     const finalState: DurableCaptureSessionState = {
-      watermark: { ...watermark, tailHashes: [...watermark.tailHashes] },
+      cursor: { ...cursor, capturedEventIds: [...cursor.capturedEventIds] },
       ...(active && active.messages.length > 0 ? { active: persistBuffer(active) } : {}),
     };
 
@@ -282,15 +241,15 @@ export class DurableBufferEngine {
     void this.pump(agentId);
   }
 
-  /** Persist a cursor observation that produced no new messages. */
-  checkpointWatermark(agentId: string, sessionKey: string, watermark: SessionWatermark): void {
+  /** Persist a read that produced no new messages, so the next one starts here. */
+  checkpointCursor(agentId: string, sessionKey: string, cursor: SessionCursor): void {
     if (this.stopped) throw new Error("cannot checkpoint after DurableBufferEngine shutdown");
     const now = Date.now();
     this.expireDueSessions(agentId, now);
     const previous = this.sessionState(agentId, sessionKey);
     const finalState: DurableCaptureSessionState = {
       ...previous,
-      watermark: { ...watermark, tailHashes: [...watermark.tailHashes] },
+      cursor: { ...cursor, capturedEventIds: [...cursor.capturedEventIds] },
     };
     this.commitSession(agentId, sessionKey, previous, finalState, []);
     void this.pump(agentId);
@@ -316,8 +275,8 @@ export class DurableBufferEngine {
     }
 
     const finalState: DurableCaptureSessionState = {
-      ...(previous.watermark
-        ? { watermark: { ...previous.watermark, tailHashes: [...previous.watermark.tailHashes] } }
+      ...(previous.cursor
+        ? { cursor: { ...previous.cursor, capturedEventIds: [...previous.cursor.capturedEventIds] } }
         : {}),
       ...(active && active.messages.length > 0 ? { active: persistBuffer(active) } : {}),
     };
@@ -409,18 +368,17 @@ export class DurableBufferEngine {
         session.agentId,
         session.sessionKey,
         state,
-        state.watermark ? { watermark: state.watermark } : {},
+        state.cursor ? { cursor: state.cursor } : {},
         [{ captureId: captureId(session.agentId, payload), enqueuedAt: deadline, payload }],
       );
       this.updateKnownSession(session.agentId, session.sessionKey, undefined);
     }
   }
 
-  /** Rebuild only the tiny timeout index and return every durable transcript cursor. */
-  private discoverSessions(): SessionWatermark[] {
-    const watermarks: SessionWatermark[] = [];
+  /** Rebuild only the tiny timeout index; cursors are read from disk on demand. */
+  private discoverSessions(): void {
     const sessionsRoot = join(this.journal.root, "sessions");
-    if (!existsSync(sessionsRoot)) return watermarks;
+    if (!existsSync(sessionsRoot)) return;
     for (const agentDir of readdirSync(sessionsRoot)) {
       const path = join(sessionsRoot, agentDir);
       for (const file of readdirSync(path)) {
@@ -438,15 +396,11 @@ export class DurableBufferEngine {
         const agentId = (raw as { agentId: string }).agentId;
         const sessionKey = (raw as { sessionKey: string }).sessionKey;
         const state = this.sessionState(agentId, sessionKey);
-        if (state.watermark) {
-          watermarks.push({ ...state.watermark, tailHashes: [...state.watermark.tailHashes] });
-        }
         if (state.active?.messages.length) {
           this.updateKnownSession(agentId, sessionKey, state.active.lastActivityAt);
         }
       }
     }
-    return watermarks;
   }
 
   private async tick(): Promise<void> {

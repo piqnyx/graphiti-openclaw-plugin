@@ -5,6 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
+
+// The gateway writes its transcript and then fires the hook; capture reads the
+// store, not the hook payload. Tests still describe a turn as a message list, so
+// the fixture writes it first and the hook only says "a turn ended".
+const agentEnd = (runtime, event, context) => {
+  agentStore.deliver(context?.agentId ?? "main", context?.sessionKey ?? "", event?.messages ?? []);
+  return runtime.hooks.get("agent_end")(event, context);
+};
 
 function jsonResponse(body, init = {}) {
   return new Response(JSON.stringify(body), {
@@ -146,6 +156,7 @@ function makeFetchRecorder(t, options = {}) {
 const validConfig = (overrides = {}) => ({
   bufferLimit: 4,
   bufferTimeout: 30,
+  agentDbPath: agentStore.agentDbPath,
   agents: { main: { user: "Вит", assistant: "Краб" } },
   ...overrides,
 });
@@ -253,12 +264,12 @@ test("two committed batches of one dialog are submitted and chained strictly in 
   const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
 
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(1) }, ctx);
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(2) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(1) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(2) }, ctx);
   await waitFor(() => toolCalls.filter((call) => call.name === "add_memory").length === 1);
 
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(3) }, ctx);
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(4) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(3) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(4) }, ctx);
   await waitFor(() => toolCalls.filter((call) => call.name === "add_memory").length === 2);
 
   const adds = toolCalls.filter((call) => call.name === "add_memory").map((call) => call.arguments);
@@ -282,8 +293,8 @@ test("a persisted Saga tail hydrates the next batch number and predecessor", asy
 
   const sessionKey = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(1) }, ctx);
-  hooks.get("agent_end")({ success: true, messages: completedTranscript(2) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(1) }, ctx);
+  agentEnd({ hooks }, { success: true, messages: completedTranscript(2) }, ctx);
   await waitFor(() => toolCalls.some((call) => call.name === "add_memory"));
 
   const add = toolCalls.find((call) => call.name === "add_memory").arguments;
@@ -299,7 +310,7 @@ test("capture stores clean user/assistant text, not injected memory wrappers or 
   const { hooks, api } = makeApi(validConfig({ autoRecall: false, bufferLimit: 2 }));
   register(api);
 
-  hooks.get("agent_end")(
+  agentEnd({ hooks }, 
     {
       success: true,
       messages: [
@@ -327,7 +338,7 @@ test("an aborted turn still durably captures a new user message", async (t) => {
   const { hooks, api } = makeApi(validConfig({ autoRecall: false, bufferLimit: 1 }));
   register(api);
 
-  hooks.get("agent_end")(
+  agentEnd({ hooks }, 
     {
       success: false,
       error: "AbortError",

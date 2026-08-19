@@ -22,9 +22,10 @@ import {
   type SagaState,
 } from "./mcp-client.js";
 import { matchSessionExclusion } from "./session-filter.js";
+import { advanceCursor, alreadyCaptured, emptyCursor } from "./capture-cursor.js";
+import { defaultAgentDbPath, TranscriptStore, type TranscriptRow } from "./transcript-store.js";
 import { extractConversationMessages, type ConversationMessage } from "./text.js";
 import type { LocalCaptureState } from "./tools.js";
-import { TranscriptCursorError } from "./transcript-delta.js";
 import type {
   AgentEndEvent,
   HookContext,
@@ -39,7 +40,7 @@ const BACKEND_STATUS_DESCRIPTOR_ID = "backend-queue-error";
 const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
 const DURABLE_CAPTURE_DIR = "durable-capture-v1";
 
-type CaptureFailureReason = "limit" | "timeout" | "cursor" | "durability";
+type CaptureFailureReason = "limit" | "timeout" | "durability";
 
 export function resolveDurableCaptureRoot(): string {
   return join(resolveOpenClawStateDir(), "graphiti-openclaw-plugin", DURABLE_CAPTURE_DIR);
@@ -93,22 +94,34 @@ function captureSessionKey(agentId: string, sessionKey: string): string {
   return JSON.stringify([agentId, sessionKey]);
 }
 
-/** Count the identity witnesses present across one snapshot, by kind. */
-function witnessCounts(snapshot: readonly ConversationMessage[]): Record<string, number> {
-  const counts: Record<string, number> = { unnamed: 0 };
-  for (const message of snapshot) {
-    const witnesses = message.witnesses ?? [];
-    if (witnesses.length === 0) {
-      counts.unnamed += 1;
-      continue;
-    }
-    for (const witness of witnesses) {
-      const kind = `named_${witness.slice(0, witness.indexOf(":"))}`;
-      counts[kind] = (counts[kind] ?? 0) + 1;
-    }
-  }
-  return counts;
+/**
+ * A message body rendered for the log, never for storage.
+ *
+ * An inbound photo arrives as a base64 block -- 224 KB of it, measured -- so the
+ * raw content cannot be printed as-is without drowning the journal. Text is kept
+ * because that is the point of the line; everything else is named and counted.
+ */
+function describeContent(message: unknown): string {
+  if (typeof message !== "object" || message === null) return "";
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content.slice(0, LOG_TEXT_CHARS);
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (typeof block !== "object" || block === null) return "?";
+      const type = (block as { type?: unknown }).type;
+      const text = (block as { text?: unknown }).text;
+      if (type === "text" && typeof text === "string") return text;
+      const data = (block as { data?: unknown }).data;
+      const size = typeof data === "string" ? `(${Math.round(data.length / 1024)}KB)` : "";
+      return `<${String(type)}${size}>`;
+    })
+    .join(" | ")
+    .slice(0, LOG_TEXT_CHARS);
 }
+
+/** Enough of a message to recognise it in the log without flooding the journal. */
+const LOG_TEXT_CHARS = 2000;
 
 export function createCapturePipeline(params: {
   api: OpenClawPluginApi;
@@ -130,7 +143,29 @@ export function createCapturePipeline(params: {
   const backendReportedSessionByAgent = new Map<string, string>();
   const backendFingerprintByAgent = new Map<string, string>();
   const lastQueueStatusByAgent = new Map<string, QueueStatus>();
-  const cursorErrorSessions = new Set<string>();
+  /**
+   * One open store per agent, verified before it is ever used.
+   *
+   * Verification happens here, at registration, so a schema that moved under us
+   * stops the plugin loading instead of quietly capturing nothing. That is the
+   * safe failure: the gateway keeps writing its transcript, and a repaired plugin
+   * reads the backlog from its cursor. Guessing against a changed schema is the
+   * only way to actually lose conversation.
+   */
+  const storesByAgent = new Map<string, TranscriptStore>();
+  const storeFor = (agentId: string): TranscriptStore => {
+    const existing = storesByAgent.get(agentId);
+    if (existing) return existing;
+    const path = cfg.agentDbPath
+      ? cfg.agentDbPath.replaceAll("{agentId}", agentId)
+      : defaultAgentDbPath(agentId);
+    const store = new TranscriptStore(path);
+    store.verify();
+    storesByAgent.set(agentId, store);
+    logger.info("capture_store_opened", { agentId, group_id: agentId, path });
+    return store;
+  };
+  for (const agentId of Object.keys(cfg.agents)) storeFor(agentId);
   const statusHost: CaptureStatusHost = {};
   const durableRoot = resolveDurableCaptureRoot();
   const legacySpoolPath = resolveCaptureSpoolPath();
@@ -177,7 +212,7 @@ export function createCapturePipeline(params: {
           status: { const: "error" },
           message: { type: "string" },
           error: { type: "string" },
-          reason: { enum: ["limit", "timeout", "cursor", "durability"] },
+          reason: { enum: ["limit", "timeout", "durability"] },
           retryIntervalSeconds: { type: "integer" },
           occurredAt: { type: "string" },
         },
@@ -242,15 +277,12 @@ export function createCapturePipeline(params: {
       reason: CaptureFailureReason,
       error: Error,
     ): void => {
-      if (reason === "cursor") cursorErrorSessions.add(captureSessionKey(agentId, sessionKey));
       const value: PluginJsonValue = {
         status: "error",
         message:
-          reason === "cursor"
-            ? "Graphiti capture stopped for this session because transcript position is ambiguous"
-            : reason === "durability"
-              ? "Graphiti capture could not make a durable local transaction; transcript cursor was not advanced"
-              : "Graphiti capture failed; durable FIFO head retained for automatic retry",
+          reason === "durability"
+            ? "Graphiti capture could not read the transcript store or make a durable local transaction; the cursor was not advanced"
+            : "Graphiti capture failed; durable FIFO head retained for automatic retry",
         error: errorText(error),
         reason,
         retryIntervalSeconds: CHECK_INTERVAL_SEC,
@@ -722,45 +754,63 @@ export function createCapturePipeline(params: {
         });
       }
 
-      const snapshot = extractConversationMessages(
-        Array.isArray(event.messages) ? event.messages : [],
-      );
-      let delta;
+      // Read the gateway's own store rather than the hook payload. The hook is a
+      // lossy view of it -- text rewritten, identity stripped, entries spliced in --
+      // and anything it drops is gone for good. The store keeps every row under a
+      // per-session seq with the id the gateway assigned it, so the same read is
+      // safe to repeat after a crash or a week of downtime.
+      let delta: ConversationMessage[] = [];
+      let rowsRead = 0;
       try {
-        delta = engine.ingestTranscript(agentId, sessionKey, snapshot);
-      } catch (error) {
-        if (error instanceof TranscriptCursorError) {
-          // Without this the stale snapshot stays the trusted predecessor and the
-          // session never captures again. The durable watermark is not touched.
-          engine.rollbackTranscriptSnapshot(agentId, sessionKey);
-          logger.error("capture_cursor_ambiguous", {
+        const store = storeFor(agentId);
+        const sessionId = store.currentSessionId(sessionKey);
+        if (!sessionId) {
+          logger.debug("capture_skipped", {
             agentId,
             group_id: agentId,
             saga: sessionKey,
-            snapshotMessages: snapshot.length,
-            error: errorText(error),
-            action: "snapshot_rolled_back_resuming_from_durable_watermark",
-            ...(error.details ?? {}),
+            reason: "session_not_in_store",
           });
-          // Both versions of the message in full, behind the operator's content
-          // switch. Truncation is what kept the last three divergences guesswork.
-          if (error.content) {
-            logger.debugContent(
-              "capture_cursor_divergence",
-              { agentId, group_id: agentId, saga: sessionKey },
-              error.content,
-            );
-          }
-          publishCaptureError(agentId, sessionKey, "cursor", error);
           return;
         }
+
+        const previous = engine.sessionCursor(agentId, sessionKey);
+        // A rewind repoints the key at a new session whose opening rows are copies
+        // of the old ones, so a changed id means read from the beginning and let
+        // the captured-id set discard what has already been taken.
+        const cursor =
+          previous && previous.sessionId === sessionId ? previous : emptyCursor(sessionId);
+        const rows = store.readAfter(sessionId, cursor.lastSeq);
+        rowsRead = rows.length;
+
+        const fresh = rows.filter((row: TranscriptRow) => !alreadyCaptured(cursor, row));
+        const observedSeq = rows.length > 0 ? rows[rows.length - 1]!.seq : cursor.lastSeq;
+
+        for (const row of fresh) {
+          const [message] = extractConversationMessages([row.message]);
+          logger.debugContent(
+            "capture_row",
+            { agentId, group_id: agentId, saga: sessionKey, seq: row.seq, eventId: row.eventId },
+            {
+              rawText: describeContent(row.message),
+              sanitized: message?.text ?? "",
+              verdict: message ? "captured" : "dropped_by_sanitisation",
+            },
+          );
+          if (message) delta.push(message);
+        }
+
+        const advanced = advanceCursor(cursor, sessionId, rows, observedSeq);
+        if (delta.length > 0) engine.ingest(agentId, sessionKey, delta, advanced);
+        else engine.checkpointCursor(agentId, sessionKey, advanced);
+      } catch (error) {
         logger.error("capture_durable_transaction_failed", {
           agentId,
           group_id: agentId,
           saga: sessionKey,
-          snapshotMessages: snapshot.length,
+          rowsRead,
           error: errorText(error),
-          action: "transcript_cursor_rolled_back",
+          action: "cursor_not_advanced",
         });
         publishCaptureError(
           agentId,
@@ -769,18 +819,6 @@ export function createCapturePipeline(params: {
           error instanceof Error ? error : new Error(String(error)),
         );
         return;
-      }
-
-      const recovery = engine.takeWatermarkRecovery(agentId, sessionKey);
-      if (recovery) {
-        logger.warn("capture_resumed_from_current_turn", {
-          agentId,
-          group_id: agentId,
-          saga: sessionKey,
-          snapshotMessages: snapshot.length,
-          action: "transcript_history_before_this_turn_was_not_captured",
-          ...recovery,
-        });
       }
 
       if (delta.length > 0) {
@@ -793,12 +831,7 @@ export function createCapturePipeline(params: {
             messages: delta.length,
             userMessages: delta.filter((message) => message.role === "user").length,
             assistantMessages: delta.filter((message) => message.role === "assistant").length,
-            // Which stable names the gateway actually supplied, counted by kind.
-            // A message named by none of them falls back to text comparison, which is
-            // what used to stall capture -- so `unnamed` is the number worth watching,
-            // and the breakdown says which channel stopped naming its messages.
-            ...witnessCounts(snapshot),
-            snapshotMessages: snapshot.length,
+            rowsRead,
             eventSuccess: event.success,
             durationMs: event.durationMs,
             durableQueueDepth: engine.queueDepth(agentId),
@@ -806,8 +839,6 @@ export function createCapturePipeline(params: {
           { messages: delta },
         );
       }
-      const cursorKey = captureSessionKey(agentId, sessionKey);
-      if (cursorErrorSessions.delete(cursorKey)) clearCaptureError(agentId, sessionKey);
     };
 
     const shutdown = (): Promise<void> => {
@@ -843,7 +874,23 @@ export function createCapturePipeline(params: {
     const localCaptureState = (agentId: string): LocalCaptureState => {
       const backend = lastQueueStatusByAgent.get(agentId);
       const queuedBatches = engine.queueDepth(agentId);
+      let storePath: string | undefined;
+      let storeReadable = false;
+      try {
+        const store = storeFor(agentId);
+        storePath = store.path;
+        store.verify();
+        storeReadable = true;
+      } catch (error) {
+        logger.warn("capture_store_unreadable", {
+          agentId,
+          group_id: agentId,
+          error: errorText(error),
+        });
+      }
       return {
+        ...(storePath ? { storePath } : {}),
+        storeReadable,
         awaitingConfirmation: queuedBatches,
         awaitingBytes: 0,
         notLanding:

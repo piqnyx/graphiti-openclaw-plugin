@@ -30,12 +30,9 @@ function rootFor(t) {
 
 function mark(agentId, sessionKey, observedMessages = 1) {
   return {
-    agentId,
-    sessionKey,
-    tailHashes: [`${agentId}:${sessionKey}:${observedMessages}`.padEnd(64, "0").slice(0, 64)],
-    observedMessages,
-    prefixDigest: "d".repeat(64),
-    updatedAt: Date.now(),
+    sessionId: `${agentId}:${sessionKey}`,
+    lastSeq: observedMessages - 1,
+    capturedEventIds: Array.from({ length: observedMessages }, (_, i) => `e${i}`),
   };
 }
 

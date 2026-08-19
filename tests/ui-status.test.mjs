@@ -5,6 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
+import { makeAgentStore } from "./helpers-agent-store.mjs";
+const agentStore = makeAgentStore();
+
+// The gateway writes its transcript and then fires the hook; capture reads the
+// store, not the hook payload. Tests still describe a turn as a message list, so
+// the fixture writes it first and the hook only says "a turn ended".
+const agentEnd = (runtime, event, context) => {
+  agentStore.deliver(context?.agentId ?? "main", context?.sessionKey ?? "", event?.messages ?? []);
+  return runtime.hooks.get("agent_end")(event, context);
+};
 
 function jsonResponse(body, init = {}) {
   return new Response(JSON.stringify(body), {
@@ -107,6 +117,7 @@ function makeApi(t, { patchThrows = false } = {}) {
         autoRecall: false,
         bufferLimit: 4,
         bufferTimeout: 30,
+        agentDbPath: agentStore.agentDbPath,
         agents: { main: { user: "Вит", assistant: "Краб" } },
       },
       logger: {
@@ -154,8 +165,8 @@ test("definitive capture failures publish error-only plugin session status", asy
 
   const sessionKey = "agent:main:web:status-test";
   const ctx = { agentId: "main", sessionKey, trigger: "user" };
-  hooks.get("agent_end")(completedTurn(1), ctx);
-  hooks.get("agent_end")(completedTranscript(2), ctx);
+  agentEnd({ hooks }, completedTurn(1), ctx);
+  agentEnd({ hooks }, completedTranscript(2), ctx);
 
   await waitFor(() => patches.length === 1);
   const status = patches[0].entry.pluginExtensions["graphiti-openclaw-plugin"]["capture-status"];
@@ -172,8 +183,8 @@ test("session status write failures never escape into capture control flow", asy
   register(api);
 
   const ctx = { agentId: "main", sessionKey: "agent:main:web:status-failure", trigger: "user" };
-  hooks.get("agent_end")(completedTurn(1), ctx);
-  hooks.get("agent_end")(completedTranscript(2), ctx);
+  agentEnd({ hooks }, completedTurn(1), ctx);
+  agentEnd({ hooks }, completedTranscript(2), ctx);
 
   await waitFor(() => logs.some((line) => line.includes("event=capture_ui_status_failed")));
   assert.ok(logs.some((line) => line.includes("event=capture_flush_failed")));

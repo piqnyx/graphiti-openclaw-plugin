@@ -18,12 +18,9 @@ async function waitFor(predicate, timeoutMs = 1500) {
 
 function watermark(agentId, sessionKey, observedMessages = 1) {
   return {
-    agentId,
-    sessionKey,
-    tailHashes: ["a".repeat(64)],
-    observedMessages,
-    prefixDigest: "b".repeat(64),
-    updatedAt: Date.now(),
+    sessionId: `${agentId}:${sessionKey}`,
+    lastSeq: observedMessages - 1,
+    capturedEventIds: Array.from({ length: observedMessages }, (_, i) => `e${i}`),
   };
 }
 
@@ -366,7 +363,7 @@ test("partial buffer flushes on inactivity without moving its durable watermark"
   Date.now = () => now;
   t.after(() => { Date.now = originalNow; });
 
-  const mark = { ...watermark("main", "s1"), updatedAt: now };
+  const mark = watermark("main", "s1");
   engine.ingest("main", "s1", [{ role: "user", text: "partial" }], mark);
   assert.equal(engine.activeBufferCount("main"), 1);
   assert.equal(delivered.length, 0);
@@ -380,7 +377,7 @@ test("partial buffer flushes on inactivity without moving its durable watermark"
   assert.equal(delivered[0].enqueuedAt, 1_030_000);
   const state = engine.journal.read("main", "s1").committed;
   assert.equal(state.active, undefined);
-  assert.deepEqual(state.watermark, mark);
+  assert.deepEqual(state.cursor, mark);
 });
 
 test("a synthetic note joins the same session buffer without advancing transcript cursor", async (t) => {
@@ -393,6 +390,6 @@ test("a synthetic note joins the same session buffer without advancing transcrip
   engine.appendSynthetic("main", "s1", { role: "assistant", text: "remember this" });
 
   const state = engine.journal.read("main", "s1").committed;
-  assert.deepEqual(state.watermark, mark);
+  assert.deepEqual(state.cursor, mark);
   assert.deepEqual(state.active.messages.map((m) => m.text), ["ordinary", "remember this"]);
 });

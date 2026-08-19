@@ -104,6 +104,14 @@ type MessageLike = {
   role?: unknown;
   content?: unknown;
   timestamp?: unknown;
+  /** Stable per-message key the gateway persists; not declared in its public types. */
+  idempotencyKey?: unknown;
+  /** Provider-assigned reply identifier on an assistant message. */
+  responseId?: unknown;
+  /** Runtime-assigned turn identity, used when the provider exposes none. */
+  turnId?: unknown;
+  /** Gateway-private envelope; carries the originating channel's own message id. */
+  __openclaw?: unknown;
   /**
    * Set by the gateway on a message carrying transient current-turn runtime
    * context. Such a message exists only on the turn that produced it and is
@@ -113,23 +121,62 @@ type MessageLike = {
   runtimeContextCarrier?: unknown;
 };
 
+function identityWitness(prefix: string, value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return `${prefix}:${value}`;
+  if (typeof value === "number" && Number.isFinite(value)) return `${prefix}:${value}`;
+  return undefined;
+}
+
+function transportMessageId(envelope: unknown): unknown {
+  if (!envelope || typeof envelope !== "object") return undefined;
+  const transport = (envelope as { transport?: unknown }).transport;
+  if (!transport || typeof transport !== "object") return undefined;
+  return (transport as { messageId?: unknown }).messageId;
+}
+
+/**
+ * Every stable name this message answers to.
+ *
+ * Each of these is assigned when the message is created and never derived from
+ * its text, so none of them moves when the gateway rewrites the text. They are
+ * collected rather than ranked because the delivered payload is inconsistent:
+ * the same message arrives with a timestamp on the turn it happens and without
+ * one when it comes back as history, which is why keying identity on any single
+ * field made a message stop matching itself.
+ *
+ * Undeclared in OpenClaw's public types, all of them: the types describe the
+ * contract, the delivered object carries more. Read defensively, treat absence
+ * as "this witness has nothing to say" rather than as a difference.
+ */
+function identityWitnesses(message: MessageLike): string[] {
+  return [
+    identityWitness("idem", message.idempotencyKey),
+    identityWitness("resp", message.responseId),
+    identityWitness("turn", message.turnId),
+    identityWitness("chan", transportMessageId(message.__openclaw)),
+    identityWitness("ts", message.timestamp),
+  ].filter((witness): witness is string => witness !== undefined);
+}
+
 export type ConversationMessage = {
   role: "user" | "assistant";
   text: string;
-  /**
-   * Creation time in ms, straight from the gateway's own message record.
-   *
-   * OpenClaw rewrites message *text* between observations -- a voice turn arrives
-   * as `[Audio transcript ...]: "…"` on the live turn and comes back with the
-   * marker relocated on the next one, and assistant replies lose their blank
-   * lines once rendered. Identity therefore cannot be the text. `timestamp` is
-   * assigned when the message is created and is not optional in the gateway's
-   * UserMessage/AssistantMessage, so it survives every rewrite we have seen.
-   *
-   * Optional here only because a channel that somehow omits it must degrade to
-   * text comparison rather than lose capture.
-   */
+  /** Creation time in ms, kept for logging and for ordering diagnostics. */
   timestamp?: number;
+  /**
+   * Stable names this message answers to, none of them derived from its text.
+   *
+   * OpenClaw rewrites message text between observations -- a voice turn arrives
+   * as `[Audio transcript ...]: "…"` and comes back with the marker relocated,
+   * assistant replies lose their blank lines once rendered -- so identity cannot
+   * be the text. It cannot be one chosen field either: the delivered payload is
+   * inconsistent about which of them it includes.
+   *
+   * Absent on a message restored from the durable queue, which persists only role
+   * and text, and empty when the gateway supplied none. Either way comparison
+   * falls back to the text rather than losing capture.
+   */
+  witnesses?: string[];
 };
 
 export type RecallQueryOptions = {
@@ -232,7 +279,13 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
       typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
         ? message.timestamp
         : undefined;
-    result.push(timestamp === undefined ? { role: message.role, text } : { role: message.role, text, timestamp });
+    // Omitted entirely when the gateway named none, so a message carries only what
+    // it actually has and equality against a plain {role, text} stays meaningful.
+    const witnesses = identityWitnesses(message);
+    const entry: ConversationMessage = { role: message.role, text };
+    if (timestamp !== undefined) entry.timestamp = timestamp;
+    if (witnesses.length > 0) entry.witnesses = witnesses;
+    result.push(entry);
   }
   return result;
 }

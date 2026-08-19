@@ -22,7 +22,7 @@ import {
   type SagaState,
 } from "./mcp-client.js";
 import { matchSessionExclusion } from "./session-filter.js";
-import { extractConversationMessages } from "./text.js";
+import { extractConversationMessages, type ConversationMessage } from "./text.js";
 import type { LocalCaptureState } from "./tools.js";
 import { TranscriptCursorError } from "./transcript-delta.js";
 import type {
@@ -91,6 +91,23 @@ function expectedEpisodeName(sessionKey: string, batchNumber: number): string {
 
 function captureSessionKey(agentId: string, sessionKey: string): string {
   return JSON.stringify([agentId, sessionKey]);
+}
+
+/** Count the identity witnesses present across one snapshot, by kind. */
+function witnessCounts(snapshot: readonly ConversationMessage[]): Record<string, number> {
+  const counts: Record<string, number> = { unnamed: 0 };
+  for (const message of snapshot) {
+    const witnesses = message.witnesses ?? [];
+    if (witnesses.length === 0) {
+      counts.unnamed += 1;
+      continue;
+    }
+    for (const witness of witnesses) {
+      const kind = `named_${witness.slice(0, witness.indexOf(":"))}`;
+      counts[kind] = (counts[kind] ?? 0) + 1;
+    }
+  }
+  return counts;
 }
 
 export function createCapturePipeline(params: {
@@ -776,10 +793,11 @@ export function createCapturePipeline(params: {
             messages: delta.length,
             userMessages: delta.filter((message) => message.role === "user").length,
             assistantMessages: delta.filter((message) => message.role === "assistant").length,
-            // Identity comes from the gateway timestamp; anything without one falls
-            // back to text comparison, which is what used to stall capture. Report the
-            // ratio so a channel that stops supplying timestamps is visible at once.
-            timestamped: snapshot.filter((message) => message.timestamp !== undefined).length,
+            // Which stable names the gateway actually supplied, counted by kind.
+            // A message named by none of them falls back to text comparison, which is
+            // what used to stall capture -- so `unnamed` is the number worth watching,
+            // and the breakdown says which channel stopped naming its messages.
+            ...witnessCounts(snapshot),
             snapshotMessages: snapshot.length,
             eventSuccess: event.success,
             durationMs: event.durationMs,

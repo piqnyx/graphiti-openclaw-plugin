@@ -59,24 +59,26 @@ export class TranscriptCursorError extends Error {
 /**
  * Is this the same message seen again?
  *
- * Two independent witnesses, and either one is enough, because each covers what
- * the other misses. OpenClaw supplies `timestamp` only on the turn that just
- * happened -- observed live: `timestamped=2` against `snapshotMessages=24` -- so
- * identity cannot rest on it alone. And it rewrites message text between
- * observations -- a voice turn's `[Audio transcript ...]` marker moves out of
- * first position once stored -- so it cannot rest on the text alone either.
+ * Any shared witness settles it, and the text is the witness of last resort.
  *
- * Requiring both to agree fails every message that lost its timestamp on the way
- * into history, which is nearly all of them. Accepting either means a text turn
- * is matched by its unchanged text and a rewritten voice turn by its timestamp.
- * Only a message that has lost both is genuinely unrecognisable.
+ * Requiring a particular field to agree is what kept failing. The gateway hands
+ * the same message over with a timestamp on the turn it happens and without one
+ * when it comes back as history -- observed live as `timestamped=2` against
+ * `snapshotMessages=4` -- so a comparison anchored on the timestamp made messages
+ * stop matching themselves. And the text alone cannot carry identity either,
+ * because the gateway rewrites it: markers relocate, blank lines collapse.
+ *
+ * So absence of a witness means that witness has nothing to say, never that the
+ * messages differ. Only a message that shares no witness and whose text has also
+ * changed is genuinely unrecognisable -- and that is worth refusing to guess about.
  */
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
   if (a.role !== b.role) return false;
   if (a.text === b.text) return true;
-  return (
-    a.timestamp !== undefined && b.timestamp !== undefined && a.timestamp === b.timestamp
-  );
+  const mine = a.witnesses;
+  const theirs = b.witnesses;
+  if (!mine?.length || !theirs?.length) return false;
+  return mine.some((witness) => theirs.includes(witness));
 }
 
 /**

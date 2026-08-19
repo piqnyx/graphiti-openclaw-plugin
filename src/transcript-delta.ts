@@ -19,13 +19,27 @@ export type SessionWatermark = {
 };
 
 export class TranscriptCursorError extends Error {
-  /** Shape of the divergence, for operator logs. Never carries message text. */
+  /** Shape of the divergence. Safe for the ordinary error line: no message text. */
   readonly details?: Record<string, unknown>;
+  /**
+   * The diverging message in full, in both versions.
+   *
+   * Kept apart from `details` so the caller can route it through the content
+   * channel, which the operator already gates with logContent. Truncating it
+   * would defeat the purpose: what rewrote the message has landed at the end of
+   * the text as often as at the start.
+   */
+  readonly content?: Record<string, unknown>;
 
-  constructor(message: string, details?: Record<string, unknown>) {
+  constructor(
+    message: string,
+    details?: Record<string, unknown>,
+    content?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = "TranscriptCursorError";
     this.details = details;
+    this.content = content;
   }
 }
 
@@ -230,6 +244,11 @@ function describeDivergence(
 ): Record<string, unknown> {
   const before = edgeHashes(previous);
   const after = edgeHashes(current);
+  // commonPrefix already names the exact index, so the two versions of that one
+  // message can be named too -- lengths and timestamp presence here, the text
+  // itself in the content channel below.
+  const diverged = previous[commonPrefix];
+  const replacement = current[commonPrefix];
   return {
     previousMessages: previous.length,
     currentMessages: current.length,
@@ -239,6 +258,32 @@ function describeDivergence(
     previousLastHash: before.last,
     currentFirstHash: after.first,
     currentLastHash: after.last,
+    divergedRole: diverged?.role,
+    divergedChars: diverged?.text.length,
+    replacementChars: replacement?.text.length,
+    divergedHadTimestamp: diverged === undefined ? undefined : diverged.timestamp !== undefined,
+    replacementHadTimestamp:
+      replacement === undefined ? undefined : replacement.timestamp !== undefined,
+  };
+}
+
+/**
+ * The diverging message in full, for the content-gated log.
+ *
+ * Every divergence found so far was a different kind of gateway machinery sitting
+ * in the text: a transcript marker that moved out of first position, a delivery
+ * tag, a tool call the model wrote as prose. Each was identified by inference from
+ * indirect evidence, and each inference cost a round trip and was wrong at least
+ * once. Printing both versions verbatim replaces that with reading.
+ */
+function divergenceContent(
+  previous: readonly ConversationMessage[],
+  current: readonly ConversationMessage[],
+  commonPrefix: number,
+): Record<string, unknown> {
+  return {
+    divergedWas: previous[commonPrefix]?.text,
+    divergedNow: current[commonPrefix]?.text,
   };
 }
 
@@ -351,6 +396,7 @@ export class TranscriptDeltaTracker {
     throw new TranscriptCursorError(
       "OpenClaw transcript changed with no trustworthy overlap; refusing to guess which messages are new",
       describeDivergence(previous, current, prefix, overlap),
+      divergenceContent(previous, current, prefix),
     );
   }
 

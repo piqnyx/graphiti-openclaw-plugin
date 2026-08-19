@@ -53,8 +53,11 @@ export function advanceCursor(
 ): SessionCursor {
   // Ids carry across a session change on purpose: that is what a rewind copies.
   const ids = [...cursor.capturedEventIds];
+  const known = new Set(ids);
   for (const row of rows) {
-    if (!ids.includes(row.eventId)) ids.push(row.eventId);
+    if (known.has(row.eventId)) continue;
+    known.add(row.eventId);
+    ids.push(row.eventId);
   }
   const overflow = ids.length - MAX_REMEMBERED_EVENT_IDS;
   return {

@@ -807,19 +807,18 @@ export function createCapturePipeline(params: {
           // start after it. Only correct when that history is already in memory
           // from before this cursor existed, which is why it is not the default --
           // a conversation that begins now is written and read in the same turn.
-          const existing = store.readAfter(sessionId, -1);
-          const head = existing.length > 0 ? existing[existing.length - 1]!.seq : store.maxSeq(sessionId);
+          const existing = store.readAfter(sessionId, -1, Number.MAX_SAFE_INTEGER);
           engine.checkpointCursor(
             agentId,
             sessionKey,
-            advanceCursor(emptyCursor(sessionId), sessionId, existing, head),
+            advanceCursor(emptyCursor(sessionId), sessionId, existing.rows, existing.scannedThrough),
           );
           logger.info("capture_session_adopted", {
             agentId,
             group_id: agentId,
             saga: sessionKey,
-            existingRows: existing.length,
-            fromSeq: head,
+            existingRows: existing.rows.length,
+            fromSeq: existing.scannedThrough,
             action: "history_left_to_whatever_already_holds_it",
           });
           return;
@@ -829,15 +828,16 @@ export function createCapturePipeline(params: {
         // the captured-id set discard what has already been taken.
         const cursor =
           previous && previous.sessionId === sessionId ? previous : emptyCursor(sessionId);
-        const rows = store.readAfter(sessionId, cursor.lastSeq);
+        const read = store.readAfter(sessionId, cursor.lastSeq);
+        const rows = read.rows;
         rowsRead = rows.length;
 
-        const fresh = rows.filter((row: TranscriptRow) => !alreadyCaptured(cursor, row));
-        // Where the read got to, not where the last kept row was. A session can be
-        // entirely machinery -- the heartbeat is -- and stopping the cursor at the
-        // last conversational row would re-read and re-discard the whole session on
-        // every turn, forever.
-        const observedSeq = Math.max(store.maxSeq(sessionId), cursor.lastSeq);
+        // Membership by set, not by scanning the list per row: a first read of a
+        // long session compares every row against everything taken so far, and the
+        // list is ten thousand ids deep.
+        const taken = new Set(cursor.capturedEventIds);
+        const fresh = rows.filter((row: TranscriptRow) => !taken.has(row.eventId));
+        const observedSeq = read.scannedThrough;
 
         let logged = 0;
         for (const row of fresh) {

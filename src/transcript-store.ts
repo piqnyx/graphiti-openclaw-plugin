@@ -25,6 +25,29 @@ const REQUIRED_SCHEMA: Record<string, readonly string[]> = {
   session_nodes: ["session_key", "current_session_id"],
 };
 
+/** Rows kept, and the position the scan actually reached. */
+export type TranscriptRead = {
+  rows: TranscriptRow[];
+  /**
+   * Highest seq examined, kept or discarded.
+   *
+   * The cursor must move to this and not to the last kept row: a session can end
+   * in machinery, or in nothing but machinery, and stopping at the last
+   * conversational row would re-read the tail on every turn forever.
+   */
+  scannedThrough: number;
+};
+
+/**
+ * Rows per read.
+ *
+ * A first look at a long session would otherwise pull the whole thing into memory
+ * at once, and inbound photos live in these rows as base64 -- a couple of hundred
+ * kilobytes each. Reading in slices costs nothing: the cursor advances to what was
+ * scanned, and the next turn continues from there.
+ */
+const MAX_ROWS_PER_READ = 500;
+
 export type TranscriptRow = {
   seq: number;
   eventId: string;
@@ -125,17 +148,19 @@ export class TranscriptStore {
    * conversation. Assistant replies to an internal turn go too -- `HEARTBEAT_OK`
    * carries no marker of its own and is only recognisable through its parent.
    */
-  readAfter(sessionId: string, afterSeq: number): TranscriptRow[] {
+  readAfter(sessionId: string, afterSeq: number, limit = MAX_ROWS_PER_READ): TranscriptRead {
     const rows = this.db
       .prepare(
         "SELECT e.seq AS seq, e.event_json AS json FROM transcript_events e " +
-          "WHERE e.session_id = ? AND e.seq > ? ORDER BY e.seq",
+          "WHERE e.session_id = ? AND e.seq > ? ORDER BY e.seq LIMIT ?",
       )
-      .all(sessionId, afterSeq) as Array<{ seq: unknown; json: unknown }>;
+      .all(sessionId, afterSeq, limit) as Array<{ seq: unknown; json: unknown }>;
 
     const result: TranscriptRow[] = [];
+    let scannedThrough = afterSeq;
     for (const row of rows) {
       if (typeof row.seq !== "number" || typeof row.json !== "string") continue;
+      scannedThrough = Math.max(scannedThrough, row.seq);
       let event: unknown;
       try {
         event = JSON.parse(row.json);
@@ -157,7 +182,7 @@ export class TranscriptStore {
 
       result.push({ seq: row.seq, eventId, ...(parentId ? { parentId } : {}), message });
     }
-    return result;
+    return { rows: result, scannedThrough };
   }
 
   close(): void {

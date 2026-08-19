@@ -55,7 +55,7 @@ test("only user and assistant messages are conversation", (t) => {
   store.verify();
   assert.equal(store.currentSessionId("agent:main:telegram:direct:1"), "sess-1");
   assert.deepEqual(
-    store.readAfter("sess-1", -1).map((row) => [row.seq, row.eventId]),
+    store.readAfter("sess-1", -1).rows.map((row) => [row.seq, row.eventId]),
     [[0, "e0"], [3, "e3"]],
   );
 });
@@ -75,16 +75,18 @@ test("the gateway talking to itself is dropped, and so is the reply to it", (t) 
 
   const store = new TranscriptStore(path);
   // HEARTBEAT_OK carries no marker of its own; only its parent gives it away.
-  assert.deepEqual(store.readAfter("s", -1).map((row) => row.eventId), ["r0"]);
+  assert.deepEqual(store.readAfter("s", -1).rows.map((row) => row.eventId), ["r0"]);
 });
 
 test("reading resumes strictly after the given seq", (t) => {
   const { path, db } = makeDb(t);
   for (let seq = 0; seq < 5; seq += 1) addEvent(db, "s", seq, say(`e${seq}`, "user", `m${seq}`));
   const store = new TranscriptStore(path);
-  assert.deepEqual(store.readAfter("s", 2).map((row) => row.seq), [3, 4]);
+  assert.deepEqual(store.readAfter("s", 2).rows.map((row) => row.seq), [3, 4]);
   assert.equal(store.maxSeq("s"), 4);
-  assert.deepEqual(store.readAfter("s", 4), []);
+  assert.deepEqual(store.readAfter("s", 4).rows, []);
+  // Nothing kept, but the scan still reports where it looked.
+  assert.equal(store.readAfter("s", 2).scannedThrough, 4);
 });
 
 test("one unreadable row does not cost the rest of the conversation", (t) => {
@@ -93,5 +95,21 @@ test("one unreadable row does not cost the rest of the conversation", (t) => {
   db.prepare("INSERT INTO transcript_events VALUES (?, ?, ?)").run("s", 1, "{ это не json");
   addEvent(db, "s", 2, say("e2", "user", "второе"));
   const store = new TranscriptStore(path);
-  assert.deepEqual(store.readAfter("s", -1).map((row) => row.eventId), ["e0", "e2"]);
+  assert.deepEqual(store.readAfter("s", -1).rows.map((row) => row.eventId), ["e0", "e2"]);
+});
+
+test("a long session is read in slices that continue where the last one stopped", (t) => {
+  const { path, db } = makeDb(t);
+  for (let seq = 0; seq < 7; seq += 1) addEvent(db, "s", seq, say(`e${seq}`, "user", `m${seq}`));
+  const store = new TranscriptStore(path);
+
+  // Rows hold inbound photos as base64, so an unbounded first read of an old
+  // session would pull all of it into memory at once.
+  const first = store.readAfter("s", -1, 3);
+  assert.deepEqual(first.rows.map((row) => row.seq), [0, 1, 2]);
+  assert.equal(first.scannedThrough, 2);
+
+  const second = store.readAfter("s", first.scannedThrough, 3);
+  assert.deepEqual(second.rows.map((row) => row.seq), [3, 4, 5]);
+  assert.equal(second.scannedThrough, 5);
 });

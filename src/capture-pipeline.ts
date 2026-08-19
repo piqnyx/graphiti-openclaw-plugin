@@ -763,9 +763,6 @@ export function createCapturePipeline(params: {
     const shutdown = (): Promise<void> => {
       shutdownPromise ??= (async () => {
         if (queueHealthTimer) clearInterval(queueHealthTimer);
-        client.close();
-        for (const store of storesByAgent.values()) store.close();
-        storesByAgent.clear();
         logger.info("capture_shutdown_checkpoint", {
           root: durableRoot,
           queuedBatches: engine.journal.queue
@@ -773,7 +770,16 @@ export function createCapturePipeline(params: {
             .reduce((sum, agentId) => sum + engine.queueDepth(agentId), 0),
           graceMs: CAPTURE_SHUTDOWN_GRACE_MS,
         });
+
+        // Drain first, close after. The grace window exists so a batch caught
+        // mid-flight can still land, and closing the transport ahead of it made
+        // that window useless: every attempt inside it failed at once with
+        // "Graphiti MCP client is shutting down", and the batch was left for the
+        // next process to retry. Nothing was lost, but nothing was saved either.
         await engine.shutdown(CAPTURE_SHUTDOWN_GRACE_MS);
+        client.close();
+        for (const store of storesByAgent.values()) store.close();
+        storesByAgent.clear();
         logger.info("capture_shutdown_complete", {
           root: durableRoot,
           durableReplayRequired: engine.journal.queue

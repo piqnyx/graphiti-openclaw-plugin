@@ -113,6 +113,11 @@ type MessageLike = {
   /** Gateway-private envelope; carries the originating channel's own message id. */
   __openclaw?: unknown;
   /**
+   * Where the message came from. `kind: "internal_system"` marks the gateway
+   * talking to itself -- heartbeat polls and the like -- wearing the user role.
+   */
+  provenance?: unknown;
+  /**
    * Set by the gateway on a message carrying transient current-turn runtime
    * context. Such a message exists only on the turn that produced it and is
    * stripped on replay, so treating it as history makes the transcript look
@@ -125,6 +130,20 @@ function identityWitness(prefix: string, value: unknown): string | undefined {
   if (typeof value === "string" && value.length > 0) return `${prefix}:${value}`;
   if (typeof value === "number" && Number.isFinite(value)) return `${prefix}:${value}`;
   return undefined;
+}
+
+/**
+ * The gateway polling itself, dressed as the user.
+ *
+ * A heartbeat arrives with `role: "user"` and the body `[OpenClaw heartbeat poll]`,
+ * distinguishable only by `provenance.kind`. Captured, it becomes a line the user
+ * never said, and extraction has no way to know that. Session-name exclusions keep
+ * these out today, but that is a guard on where the message landed rather than on
+ * what it is.
+ */
+function isInternalSystemMessage(provenance: unknown): boolean {
+  if (!provenance || typeof provenance !== "object") return false;
+  return (provenance as { kind?: unknown }).kind === "internal_system";
 }
 
 function transportMessageId(envelope: unknown): unknown {
@@ -272,6 +291,7 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
     const message = rawMessage as MessageLike;
     if (message.role !== "user" && message.role !== "assistant") continue;
     if (message.runtimeContextCarrier === true) continue;
+    if (isInternalSystemMessage(message.provenance)) continue;
     const text = sanitizeConversationText(textFromContent(message.content));
     if (!text) continue;
     if (message.role === "user" && text.startsWith(SESSION_RESET_PROMPT_PREFIX)) continue;

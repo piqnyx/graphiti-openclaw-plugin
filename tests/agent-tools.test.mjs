@@ -205,7 +205,11 @@ test("a note joins the dialog's own saga, carrying its title", async (t) => {
   const submitted = calls.find((params) => params.name === "add_memory");
   assert.equal(submitted.arguments.group_id, "main");
   assert.equal(submitted.arguments.saga, "agent:main:telegram:1");
-  assert.deepEqual(JSON.parse(submitted.arguments.episode_body).messages, [{ role: "assistant", text: "собака: Басю отдали в добрые руки" }]);
+  // Marked at the boundary, so extraction reads it as a written record rather than
+  // as something the assistant said out loud.
+  assert.deepEqual(JSON.parse(submitted.arguments.episode_body).messages, [
+    { role: "assistant", text: "[note] собака: Басю отдали в добрые руки" },
+  ]);
 });
 
 test("note refuses empty and oversized text", async (t) => {
@@ -513,4 +517,22 @@ test("an episode renamed out of numbering is not read as a batch", () => {
   assert.deepEqual(inspected.gaps, []);
   assert.equal(inspected.seen, 3);
   assert.equal(splitEpisodeName("8248439450-22-orphan"), undefined);
+});
+
+test("the note marker is added at the boundary, not by whoever wrote the note", async (t) => {
+  // The agent authors a statement; the marker is machinery. Adding it here means it
+  // cannot be quoted back into the text, doubled, or left off.
+  const calls = installFetch(t, committingCaptureHandlers());
+  const { tools } = makeCaptureRuntime(t, { bufferLimit: 1 });
+  await call(tools, "graphiti_note", { note: "[note] Вит живёт в Григолети" }, {
+    agentId: "main",
+    sessionKey: "agent:main:telegram:1",
+  });
+  await waitForCall(calls, "add_memory");
+  const body = JSON.parse(calls.find((params) => params.name === "add_memory").arguments.episode_body);
+  assert.equal(
+    (body.messages[0].text.match(/\[note\]/g) ?? []).length,
+    2,
+    "text that already says [note] keeps it as ordinary words; the boundary still adds its own",
+  );
 });

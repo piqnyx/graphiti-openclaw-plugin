@@ -33,6 +33,9 @@ import type {
   PluginJsonValue,
 } from "./types.js";
 
+/** Prefix that tells extraction this line is a written record, not speech. */
+const NOTE_MARKER = "[note]";
+
 const CAPTURE_SHUTDOWN_GRACE_MS = 4_000;
 const DURABLE_CAPTURE_DIR = "durable-capture-v1";
 
@@ -785,8 +788,22 @@ export function createCapturePipeline(params: {
       return shutdownPromise;
     };
 
+    /**
+     * A note joins the batch marked as what it is.
+     *
+     * It has to travel as a message, because that is what a batch holds, and the
+     * assistant role is the only honest one available -- but it is not something
+     * the assistant said. Left unmarked, extraction attributed it like speech and
+     * produced records of protocol rather than of the world: "Ева will update the
+     * files", "Вит requests that Graphiti record the shorthand". The marker is what
+     * the extraction instructions key on to read it as a statement instead, and it
+     * is dropped from the facts themselves.
+     *
+     * Marking it here rather than in the tool keeps the marker out of the text the
+     * agent authored, so it cannot be quoted back, doubled, or forgotten.
+     */
     const captureNote = (agentId: string, sessionKey: string, note: string): void => {
-      engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: note });
+      engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: `${NOTE_MARKER} ${note}` });
     };
 
     /**

@@ -756,16 +756,18 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       label: "Repair memory (Graphiti)",
       description:
         "Repair the shape of memory, when a note cannot. A note states a fact; this changes the graph itself. " +
-        "mode=\"alias\": two entities are the same thing under different names — fold `duplicate` into `canonical` " +
-        "so their facts stop being invisible to each other. Use it when search returns the same subject twice under " +
+        "mode=\"merge\": one thing is recorded twice under different names — everything attached to `duplicate` moves " +
+        "onto `canonical` and `duplicate` ceases to exist. Use it when search returns the same subject twice under " +
         "different spellings, or a name in the wrong grammatical case. " +
+        "Not for the opposite case: if two similar names are genuinely different things, say so in a graphiti_note " +
+        "instead — nothing needs repairing, and the statement keeps them from being merged later. " +
         "Names must be exactly as memory holds them; check with graphiti_search first. " +
-        "Set preview=true to see what would move before it moves. This edits memory, so use it when something is " +
-        "actually wrong — not to tidy.",
+        "preview=true reports what would move without moving it. This destroys one entity, so use it when something " +
+        "is actually wrong — not to tidy.",
       parameters: {
         type: "object",
         properties: {
-          mode: { type: "string", enum: ["alias"], description: "What to repair. Only alias for now." },
+          mode: { type: "string", enum: ["merge"], description: "What to repair. Only merge for now." },
           duplicate: { type: "string", description: "The name to fold away, exactly as memory holds it." },
           canonical: { type: "string", description: "The name to keep, exactly as memory holds it." },
           preview: { type: "boolean", description: "Report what would move without changing anything." },
@@ -777,8 +779,8 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         if ("refusal" in resolved) return resolved.refusal;
 
         const mode = stringParam(params, "mode").trim();
-        if (mode !== "alias") {
-          return errorResult(`graphiti_repair does not know mode "${mode}". The only mode is alias.`, {
+        if (mode !== "merge") {
+          return errorResult(`graphiti_repair does not know mode "${mode}". The only mode is merge.`, {
             tool: "graphiti_repair",
             reason: "unknown_mode",
             mode,

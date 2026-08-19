@@ -168,8 +168,15 @@ test("definitive capture failures publish error-only plugin session status", asy
   agentEnd({ hooks }, completedTurn(1), ctx);
   agentEnd({ hooks }, completedTranscript(2), ctx);
 
-  await waitFor(() => patches.length === 1);
-  const status = patches[0].entry.pluginExtensions["graphiti-openclaw-plugin"]["capture-status"];
+  // Looking for the patch that carries the capture status, not for a patch count:
+  // the backend-queue namespace publishes through the same channel, and counting
+  // them makes the test fail on an unrelated report arriving first.
+  const captureStatus = () =>
+    patches
+      .map((patch) => patch.entry.pluginExtensions?.["graphiti-openclaw-plugin"]?.["capture-status"])
+      .find((value) => value?.status === "error");
+  await waitFor(() => captureStatus() !== undefined);
+  const status = captureStatus();
   assert.equal(status.status, "error");
   assert.equal(status.reason, "limit");
   assert.equal(status.retryIntervalSeconds, 30);

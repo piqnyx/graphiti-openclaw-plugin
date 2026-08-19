@@ -725,6 +725,15 @@ export function createCapturePipeline(params: {
             action: "snapshot_rolled_back_resuming_from_durable_watermark",
             ...(error.details ?? {}),
           });
+          // Both versions of the message in full, behind the operator's content
+          // switch. Truncation is what kept the last three divergences guesswork.
+          if (error.content) {
+            logger.debugContent(
+              "capture_cursor_divergence",
+              { agentId, group_id: agentId, saga: sessionKey },
+              error.content,
+            );
+          }
           publishCaptureError(agentId, sessionKey, "cursor", error);
           return;
         }

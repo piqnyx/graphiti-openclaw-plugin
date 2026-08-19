@@ -767,6 +767,11 @@ export function createCapturePipeline(params: {
             messages: delta.length,
             userMessages: delta.filter((message) => message.role === "user").length,
             assistantMessages: delta.filter((message) => message.role === "assistant").length,
+            // Identity comes from the gateway timestamp; anything without one falls
+            // back to text comparison, which is what used to stall capture. Report the
+            // ratio so a channel that stops supplying timestamps is visible at once.
+            timestamped: snapshot.filter((message) => message.timestamp !== undefined).length,
+            snapshotMessages: snapshot.length,
             eventSuccess: event.success,
             durationMs: event.durationMs,
             durableQueueDepth: engine.queueDepth(agentId),

@@ -37,7 +37,7 @@ const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\
  * for the live prompt; storing it would put the wrapper itself into the graph and
  * let extraction mint entities out of it.
  */
-const TRANSCRIPT_PREFIX_RE = /^\s*\[[^\]\n]{0,160}transcript[^\]\n]{0,160}\]\s*:\s*/i;
+const TRANSCRIPT_PREFIX_RE = /(^|\n)[ \t]*\[[^\]\n]{0,160}transcript[^\]\n]{0,160}\][ \t]*:[ \t]*/gi;
 /**
  * TTS directives the model writes into its own reply.
  *
@@ -68,11 +68,33 @@ type ContentBlock = {
 type MessageLike = {
   role?: unknown;
   content?: unknown;
+  timestamp?: unknown;
+  /**
+   * Set by the gateway on a message carrying transient current-turn runtime
+   * context. Such a message exists only on the turn that produced it and is
+   * stripped on replay, so treating it as history makes the transcript look
+   * rewritten on the very next observation.
+   */
+  runtimeContextCarrier?: unknown;
 };
 
 export type ConversationMessage = {
   role: "user" | "assistant";
   text: string;
+  /**
+   * Creation time in ms, straight from the gateway's own message record.
+   *
+   * OpenClaw rewrites message *text* between observations -- a voice turn arrives
+   * as `[Audio transcript ...]: "…"` on the live turn and comes back with the
+   * marker relocated on the next one, and assistant replies lose their blank
+   * lines once rendered. Identity therefore cannot be the text. `timestamp` is
+   * assigned when the message is created and is not optional in the gateway's
+   * UserMessage/AssistantMessage, so it survives every rewrite we have seen.
+   *
+   * Optional here only because a channel that somehow omits it must degrade to
+   * text comparison rather than lose capture.
+   */
+  timestamp?: number;
 };
 
 export type RecallQueryOptions = {
@@ -97,9 +119,17 @@ export function stripInjectedContexts(text: string): string {
     .replace(OPENVIKING_MEMORIES_RE, " ");
 }
 
-/** Remove the transcription provenance marker and unwrap the quoted transcript. */
+/**
+ * Remove the transcription provenance marker and unwrap the quoted transcript.
+ *
+ * The marker is not always first. OpenClaw stores a voice turn as the plain text
+ * followed by the marked-up transcript, so anchoring the pattern to the start of
+ * the message left the wrapper sitting in the middle -- and extraction then mints
+ * entities out of the words "Audio transcript machine-generated untrusted".
+ * Matching at any line start removes it wherever the gateway put it.
+ */
 function stripTranscriptWrapper(text: string): string {
-  const withoutMarker = text.replace(TRANSCRIPT_PREFIX_RE, "");
+  const withoutMarker = text.replace(TRANSCRIPT_PREFIX_RE, "$1");
   if (withoutMarker === text) return text;
 
   const trimmed = withoutMarker.trim();
@@ -155,10 +185,15 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
     if (!rawMessage || typeof rawMessage !== "object") continue;
     const message = rawMessage as MessageLike;
     if (message.role !== "user" && message.role !== "assistant") continue;
+    if (message.runtimeContextCarrier === true) continue;
     const text = sanitizeConversationText(textFromContent(message.content));
     if (!text) continue;
     if (message.role === "user" && text.startsWith(SESSION_RESET_PROMPT_PREFIX)) continue;
-    result.push({ role: message.role, text });
+    const timestamp =
+      typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
+        ? message.timestamp
+        : undefined;
+    result.push(timestamp === undefined ? { role: message.role, text } : { role: message.role, text, timestamp });
   }
   return result;
 }

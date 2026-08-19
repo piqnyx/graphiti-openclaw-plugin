@@ -28,6 +28,15 @@ const OPENCLAW_UNCLOSED_CONTEXT_RE = /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>[\s\S
  * collapsed — anything less certain would risk eating a genuine repetition.
  */
 const WHOLE_TEXT_DUPLICATE_RE = /^([\s\S]+)\n\1$/;
+/**
+ * The same duplicate, with the quotes the transcript marker left behind.
+ *
+ * A stored voice turn reads `текст"\n[Audio transcript …]: "текст`. Removing the
+ * marker leaves `текст"\n"текст`, which is the same sentence twice but no longer
+ * an exact duplicate, so the plain rule above walks past it and both copies reach
+ * the graph.
+ */
+const QUOTED_DUPLICATE_RE = /^([\s\S]+?)"?\n"?\1$/;
 const CONVERSATION_METADATA_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata)\s*(?:\([^)]+\))?\s*:\s*```(?:json)?[\s\S]*?```/gi;
 const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\S]*?```/gi;
@@ -159,7 +168,9 @@ export function sanitizeConversationText(text: string): string {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
-    .replace(WHOLE_TEXT_DUPLICATE_RE, "$1");
+    .replace(WHOLE_TEXT_DUPLICATE_RE, "$1")
+    .replace(QUOTED_DUPLICATE_RE, "$1")
+    .trim();
 }
 
 export function textFromContent(content: unknown): string {

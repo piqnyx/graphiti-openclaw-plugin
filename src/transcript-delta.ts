@@ -57,24 +57,41 @@ export class TranscriptCursorError extends Error {
  * before this existed.
  */
 /**
+ * The message text as it survives a round trip through the gateway.
+ *
+ * A reply is stored, sent, and handed back with its blank lines flattened: the
+ * live turn carries "в самый раз. 🍷\n\nЧёрное море", history returns
+ * "в самый раз. 🍷 Чёрное море" -- 236 characters against 235, one paragraph
+ * break, and every hash of it differs. Whitespace is the only thing observed to
+ * change, so collapsing runs of it is enough to make the two forms comparable
+ * without weakening the comparison into a fuzzy match.
+ *
+ * Comparison only. What reaches the graph keeps the author's line breaks.
+ */
+function canonicalText(text: string): string {
+  return text.replace(/\s+/gu, " ").trim();
+}
+
+/**
  * Is this the same message seen again?
  *
- * Any shared witness settles it, and the text is the witness of last resort.
+ * Either witness settles it, and for most of the transcript only one is left.
  *
- * Requiring a particular field to agree is what kept failing. The gateway hands
- * the same message over with a timestamp on the turn it happens and without one
- * when it comes back as history -- observed live as `timestamped=2` against
- * `snapshotMessages=4` -- so a comparison anchored on the timestamp made messages
- * stop matching themselves. And the text alone cannot carry identity either,
- * because the gateway rewrites it: markers relocate, blank lines collapse.
+ * The gateway names a message on the turn it happens and strips those names when
+ * it hands the same message back as history: measured live, 13 of 15 messages in
+ * one snapshot carried no timestamp, no responseId, nothing. So identity cannot
+ * rest on the names, which is what the previous attempt assumed -- they help on
+ * the current turn and are simply absent everywhere else.
  *
- * So absence of a witness means that witness has nothing to say, never that the
- * messages differ. Only a message that shares no witness and whose text has also
- * changed is genuinely unrecognisable -- and that is worth refusing to guess about.
+ * That leaves the text, which the gateway also rewrites, but only by flattening
+ * whitespace. Comparing the canonical form covers the rewrite; the names cover
+ * the case where a fresh message is quoted back with genuinely different text.
+ * Neither alone was enough, which is why both are here.
  */
 function sameMessage(a: ConversationMessage, b: ConversationMessage): boolean {
   if (a.role !== b.role) return false;
   if (a.text === b.text) return true;
+  if (canonicalText(a.text) === canonicalText(b.text)) return true;
   const mine = a.witnesses;
   const theirs = b.witnesses;
   if (!mine?.length || !theirs?.length) return false;

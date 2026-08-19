@@ -94,6 +94,18 @@ const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
 export const SESSION_RESET_PROMPT_PREFIX = "A new session was started via /new or /reset";
+/**
+ * The gateway's stand-in for a message it could not render as text.
+ *
+ * A voice turn arrives as several transcript entries -- the transcription, a
+ * duplicate of it, and this stub. Captured, it becomes a line the user never
+ * said: recall history has been showing "[Вит] (no content)" all along, and the
+ * same entry would reach the graph as an episode message.
+ *
+ * Matched exactly, after sanitisation, so a sentence that merely contains the
+ * phrase survives.
+ */
+const EMPTY_CONTENT_PLACEHOLDER = "(no content)";
 
 type ContentBlock = {
   type?: unknown;
@@ -295,6 +307,7 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
     const text = sanitizeConversationText(textFromContent(message.content));
     if (!text) continue;
     if (message.role === "user" && text.startsWith(SESSION_RESET_PROMPT_PREFIX)) continue;
+    if (text === EMPTY_CONTENT_PLACEHOLDER) continue;
     const timestamp =
       typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
         ? message.timestamp

@@ -536,3 +536,24 @@ test("the note marker is added at the boundary, not by whoever wrote the note", 
     "text that already says [note] keeps it as ordinary words; the boundary still adds its own",
   );
 });
+
+test("a batch caught by shutdown still gets its chance to land", async (t) => {
+  // The grace window exists for exactly this: something is in the queue when the
+  // gateway is asked to stop. Closing the transport before draining made the
+  // window useless -- every attempt inside it failed at once with "client is
+  // shutting down" and the batch waited for the next process instead.
+  const calls = installFetch(t, committingCaptureHandlers());
+  const runtime = makeRuntime({ autoCapture: true, bufferLimit: 1 });
+  await call(runtime.tools, "graphiti_note", { note: "Вит живёт в Григолети" }, {
+    agentId: "main",
+    sessionKey: "agent:main:telegram:1",
+  });
+
+  await runtime.hooks.get("gateway_stop")();
+  resetCaptureRuntimeForTests();
+
+  assert.ok(
+    calls.some((params) => params.name === "add_memory"),
+    "the queued batch was submitted during the drain, not left for the next start",
+  );
+});

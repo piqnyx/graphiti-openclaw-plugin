@@ -61,6 +61,8 @@ export type CapturePipeline = {
   handleAgentEnd: (rawEvent: unknown, ctx?: HookContext) => void;
   shutdown: () => Promise<void>;
   captureNote: (agentId: string, sessionKey: string, note: string) => void;
+  /** The last few conversation messages of a session, straight from the store. */
+  recentConversation: (agentId: string, sessionKey: string, limit: number) => ConversationMessage[];
   localCaptureState: (agentId: string) => LocalCaptureState;
 };
 
@@ -957,6 +959,38 @@ export function createCapturePipeline(params: {
       engine.appendSynthetic(agentId, sessionKey, { role: "assistant", text: note });
     };
 
+    /**
+     * Recent history for recall, read where capture reads it.
+     *
+     * The hook payload is a rendering of the transcript, not the transcript: it
+     * repeats the current message and shows a voice turn as "(no content)", and
+     * both went into every search query. Reading the store gives recall the same
+     * text the graph was built from, which is what makes the query match it.
+     */
+    const recentConversation = (
+      agentId: string,
+      sessionKey: string,
+      limit: number,
+    ): ConversationMessage[] => {
+      try {
+        const store = storeFor(agentId);
+        const sessionId = store?.currentSessionId(sessionKey);
+        if (!store || !sessionId) return [];
+        return store
+          .readTail(sessionId, limit)
+          .flatMap((row) => extractConversationMessages([row.message]));
+      } catch (error) {
+        // Recall degrades to a query without history; capture is unaffected.
+        logger.debug("recall_history_unavailable", {
+          agentId,
+          group_id: agentId,
+          saga: sessionKey,
+          error: errorText(error),
+        });
+        return [];
+      }
+    };
+
     const localCaptureState = (agentId: string): LocalCaptureState => {
       const backend = lastQueueStatusByAgent.get(agentId);
       const queuedBatches = engine.queueDepth(agentId);
@@ -999,6 +1033,7 @@ export function createCapturePipeline(params: {
       captureLease,
       statusHost,
       handleAgentEnd,
+      recentConversation,
       shutdown,
       captureNote,
       localCaptureState,

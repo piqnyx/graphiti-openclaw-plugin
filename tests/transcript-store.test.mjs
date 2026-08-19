@@ -112,3 +112,18 @@ test("a long session is read in slices that continue where the last one stopped"
   assert.deepEqual(second.rows.map((row) => row.seq), [3, 4, 5]);
   assert.equal(second.scannedThrough, 5);
 });
+
+test("the tail comes back oldest first, and machinery does not eat the budget", (t) => {
+  const { path, db } = makeDb(t);
+  addEvent(db, "s", 0, say("e0", "user", "первое"));
+  addEvent(db, "s", 1, say("e1", "toolResult", "NOT_FOUND"));
+  addEvent(db, "s", 2, { type: "thinking_level_change", id: "e2" });
+  addEvent(db, "s", 3, say("e3", "assistant", "второе"));
+  addEvent(db, "s", 4, say("e4", "user", "третье"));
+
+  const store = new TranscriptStore(path);
+  // Asking for two conversation rows must not return one because a tool result
+  // happened to sit between them.
+  assert.deepEqual(store.readTail("s", 2).map((row) => row.eventId), ["e3", "e4"]);
+  assert.deepEqual(store.readTail("s", 10).map((row) => row.eventId), ["e0", "e3", "e4"]);
+});

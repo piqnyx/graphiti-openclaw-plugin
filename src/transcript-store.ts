@@ -48,6 +48,15 @@ export type TranscriptRead = {
  */
 const MAX_ROWS_PER_READ = 500;
 
+/**
+ * How many raw rows to look at per conversation row wanted, when reading a tail.
+ *
+ * Tool calls, tool results and thinking-only turns sit between the messages, so
+ * asking for exactly N rows would come back short. Four is generous against the
+ * densest turns observed and still bounded.
+ */
+const TAIL_OVERSCAN = 4;
+
 export type TranscriptRow = {
   seq: number;
   eventId: string;
@@ -151,30 +160,63 @@ export class TranscriptStore {
     const result: TranscriptRow[] = [];
     let scannedThrough = afterSeq;
     for (const row of rows) {
-      if (typeof row.seq !== "number" || typeof row.json !== "string") continue;
-      scannedThrough = Math.max(scannedThrough, row.seq);
-      let event: unknown;
-      try {
-        event = JSON.parse(row.json);
-      } catch {
-        // One unreadable row must not stop the rest of the conversation.
-        continue;
-      }
-      if (!isRecord(event) || event.type !== "message") continue;
-      const message = event.message;
-      if (!isRecord(message)) continue;
-      if (message.role !== "user" && message.role !== "assistant") continue;
-
-      const eventId = typeof event.id === "string" ? event.id : "";
-      if (!eventId) continue;
-      const parentId = typeof event.parentId === "string" ? event.parentId : undefined;
-
-      if (this.isInternal(sessionId, eventId, message)) continue;
-      if (parentId && this.isInternal(sessionId, parentId)) continue;
-
-      result.push({ seq: row.seq, eventId, ...(parentId ? { parentId } : {}), message });
+      if (typeof row.seq === "number") scannedThrough = Math.max(scannedThrough, row.seq);
+      const parsed = this.toConversationRow(sessionId, row);
+      if (parsed) result.push(parsed);
     }
     return { rows: result, scannedThrough };
+  }
+
+  /** One stored row as conversation, or nothing when it is not conversation. */
+  private toConversationRow(
+    sessionId: string,
+    row: { seq: unknown; json: unknown },
+  ): TranscriptRow | undefined {
+    if (typeof row.seq !== "number" || typeof row.json !== "string") return undefined;
+    let event: unknown;
+    try {
+      event = JSON.parse(row.json);
+    } catch {
+      // One unreadable row must not stop the rest of the conversation.
+      return undefined;
+    }
+    if (!isRecord(event) || event.type !== "message") return undefined;
+    const message = event.message;
+    if (!isRecord(message)) return undefined;
+    if (message.role !== "user" && message.role !== "assistant") return undefined;
+
+    const eventId = typeof event.id === "string" ? event.id : "";
+    if (!eventId) return undefined;
+    const parentId = typeof event.parentId === "string" ? event.parentId : undefined;
+
+    if (this.isInternal(sessionId, eventId, message)) return undefined;
+    if (parentId && this.isInternal(sessionId, parentId)) return undefined;
+
+    return { seq: row.seq, eventId, ...(parentId ? { parentId } : {}), message };
+  }
+
+  /**
+   * The newest conversation rows, oldest first.
+   *
+   * Recall needs the recent past, not the whole session, and it needs the same
+   * rows capture sees. Reading the hook payload instead is what put a doubled
+   * message and a "(no content)" stub into every search query: the delivered
+   * history is a rendering, this is the record.
+   */
+  readTail(sessionId: string, limit: number): TranscriptRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT e.seq AS seq, e.event_json AS json FROM transcript_events e " +
+          "WHERE e.session_id = ? ORDER BY e.seq DESC LIMIT ?",
+      )
+      .all(sessionId, Math.max(1, limit) * TAIL_OVERSCAN) as Array<{ seq: unknown; json: unknown }>;
+    const kept: TranscriptRow[] = [];
+    for (const row of rows) {
+      const parsed = this.toConversationRow(sessionId, row);
+      if (parsed) kept.push(parsed);
+      if (kept.length >= limit) break;
+    }
+    return kept.reverse();
   }
 
   close(): void {

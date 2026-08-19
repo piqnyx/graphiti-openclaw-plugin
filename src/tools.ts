@@ -676,17 +676,19 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_note",
       label: "Note something to remember (Graphiti)",
       description:
-        "Record one lasting fact, or correct one memory has wrong. The conversation is captured automatically, " +
-        "so do NOT use this for things merely said — only when the user asks you to remember, or states a lasting " +
-        "preference or rule. Write it so it still makes sense months later: full names, no pronouns. " +
-        "Correcting? Give the right version and say what was wrong in the same sentence — that contradiction is what " +
-        "retires the old fact instead of keeping both. It joins this conversation and is searchable once the batch commits.",
+        "Note one lasting fact worth remembering — the moment you would say 'ah, I'll remember that'. " +
+        "The conversation is captured automatically, so not for things merely said: only when asked to remember, " +
+        "or for a lasting preference, rule or trait. " +
+        "Write a statement about the world, in the third person, as an encyclopedia would: 'Vit calls OpenViking \"viking\" for short'. " +
+        "Never address memory and never describe your own actions — 'the user asked me to record' is not a fact about " +
+        "the world and becomes a wrong one once stored. Full names, no pronouns, still true months from now. " +
+        "It joins this conversation and is searchable once the batch commits.",
       parameters: {
         type: "object",
         properties: {
           note: {
             type: "string",
-            description: "The fact to remember, as one or a few self-contained sentences.",
+            description: "The fact, stated in the third person as one or a few self-contained sentences.",
           },
           title: {
             type: "string",

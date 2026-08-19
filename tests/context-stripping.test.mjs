@@ -66,13 +66,15 @@ test("single-message recall query keeps the newest tail after sanitization", () 
   assert.equal(query, "ghijk");
 });
 
-test("history-aware recall query includes recent sanitized context and keeps current prompt", () => {
+test("history-aware recall query includes recent context and keeps current prompt", () => {
+  // History now arrives already extracted, read from the transcript store, so the
+  // stripping happened upstream and what reaches here is plain conversation.
   const query = buildRecallQuery(
     "А как его собаку звали?",
     [
-      { role: "user", content: "старое сообщение, которое не должно войти" },
-      { role: "assistant", content: "обсуждали Игоря <graphiti-context>hidden</graphiti-context>" },
-      { role: "user", content: "Он живёт в Батуми <relevant-memories>hidden viking</relevant-memories>" },
+      { role: "user", text: "старое сообщение, которое не должно войти" },
+      { role: "assistant", text: "обсуждали Игоря" },
+      { role: "user", text: "Он живёт в Батуми" },
     ],
     {
       useHistory: true,
@@ -83,7 +85,6 @@ test("history-aware recall query includes recent sanitized context and keeps cur
   );
 
   assert.doesNotMatch(query, /старое сообщение/);
-  assert.doesNotMatch(query, /hidden|graphiti-context|relevant-memories/);
   assert.match(query, /\[assistant\] обсуждали Игоря/);
   assert.match(query, /\[user\] Он живёт в Батуми/);
   assert.match(query, /\[user\] А как его собаку звали\?/);
@@ -93,8 +94,8 @@ test("history-aware recall query removes duplicate current user prompt from hist
   const query = buildRecallQuery(
     "текущий вопрос",
     [
-      { role: "assistant", content: "предыдущий ответ" },
-      { role: "user", content: "текущий вопрос" },
+      { role: "assistant", text: "предыдущий ответ" },
+      { role: "user", text: "текущий вопрос" },
     ],
     {
       useHistory: true,

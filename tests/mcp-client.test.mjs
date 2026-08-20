@@ -305,6 +305,76 @@ test("a queued UUID is not submitted again while a live backend worker owns it",
   assert.equal(submissions, 1);
 });
 
+function ownedByBackend(uuid, { committedAfter = 3 } = {}) {
+  let episodeReads = 0;
+  let submissions = 0;
+  const fetchImpl = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    const handshake = installHandshake(payload);
+    if (handshake) return handshake;
+    const name = payload.params.name;
+    if (name === "get_episodes_by_ref") {
+      episodeReads += 1;
+      return toolResponse(payload.id, {
+        episodes: episodeReads >= committedAfter ? [{ uuid }] : [],
+      });
+    }
+    if (name === "get_queue_status") {
+      return toolResponse(payload.id, healthyQueue("main", {
+        attempts: 1,
+        episode_uuid: uuid,
+        worker_running: true,
+      }));
+    }
+    if (name === "get_saga") {
+      return toolResponse(payload.id, validSaga({ first: uuid, last: uuid, count: 1 }));
+    }
+    if (name === "add_memory") {
+      submissions += 1;
+      return toolResponse(payload.id, { message: "queued" });
+    }
+    throw new Error(`unexpected tool ${name}`);
+  };
+  return { fetchImpl, submissions: () => submissions };
+}
+
+const replayedHead = {
+  name: "s-1",
+  jsonBody: "{}",
+  groupId: "main",
+  saga: "session",
+  referenceTime: "2026-08-18T00:00:00.000Z",
+  previousEpisodeUuids: [],
+};
+
+test("a head that outlived a restart waits for the extraction already running", async (t) => {
+  // The Saga tail is still the predecessor while the backend extracts, so asking
+  // "is it committed?" answers no about work that is merely unfinished. Submitting
+  // then would hand the backend a second task for the same UUID, and both runs
+  // would attach the episode after the same predecessor -- a second chain head.
+  const originalFetch = globalThis.fetch;
+  const uuid = "66666666-6666-4666-8666-666666666666";
+  const backend = ownedByBackend(uuid);
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = backend.fetchImpl;
+
+  await fastClient().addMemory({ ...replayedHead, uuid, replayed: true });
+  assert.equal(backend.submissions(), 0);
+});
+
+test("an ordinary head still hands off immediately", async (t) => {
+  // The preflight is the exception, not the new rule: normal work must not pay a
+  // queue round-trip before enqueueing.
+  const originalFetch = globalThis.fetch;
+  const uuid = "77777777-7777-4777-8777-777777777777";
+  const backend = ownedByBackend(uuid);
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = backend.fetchImpl;
+
+  await fastClient().addMemory({ ...replayedHead, uuid });
+  assert.equal(backend.submissions(), 1);
+});
+
 test("a lost add_memory HTTP response is observed before any resubmit", async (t) => {
   const originalFetch = globalThis.fetch;
   const uuid = "55555555-5555-4555-8555-555555555555";

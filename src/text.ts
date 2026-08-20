@@ -355,3 +355,25 @@ export function buildRecallBlockDetailed(
     skippedFacts,
   };
 }
+
+/**
+ * The texts of facts still in force.
+ *
+ * A fact carries `invalid_at` once the graph decided something later contradicted
+ * it. `graphiti_search` offers those on request and marks them `[outdated]`,
+ * because looking into history is the point of a search. Recall is the opposite:
+ * it speaks into the model's context unasked, and a superseded fact injected
+ * beside the fact that superseded it is a contradiction the model has no way to
+ * resolve -- it reads both as currently true.
+ */
+export function factTextsInForce(facts: readonly unknown[]): string[] {
+  const texts: string[] = [];
+  for (const entry of facts) {
+    if (!entry || typeof entry !== "object") continue;
+    const fact = entry as { fact?: unknown; invalid_at?: unknown };
+    if (typeof fact.invalid_at === "string" && fact.invalid_at.trim()) continue;
+    if (typeof fact.fact !== "string" || !fact.fact.trim()) continue;
+    texts.push(fact.fact);
+  }
+  return texts;
+}

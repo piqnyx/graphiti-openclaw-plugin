@@ -7,6 +7,7 @@ import {
   buildRecallBlockDetailed,
   extractConversationMessages,
   buildRecallQuery,
+  factTextsInForce,
   stripInjectedContexts,
 } from "../dist/text.js";
 
@@ -65,6 +66,17 @@ test("recall query strips injected context before bounding", () => {
     { useHistory: false, historyMaxMessages: 1, historyMaxChars: 100, maxChars: 100 },
   );
   assert.equal(query, "hello   world");
+});
+
+test("recall drops facts the graph has superseded", () => {
+  const texts = factTextsInForce([
+    { fact: "Вит живёт в Григолети" },
+    { fact: "Вит использует Graphiti", invalid_at: "2026-08-20T09:50:11Z" },
+    { fact: "   ", invalid_at: null },
+    { fact: "Дед Антон женат на Марине", invalid_at: "" },
+    "не объект",
+  ]);
+  assert.deepEqual(texts, ["Вит живёт в Григолети", "Дед Антон женат на Марине"]);
 });
 
 test("recall XML escapes fact-controlled markup", () => {

@@ -12,6 +12,8 @@ import { GraphitiMcpClient } from "./mcp-client.js";
 import {
   buildRecallBlockDetailed,
   buildRecallQuery,
+  factTextsInForce,
+  isSupersededFact,
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
@@ -193,9 +195,7 @@ export function register(api: OpenClawPluginApi): void {
         const started = Date.now();
         try {
           const facts = await client.searchFacts(query, agentId, cfg.recallLimit);
-          const factTexts = facts
-            .map((fact) => (typeof fact.fact === "string" ? fact.fact : ""))
-            .filter(Boolean);
+          const factTexts = factTextsInForce(facts);
           const recallBlock = buildRecallBlockDetailed(factTexts, cfg.recallMaxInjectedChars);
           const block = recallBlock.block;
           logger.debugContent(
@@ -204,6 +204,7 @@ export function register(api: OpenClawPluginApi): void {
               agentId,
               group_id: agentId,
               retrievedFacts: factTexts.length,
+              supersededFacts: facts.filter(isSupersededFact).length,
               injectedFacts: recallBlock.injectedFacts,
               skippedFacts: recallBlock.skippedFacts,
               recallLimit: cfg.recallLimit,

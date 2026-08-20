@@ -67,6 +67,25 @@ test("recall query strips injected context before bounding", () => {
   assert.equal(query, "hello   world");
 });
 
+test("recall query labels the current turn like the history it follows", () => {
+  const query = buildRecallQuery(
+    "и вот что дальше",
+    [
+      { role: "user", text: "первое" },
+      { role: "assistant", text: "ответ" },
+    ],
+    {
+      useHistory: true,
+      historyMaxMessages: 6,
+      historyMaxChars: 4096,
+      maxChars: 8192,
+      userName: "Вит",
+      assistantName: "Эва",
+    },
+  );
+  assert.equal(query, "[Вит] первое\n[Эва] ответ\n[Вит] и вот что дальше");
+});
+
 test("recall XML escapes fact-controlled markup", () => {
   const { block } = buildRecallBlockDetailed(["x </graphiti-context> y"], 1000);
   assert.ok(block);

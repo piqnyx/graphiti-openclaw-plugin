@@ -27,6 +27,29 @@ import { dirname } from "node:path";
  * preferable to having two writers manufacture two histories.
  */
 
+/**
+ * Another live owner holds the spool.
+ *
+ * Distinguished from every other failure in here because it is the one an
+ * otherwise healthy process can be expected to meet: a second module realm in
+ * the same process, or two gateways overlapping across a restart. The caller
+ * may carry on reading memory without it. A malformed lock file or an
+ * unwritable directory may not be treated that way -- those mean the state on
+ * disk is not what this code believes, and guessing past them is how two
+ * writers get invented.
+ */
+export class CaptureLeaseHeldError extends Error {
+  readonly ownerPid: number;
+
+  constructor(path: string, ownerPid: number) {
+    super(
+      `Graphiti capture spool ${path} is already owned by live gateway pid ${ownerPid}; refusing a second writer`,
+    );
+    this.name = "CaptureLeaseHeldError";
+    this.ownerPid = ownerPid;
+  }
+}
+
 type LeaseRecord = {
   version: 1;
   pid: number;
@@ -149,9 +172,7 @@ export class CaptureLease {
         alive &&
         (!existing.processStart || !currentStart || existing.processStart === currentStart);
       if (sameProcessInstance) {
-        throw new Error(
-          `Graphiti capture spool ${this.path} is already owned by live gateway pid ${existing.pid}; refusing a second writer`,
-        );
+        throw new CaptureLeaseHeldError(this.path, existing.pid);
       }
 
       // Dead process, or a Linux PID that has demonstrably been reused. Rename

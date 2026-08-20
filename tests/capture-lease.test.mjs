@@ -22,7 +22,14 @@ test("only one live process lease can own a spool", (t) => {
     if (second.isHeld()) second.release();
   });
 
-  assert.throws(() => second.acquire(), /already owned by live gateway pid/);
+  // The type carries the refusal, not just the sentence: register() keeps recall
+  // alive on this one error and rethrows every other.
+  assert.throws(() => second.acquire(), (error) => {
+    assert.equal(error.name, "CaptureLeaseHeldError");
+    assert.equal(error.ownerPid, process.pid);
+    assert.match(error.message, /already owned by live gateway pid/);
+    return true;
+  });
   first.release();
   assert.doesNotThrow(() => second.acquire());
   assert.equal(second.isHeld(), true);

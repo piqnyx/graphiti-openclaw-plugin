@@ -468,12 +468,34 @@ export class GraphitiMcpClient {
     return { facts: list(result.facts), entities: list(result.entities), episodes: list(result.episodes) };
   }
 
-  async searchFacts(query: string, groupId: string, limit: number): Promise<JsonObject[]> {
-    const result = await this.callTool("search_memory_facts", {
+  async searchFacts(
+    query: string,
+    groupId: string,
+    limit: number,
+    tuning: {
+      pool?: number;
+      rerank?: boolean;
+      minScore?: number | null;
+      contextMinScore?: number | null;
+      focus?: string;
+    } = {},
+  ): Promise<JsonObject[]> {
+    const args: JsonObject = {
       query,
       group_ids: groupId,
       max_facts: limit,
-    });
+    };
+    // Sent only when configured, so an unset deployment produces the request it
+    // produced before any of this existed.
+    if (tuning.pool && tuning.pool > 0) args.pool = tuning.pool;
+    if (tuning.rerank) args.rerank = true;
+    if (typeof tuning.minScore === "number") args.min_score = tuning.minScore;
+    if (typeof tuning.contextMinScore === "number") {
+      args.context_min_score = tuning.contextMinScore;
+    }
+    if (tuning.rerank && tuning.focus) args.focus = tuning.focus;
+
+    const result = await this.callTool("search_memory_facts", args);
     if (typeof result.error === "string") throw new Error(result.error);
     return Array.isArray(result.facts)
       ? result.facts.filter((fact): fact is JsonObject => isObject(fact))

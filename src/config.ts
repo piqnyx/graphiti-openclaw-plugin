@@ -18,6 +18,50 @@ export type GraphitiPluginConfig = {
   recallLimit: number;
   recallQueryMaxChars: number;
   recallMaxInjectedChars: number;
+  /**
+   * How many candidates recall examines before choosing `recallLimit` of them.
+   *
+   * Zero keeps the two the same number, which is what they were: each search
+   * method fetches twice the limit, so asking for eight facts looked at sixteen
+   * candidates and nothing below that depth could be reached by asking
+   * differently. Measured on a live graph, a question about a repository
+   * returned twenty-five facts about shell utilities while the facts about that
+   * repository sat unreachable at any requested size.
+   */
+  recallPool: number;
+  /**
+   * Score the candidates with a cross-encoder against the message just sent,
+   * rather than fusing the search methods by rank.
+   *
+   * Rank fusion has no notion of "none of these are relevant": its top result
+   * scores the same whether the graph holds the answer or holds cafe dishes. A
+   * cross-encoder scores each candidate against the question, which is what
+   * makes both a floor and an empty answer possible.
+   */
+  recallRerank: boolean;
+  /**
+   * Below this, a fact is not injected. Null keeps whatever the search recipe
+   * declares.
+   *
+   * The scale belongs to the reranker: a bge cross-encoder returns logits either
+   * side of zero, while a Cohere-shaped one returns 0..1. Measured with the
+   * latter on this graph, a question's one right answer scored 0.146 with the
+   * next candidate at 0.046, and a question the graph could not answer scored
+   * everything below 0.027.
+   */
+  recallMinScore: number | null;
+  /**
+   * The floor for a second pass scored against the recent conversation, taken
+   * only when the first pass admitted nothing. Null means the message decides
+   * alone.
+   *
+   * A message like "далеко это от меня вообще?" carries no word to rank by:
+   * scoring by it put every fact within a hundredth of every other, while the
+   * conversation knew that "это" was Poti and scored it 0.437. The scales
+   * differ, hence a floor of its own -- a transcript resembles everything a
+   * little, so its numbers run several times higher.
+   */
+  recallContextMinScore: number | null;
   recallUseHistory: boolean;
   recallHistoryMaxMessages: number;
   recallHistoryMaxChars: number;
@@ -63,6 +107,10 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   recallLimit: 8,
   recallQueryMaxChars: 6_000,
   recallMaxInjectedChars: 8_000,
+  recallPool: 0,
+  recallRerank: false,
+  recallMinScore: null,
+  recallContextMinScore: null,
   recallUseHistory: true,
   recallHistoryMaxMessages: 6,
   recallHistoryMaxChars: 4_000,
@@ -123,6 +171,15 @@ function integerValue(raw: unknown, fallback: number, name: string, min: number,
   if (raw === undefined) return fallback;
   if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
     throw new Error(`${name} must be an integer in [${min}, ${max}]`);
+  }
+  return raw;
+}
+
+/** A threshold, or nothing. Absent and null differ from zero: zero is a floor. */
+function optionalNumberValue(raw: unknown, name: string): number | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    throw new Error(`${name} must be a finite number or null`);
   }
   return raw;
 }
@@ -208,6 +265,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
   const allowed = new Set<keyof GraphitiPluginConfig>([
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
+    "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
     "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
     "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
@@ -226,6 +284,13 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     requestTimeoutMs: integerValue(raw.requestTimeoutMs, DEFAULT_CONFIG.requestTimeoutMs, "requestTimeoutMs", 1_000, 300_000),
     recallLimit: integerValue(raw.recallLimit, DEFAULT_CONFIG.recallLimit, "recallLimit", 1, 100),
     recallQueryMaxChars: integerValue(raw.recallQueryMaxChars, DEFAULT_CONFIG.recallQueryMaxChars, "recallQueryMaxChars", 32, 32_000),
+    recallPool: integerValue(raw.recallPool, DEFAULT_CONFIG.recallPool, "recallPool", 0, 500),
+    recallRerank: booleanValue(raw.recallRerank, DEFAULT_CONFIG.recallRerank, "recallRerank"),
+    recallMinScore: optionalNumberValue(raw.recallMinScore, "recallMinScore"),
+    recallContextMinScore: optionalNumberValue(
+      raw.recallContextMinScore,
+      "recallContextMinScore",
+    ),
     recallMaxInjectedChars: integerValue(raw.recallMaxInjectedChars, DEFAULT_CONFIG.recallMaxInjectedChars, "recallMaxInjectedChars", 128, 64_000),
     recallUseHistory: booleanValue(raw.recallUseHistory, DEFAULT_CONFIG.recallUseHistory, "recallUseHistory"),
     recallHistoryMaxMessages: integerValue(raw.recallHistoryMaxMessages, DEFAULT_CONFIG.recallHistoryMaxMessages, "recallHistoryMaxMessages", 1, 100),

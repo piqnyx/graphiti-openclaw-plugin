@@ -113,3 +113,25 @@ test("only a real invalid_at counts as superseded", () => {
   assert.equal(isSupersededFact({ fact: "x" }), false);
   assert.equal(isSupersededFact("не объект"), false);
 });
+
+test("recall tuning is absent from the request until it is configured", () => {
+  const defaults = parseConfig({});
+  assert.equal(defaults.recallPool, 0);
+  assert.equal(defaults.recallRerank, false);
+  assert.equal(defaults.recallMinScore, null);
+  assert.equal(defaults.recallContextMinScore, null);
+});
+
+test("a floor may be zero, and zero is not absent", () => {
+  // Absent means "whatever the recipe declares"; zero is a floor, and for a bge
+  // cross-encoder it is the one that separates relevant from not.
+  assert.equal(parseConfig({ recallMinScore: 0 }).recallMinScore, 0);
+  assert.equal(parseConfig({ recallMinScore: null }).recallMinScore, null);
+  assert.equal(parseConfig({ recallMinScore: -0.5 }).recallMinScore, -0.5);
+});
+
+test("recall tuning rejects what it cannot use", () => {
+  assert.throws(() => parseConfig({ recallMinScore: "0.1" }), /recallMinScore/);
+  assert.throws(() => parseConfig({ recallPool: 1.5 }), /recallPool/);
+  assert.throws(() => parseConfig({ recallRerank: "yes" }), /recallRerank/);
+});

@@ -194,7 +194,15 @@ export function register(api: OpenClawPluginApi): void {
 
         const started = Date.now();
         try {
-          const facts = await client.searchFacts(query, agentId, cfg.recallLimit);
+          const facts = await client.searchFacts(query, agentId, cfg.recallLimit, {
+            pool: cfg.recallPool,
+            rerank: cfg.recallRerank,
+            minScore: cfg.recallMinScore,
+            contextMinScore: cfg.recallContextMinScore,
+            // What the reranker scores against: the message just sent, not the
+            // transcript around it. The transcript is what found the candidates.
+            focus: currentPrompt,
+          });
           const factTexts = factTextsInForce(facts);
           const recallBlock = buildRecallBlockDetailed(factTexts, cfg.recallMaxInjectedChars);
           const block = recallBlock.block;

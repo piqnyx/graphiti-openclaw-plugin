@@ -158,6 +158,30 @@
       "adoptExistingHistoryOnFirstSight": {
         "type": "boolean",
         "description": "Skip a session's existing rows the first time it is seen. Off by default; only correct when that history is already in memory and reading it again would duplicate episodes."
+      },
+      "recallPool": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 500,
+        "description": "How many candidates recall examines before choosing recallLimit of them. 0 keeps them the same number."
+      },
+      "recallRerank": {
+        "type": "boolean",
+        "description": "Score candidates with a cross-encoder against the message just sent, instead of fusing search methods by rank."
+      },
+      "recallMinScore": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Below this a fact is not injected. Null keeps whatever the search recipe declares."
+      },
+      "recallContextMinScore": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Floor for a second pass scored against the recent conversation, taken only when the first admitted nothing. Null means the message decides alone."
       }
     }
   }

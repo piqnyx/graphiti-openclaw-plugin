@@ -365,13 +365,22 @@ export function buildRecallBlockDetailed(
  * it speaks into the model's context unasked, and a superseded fact injected
  * beside the fact that superseded it is a contradiction the model has no way to
  * resolve -- it reads both as currently true.
+ *
+ * The test for it is its own function because the count of what was dropped is
+ * logged from the call site, and a predicate written out twice is how the two
+ * places that label a speaker drifted apart.
  */
+export function isSupersededFact(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const invalidAt = (entry as { invalid_at?: unknown }).invalid_at;
+  return typeof invalidAt === "string" && invalidAt.trim().length > 0;
+}
+
 export function factTextsInForce(facts: readonly unknown[]): string[] {
   const texts: string[] = [];
   for (const entry of facts) {
-    if (!entry || typeof entry !== "object") continue;
-    const fact = entry as { fact?: unknown; invalid_at?: unknown };
-    if (typeof fact.invalid_at === "string" && fact.invalid_at.trim()) continue;
+    if (isSupersededFact(entry)) continue;
+    const fact = entry as { fact?: unknown };
     if (typeof fact.fact !== "string" || !fact.fact.trim()) continue;
     texts.push(fact.fact);
   }

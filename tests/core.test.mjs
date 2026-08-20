@@ -8,6 +8,7 @@ import {
   extractConversationMessages,
   buildRecallQuery,
   factTextsInForce,
+  isSupersededFact,
   stripInjectedContexts,
 } from "../dist/text.js";
 
@@ -77,6 +78,14 @@ test("recall drops facts the graph has superseded", () => {
     "не объект",
   ]);
   assert.deepEqual(texts, ["Вит живёт в Григолети", "Дед Антон женат на Марине"]);
+});
+
+test("only a real invalid_at counts as superseded", () => {
+  assert.equal(isSupersededFact({ fact: "x", invalid_at: "2026-08-20T09:50:11Z" }), true);
+  assert.equal(isSupersededFact({ fact: "x", invalid_at: "" }), false);
+  assert.equal(isSupersededFact({ fact: "x", invalid_at: null }), false);
+  assert.equal(isSupersededFact({ fact: "x" }), false);
+  assert.equal(isSupersededFact("не объект"), false);
 });
 
 test("recall XML escapes fact-controlled markup", () => {

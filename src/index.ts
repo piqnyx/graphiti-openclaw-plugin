@@ -13,6 +13,7 @@ import {
   buildRecallBlockDetailed,
   buildRecallQuery,
   factTextsInForce,
+  isSupersededFact,
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
@@ -203,7 +204,7 @@ export function register(api: OpenClawPluginApi): void {
               agentId,
               group_id: agentId,
               retrievedFacts: factTexts.length,
-              supersededFacts: facts.length - factTexts.length,
+              supersededFacts: facts.filter(isSupersededFact).length,
               injectedFacts: recallBlock.injectedFacts,
               skippedFacts: recallBlock.skippedFacts,
               recallLimit: cfg.recallLimit,

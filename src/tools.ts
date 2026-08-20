@@ -689,15 +689,17 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       description:
         "Note one lasting thing worth remembering — the moment you would say 'ah, that I'll remember'. " +
         "The conversation is already stored whole and by itself, so anything that was said is in memory " +
-        "whether you note it or not. A note is for what the conversation did not state outright: a habit you " +
+        "whether you note it or not, and whatever of it matters comes back on its own before later replies. " +
+        "A note neither speeds that up nor improves it. " +
+        "A note is for what the conversation did not state outright: a habit you " +
         "noticed, a preference that showed itself, a rule that will matter later, or something you were asked to keep. " +
         "Never retell what just happened — a digest of the last few turns is the one thing this tool must not hold. " +
         "Write it in the language being spoken: this description is in English, the note is not. " +
-        "A note in the wrong language mints a second set of entities -- Vit beside Вит, Grigoleti beside " +
-        "Григолети -- and no amount of later conversation merges them back. " +
+        "A note in another language mints a second, separate set of names for the same people and " +
+        "places, and nothing said afterwards merges them back. " +
         "State it about the world in the third person, full names, no pronouns, still true months from now. " +
-        "Never address memory and never describe your own actions — 'the user asked me to record' is not a fact about " +
-        "the world and becomes a wrong one once stored. " +
+        "Never address memory and never describe your own actions: being asked to remember something is a fact " +
+        "about the asking, not about the world, and it ages into a false one. " +
         "It joins this conversation and is searchable once the batch commits.",
       parameters: {
         type: "object",

@@ -306,7 +306,7 @@ export function buildRecallQuery(
     options.assistantName,
   );
   const combined = rendered
-    ? `${rendered}\n[user] ${currentPrompt}`
+    ? `${rendered}\n${formatRecallMessage({ role: "user", text: currentPrompt }, options.userName, options.assistantName)}`
     : currentPrompt;
   return keepTail(combined, options.maxChars).trim();
 }

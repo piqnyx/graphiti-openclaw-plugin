@@ -447,6 +447,7 @@ export function createCapturePipeline(params: {
         referenceTime,
         previousEpisodeUuids: sequence.previousEpisodeUuids,
         sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
+        replayed: entry.identityRestored === true,
       });
       const committedUuid = acceptedEpisodeUuid(result);
       if (committedUuid !== sequence.episodeUuid) {

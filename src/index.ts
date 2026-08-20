@@ -3,7 +3,8 @@ import {
   resolveDurableCaptureRoot,
   type CapturePipeline,
 } from "./capture-pipeline.js";
-import { acquireCaptureRuntime } from "./capture-runtime.js";
+import { CaptureLeaseHeldError } from "./capture-lease.js";
+import { acquireCaptureRuntime, type AcquireResult } from "./capture-runtime.js";
 import { parseConfig, type GraphitiPluginConfig } from "./config.js";
 import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
@@ -57,12 +58,32 @@ export function register(api: OpenClawPluginApi): void {
   let client: GraphitiMcpClient;
   let captureOutcome = "disabled";
 
+  let acquired: AcquireResult<CapturePipeline> | undefined;
   if (cfg.autoCapture) {
-    const acquired = acquireCaptureRuntime<CapturePipeline>({
-      fingerprint: JSON.stringify({ cfg, durableRoot: resolveDurableCaptureRoot() }),
-      isStopped: (candidate) => candidate.engine.isStopped(),
-      create: () => createCapturePipeline({ api, cfg, logger, excludedSessionPatterns }),
-    });
+    try {
+      acquired = acquireCaptureRuntime<CapturePipeline>({
+        fingerprint: JSON.stringify({ cfg, durableRoot: resolveDurableCaptureRoot() }),
+        isStopped: (candidate) => candidate.engine.isStopped(),
+        create: () => createCapturePipeline({ api, cfg, logger, excludedSessionPatterns }),
+      });
+    } catch (error) {
+      // Losing the race for the spool costs this registration its writing, and
+      // nothing else: reading memory needs only the MCP client. Failing the whole
+      // register took recall and the tools down with the capture, so a second
+      // module realm in one process ended up with no memory at all rather than
+      // with read-only memory. Every other failure here still stands -- a
+      // malformed lock or an unmigrated legacy spool means the state on disk is
+      // not what this code believes, and carrying on past that invents a writer.
+      if (!(error instanceof CaptureLeaseHeldError)) throw error;
+      captureOutcome = "owned_elsewhere";
+      logger.warn("capture_spool_owned_elsewhere", {
+        ownerPid: error.ownerPid,
+        detail: "another live owner holds the spool; this registration reads memory but does not write it",
+      });
+    }
+  }
+
+  if (acquired) {
     capture = acquired.runtime;
     captureOutcome = acquired.outcome;
     client = capture.client;
@@ -92,7 +113,10 @@ export function register(api: OpenClawPluginApi): void {
       logger,
       excludedSessionPatterns,
       captureNote: (agentId, sessionKey, note) => {
-        if (!capture) throw new Error("Graphiti auto-capture is disabled; notes cannot be durably queued");
+        if (!capture)
+          throw new Error(
+            "Graphiti is not writing memory in this process, so a note cannot be queued: auto-capture is off, or another live owner holds the capture spool",
+          );
         capture.captureNote(agentId, sessionKey, note);
       },
       localCaptureState: (agentId) =>

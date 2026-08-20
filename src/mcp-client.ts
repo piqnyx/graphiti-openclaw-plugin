@@ -28,6 +28,23 @@ export type SagaState = {
   integrityErrors: string[];
 };
 
+/**
+ * Ownership of one UUID by the backend's episode queue.
+ *
+ * A queued UUID with no worker is stranded RAM rather than useful ownership. The
+ * server normally self-heals that in get_queue_status, and after the ambiguity
+ * grace, re-submitting the same UUID is the safe kick if it remains stranded.
+ *
+ * Both the replay preflight and the observation loop ask this question, so it is
+ * written once: the two callers must never drift into disagreeing about who owns
+ * an episode.
+ */
+function queueOwns(status: QueueStatus, uuid: string): boolean {
+  const active = status.episodeUuid === uuid;
+  const queued = status.queuedEpisodeUuids.includes(uuid);
+  return active || (queued && status.workerRunning !== false);
+}
+
 export type QueueStatus = {
   groupId: string;
   blocked: boolean;
@@ -205,6 +222,11 @@ export class GraphitiMcpClient {
     this.resetSession();
   }
 
+  /** Whether the backend is running this episode, or holds it behind a live worker. */
+  private async backendOwnsEpisode(groupId: string, uuid: string): Promise<boolean> {
+    return queueOwns(await this.getQueueStatus(groupId), uuid);
+  }
+
   private assertOpen(): void {
     if (this.lifecycle.signal.aborted) throw new McpClientClosedError();
   }
@@ -217,6 +239,17 @@ export class GraphitiMcpClient {
    * graph or sleep before enqueueing ordinary work. Only an ambiguous post-send
    * transport outcome enters the observation/grace path before the same UUID may
    * be submitted again. The durable caller keeps the head on disk the whole time.
+   *
+   * `replayed` is the exception, and it exists because the graph answers a
+   * narrower question than the one being asked. A restart mid-delivery leaves a
+   * head whose episode the backend may still be extracting -- minutes of work --
+   * and during that time the Saga tail is still the predecessor, so "is it
+   * committed?" answers no while the truthful answer is "not yet, it is running".
+   * Submitting then hands the backend a second task for the same UUID: its
+   * episode queue holds closures and does not dedupe, so the extraction runs
+   * twice and both runs attach the episode to the Saga after the same
+   * predecessor, which is how a chain grows a second head. A replayed head
+   * therefore asks the queue first and submits only if nobody owns the UUID.
    */
   async addMemory(params: {
     uuid: string;
@@ -228,6 +261,8 @@ export class GraphitiMcpClient {
     previousEpisodeUuids: string[];
     sagaPreviousEpisodeUuid?: string;
     sourceDescription?: string;
+    /** This head outlived a restart: the backend may already be working on it. */
+    replayed?: boolean;
   }): Promise<JsonObject> {
     const args: JsonObject = {
       uuid: params.uuid,
@@ -255,9 +290,11 @@ export class GraphitiMcpClient {
         return { uuid: params.uuid, persisted: true };
       }
 
-      lastSubmissionResult = await this.callToolOnce("add_memory", args);
-      if (typeof lastSubmissionResult.error === "string") {
-        throw new McpToolResultError(lastSubmissionResult.error);
+      if (!(params.replayed && (await this.backendOwnsEpisode(params.groupId, params.uuid)))) {
+        lastSubmissionResult = await this.callToolOnce("add_memory", args);
+        if (typeof lastSubmissionResult.error === "string") {
+          throw new McpToolResultError(lastSubmissionResult.error);
+        }
       }
     } catch (error) {
       if (isClientClosedError(error) || isDefinitiveMcpError(error)) throw error;
@@ -286,12 +323,7 @@ export class GraphitiMcpClient {
         continue;
       }
 
-      const activeHere = status.episodeUuid === params.uuid;
-      const queuedHere = status.queuedEpisodeUuids.includes(params.uuid);
-      // A queued UUID with no worker is stranded RAM rather than useful ownership.
-      // The server normally self-heals this in get_queue_status; after the ambiguity
-      // grace, re-submitting the same UUID is the safe kick if it remains stranded.
-      const backendOwnsUuid = activeHere || (queuedHere && status.workerRunning !== false);
+      const backendOwnsUuid = queueOwns(status, params.uuid);
       const submissionOldEnough =
         Date.now() - lastSubmissionAt >= this.deliveryResubmitGraceMs;
 

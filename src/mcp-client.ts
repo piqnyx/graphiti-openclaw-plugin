@@ -1,5 +1,8 @@
 type JsonObject = Record<string, unknown>;
 
+/** Ceiling on the text handed to the cross-encoder as the thing to rank against. */
+export const FOCUS_MAX_CHARS = 2_000;
+
 export const CUSTOM_EXTRACTION_PROMPT = `This JSON is a conversation between the two participants whose canonical names are in "participants.user" and "participants.assistant". "messages" is an ARRAY of message objects, each with a "text" field. Extract ALL entities from the "text" field of each message in the "messages" array. The participants often refer to each other and to people by name; a name may appear in slightly different forms (case, nicknames). When a mentioned name clearly refers to one of the participants, treat it as the same entity. Do not merge different people into one unless it is clearly the same person. A message whose "text" begins with "[note]" is not something either participant said out loud: it is a statement written into memory on purpose, about the world. Extract from it exactly as from any other text, but attribute what it says to whoever it names rather than to the speaker of the message, and never record that someone asked for something to be remembered. Drop the "[note]" marker itself; it is not part of any fact. If it restates something already said in this same batch, that is one fact, not two. Respect all other extraction rules.`;
 
 export const OPENCLAW_SOURCE_DESCRIPTION = "OpenClaw conversation batch";
@@ -508,7 +511,7 @@ export class GraphitiMcpClient {
       pool?: number;
       rerank?: boolean;
       minScore?: number | null;
-      contextMinScore?: number | null;
+      contextWeight?: number;
       focus?: string;
     } = {},
   ): Promise<JsonObject[]> {
@@ -522,10 +525,15 @@ export class GraphitiMcpClient {
     if (tuning.pool && tuning.pool > 0) args.pool = tuning.pool;
     if (tuning.rerank) args.rerank = true;
     if (typeof tuning.minScore === "number") args.min_score = tuning.minScore;
-    if (typeof tuning.contextMinScore === "number") {
-      args.context_min_score = tuning.contextMinScore;
+    // Only alongside a reranker: the server reads it in the cross-encoder branch and
+    // nowhere else, so sending it on its own would change the request and nothing else.
+    if (tuning.rerank && typeof tuning.contextWeight === "number" && tuning.contextWeight > 0) {
+      args.context_weight = tuning.contextWeight;
     }
-    if (tuning.rerank && tuning.focus) args.focus = tuning.focus;
+    // Bounded like the query is. The focus is a whole message, and a pasted wall of
+    // text went to the cross-encoder unabridged -- which is what used to return HTTP
+    // 500 from the local reranker on a single long pair.
+    if (tuning.rerank && tuning.focus) args.focus = tuning.focus.slice(0, FOCUS_MAX_CHARS);
 
     const result = await this.callTool("search_memory_facts", args);
     if (typeof result.error === "string") throw new Error(result.error);

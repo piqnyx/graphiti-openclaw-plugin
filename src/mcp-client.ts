@@ -512,10 +512,11 @@ export class GraphitiMcpClient {
       rerank?: boolean;
       minScore?: number | null;
       contextMinScore?: number | null;
+      minSpread?: number | null;
       vectorMinScore?: number | null;
       focus?: string;
     } = {},
-  ): Promise<JsonObject[]> {
+  ): Promise<{ facts: JsonObject[]; rankedBy: string }> {
     const args: JsonObject = {
       query,
       group_ids: groupId,
@@ -531,6 +532,9 @@ export class GraphitiMcpClient {
     }
     // Sent whether or not anything reranks: this floor decides what the database
     // hands over, and everything downstream only re-sorts what got out.
+    if (typeof tuning.minSpread === "number") {
+      args.min_spread = tuning.minSpread;
+    }
     if (typeof tuning.vectorMinScore === "number") {
       args.vector_min_score = tuning.vectorMinScore;
     }
@@ -541,9 +545,15 @@ export class GraphitiMcpClient {
 
     const result = await this.callTool("search_memory_facts", args);
     if (typeof result.error === "string") throw new Error(result.error);
-    return Array.isArray(result.facts)
-      ? result.facts.filter((fact): fact is JsonObject => isObject(fact))
-      : [];
+    return {
+      facts: Array.isArray(result.facts)
+        ? result.facts.filter((fact): fact is JsonObject => isObject(fact))
+        : [],
+      // Which scale the scores are on. Two passes rank on scales that are not
+      // comparable, and a floor read against the wrong one is how a threshold came
+      // to sit three times below its own noise and stay there.
+      rankedBy: typeof result.ranked_by === "string" ? result.ranked_by : "unknown",
+    };
   }
 
   private async callToolOnce(name: string, args: JsonObject): Promise<JsonObject> {

@@ -121,6 +121,7 @@ test("recall tuning is absent from the request until it is configured", () => {
   assert.equal(defaults.recallMinScore, null);
   assert.equal(defaults.recallContextMinScore, null);
   assert.equal(defaults.recallVectorMinScore, null);
+  assert.equal(defaults.recallMinSpread, null);
 });
 
 test("a floor may be zero, and zero is not absent", () => {

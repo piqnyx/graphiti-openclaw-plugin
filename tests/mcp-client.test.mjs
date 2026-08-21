@@ -95,8 +95,11 @@ test("MCP client initializes once and scopes fact search to group_id", async (t)
   };
 
   const client = fastClient();
-  const facts = await client.searchFacts("tea", "main", 6);
-  assert.equal(facts.length, 1);
+  const found = await client.searchFacts("tea", "main", 6);
+  assert.equal(found.facts.length, 1);
+  // A server that says nothing about the pass leaves the scores without a scale,
+  // so the absence is named rather than guessed at.
+  assert.equal(found.rankedBy, "unknown");
   const call = requests.find((request) => request.payload.method === "tools/call");
   assert.equal(call.payload.params.name, "search_memory_facts");
   assert.equal(call.payload.params.arguments.group_ids, "main");

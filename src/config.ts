@@ -77,6 +77,13 @@ export type GraphitiPluginConfig = {
    */
   recallContextMinScore: number | null;
   /**
+   * How much the top and bottom of a ranking must differ, as a fraction of the
+   * top, for it to count as a ranking at all. A reranker asked something it
+   * cannot answer scores everything about the same, high; the spread is what
+   * tells that apart, and the height is not.
+   */
+  recallMinSpread: number | null;
+  /**
    * The cosine floor on what the vector search returns at all, before anything
    * ranks it. Null leaves the library's own 0.6 -- which is what makes a wide pool
    * arrive narrow.
@@ -133,6 +140,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   recallRerank: false,
   recallMinScore: null,
   recallContextMinScore: null,
+  recallMinSpread: null,
   recallVectorMinScore: null,
   recallUseHistory: true,
   recallHistoryMaxMessages: 6,
@@ -288,7 +296,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
   const allowed = new Set<keyof GraphitiPluginConfig>([
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
-    "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore", "recallVectorMinScore",
+    "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore", "recallMinSpread", "recallVectorMinScore",
     "recallExpandTop", "recallExpandChars",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
     "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
@@ -314,6 +322,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     recallRerank: booleanValue(raw.recallRerank, DEFAULT_CONFIG.recallRerank, "recallRerank"),
     recallMinScore: optionalNumberValue(raw.recallMinScore, "recallMinScore"),
     recallContextMinScore: optionalNumberValue(raw.recallContextMinScore, "recallContextMinScore"),
+    recallMinSpread: optionalNumberValue(raw.recallMinSpread, "recallMinSpread"),
     recallVectorMinScore: optionalNumberValue(raw.recallVectorMinScore, "recallVectorMinScore"),
     recallMaxInjectedChars: integerValue(raw.recallMaxInjectedChars, DEFAULT_CONFIG.recallMaxInjectedChars, "recallMaxInjectedChars", 128, 64_000),
     recallUseHistory: booleanValue(raw.recallUseHistory, DEFAULT_CONFIG.recallUseHistory, "recallUseHistory"),

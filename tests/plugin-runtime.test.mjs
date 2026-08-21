@@ -242,6 +242,7 @@ test("every recall floor reaches the request under the name the server has", asy
       recallMinScore: 0.08,
       recallContextMinScore: 0.3,
       recallVectorMinScore: 0.25,
+      recallMinSpread: 0.2,
     }),
   );
   register(api);
@@ -258,6 +259,7 @@ test("every recall floor reaches the request under the name the server has", asy
   assert.equal(search.arguments.min_score, 0.08);
   assert.equal(search.arguments.context_min_score, 0.3);
   assert.equal(search.arguments.vector_min_score, 0.25);
+  assert.equal(search.arguments.min_spread, 0.2);
 });
 
 test("floors left unset are absent from the request, not sent as zero", async (t) => {
@@ -271,7 +273,7 @@ test("floors left unset are absent from the request, not sent as zero", async (t
   );
 
   const search = toolCalls.find((call) => call.name === "search_memory_facts");
-  for (const key of ["pool", "min_score", "context_min_score", "vector_min_score", "focus"]) {
+  for (const key of ["pool", "min_score", "context_min_score", "min_spread", "vector_min_score", "focus"]) {
     assert.ok(!(key in search.arguments), `${key} ушёл в запрос без настройки`);
   }
 });
@@ -297,6 +299,8 @@ test("recall reports the score of every fact it returned", async (t) => {
   // Rounded, in the order returned, and a fact the ranker never scored says so
   // rather than being reported as zero.
   assert.match(line, /scores=\[0\.4123,0\.09,null\]/);
+  // Which scale those numbers are on. Without it they are a column with no unit.
+  assert.match(line, /rankedBy=/);
   assert.ok(toolCalls);
 });
 

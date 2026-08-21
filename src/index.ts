@@ -220,16 +220,18 @@ export function register(api: OpenClawPluginApi): void {
 
         const started = Date.now();
         try {
-          const facts = await client.searchFacts(query, agentId, cfg.recallLimit, {
+          const found = await client.searchFacts(query, agentId, cfg.recallLimit, {
             pool: cfg.recallPool,
             rerank: cfg.recallRerank,
             minScore: cfg.recallMinScore,
             contextMinScore: cfg.recallContextMinScore,
+            minSpread: cfg.recallMinSpread,
             vectorMinScore: cfg.recallVectorMinScore,
             // What the reranker scores against: the message just sent, not the
             // transcript around it. The transcript is what found the candidates.
             focus: currentPrompt,
           });
+          const facts = found.facts;
           const inForce = factsInForce(facts);
           const factTexts = inForce.map((fact) => fact.fact as string);
 
@@ -265,6 +267,7 @@ export function register(api: OpenClawPluginApi): void {
               agentId,
               group_id: agentId,
               retrievedFacts: factTexts.length,
+              rankedBy: found.rankedBy,
               // The scores the cross-encoder gave, in the order they came back. The
               // floor is a number someone has to choose, and until these were logged
               // the only evidence available was which facts survived it -- never how

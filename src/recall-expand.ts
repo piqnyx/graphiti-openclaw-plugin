@@ -1,5 +1,6 @@
 import type { GraphitiMcpClient } from "./mcp-client.js";
-import { renderEpisode } from "./tools.js";
+import type { EpisodeMessage } from "./text.js";
+import { episodeMessages } from "./text.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -7,113 +8,119 @@ type JsonObject = Record<string, unknown>;
  * Showing the conversation a recalled fact came from.
  *
  * A fact is a sentence the extractor wrote, and it is often true and useless on its
- * own: "Вит переехал" says nothing about when, or from where, or whether he was
- * pleased about it. The conversation behind it says all three, and it is already in
- * the store -- every fact carries the uuids of the episodes it was drawn from.
+ * own: "Вит переехал" says nothing about when, from where, or whether he was pleased
+ * about it. The conversation says all three and is already stored -- every fact
+ * carries the uuids of the episodes it was drawn from.
  *
- * Only the first few facts are expanded, and only a window around the point the fact
- * came from. The whole episode is a batch of up to twenty messages, and injecting one
- * of those on every turn would bury the short facts it was meant to support.
+ * The excerpt is cut at message boundaries, and the message to cut around is chosen
+ * by how many words it shares with the fact. An earlier version looked for the fact's
+ * proper nouns instead, which meant a rule about what a name looks like: it missed
+ * `C++` because of the plus signs, and it settled on `Вит` -- a word in every line of
+ * the episode -- so the excerpt showed the greeting. Every such rule is a list of the
+ * spellings someone thought of, and `.NET`, `C#` and an all-caps abbreviation are the
+ * ones nobody thinks of. Shared words need no such list.
  */
 
-/**
- * Where in the episode to cut.
- *
- * The fact is a paraphrase, so it does not appear verbatim anywhere. Its proper nouns
- * usually do -- they are copied from what was said rather than rewritten -- so the
- * longest capitalised word is the most specific thing to look for. Longest first,
- * because "Кобулети" locates a passage and "Вит" locates the whole conversation.
- */
-export function anchorCandidates(fact: string): string[] {
-  // Trailing symbols belong to the name: C++ and F# are the whole word, and a
-  // candidate cut down to "C" matches everywhere and locates nothing.
-  const found = fact.match(/\p{Lu}[\p{L}\p{N}._-]*[\p{L}\p{N}][+#]*|\p{Lu}[\p{L}\p{N}]*[+#]+/gu) ?? [];
-  return [...new Set(found)].filter((word) => word.length >= 2);
+/** The name of the episode a fact came from, and optionally the conversation itself. */
+export type FactSource = { episode: string; excerpt?: string };
+
+/** Marks a message shown only in part. */
+const OMITTED = "(…omitted…)";
+/** Marks messages dropped above or below the excerpt. */
+const ELISION = "…";
+/** Below this a word carries no signal: prepositions, particles, "это", "как". */
+const MIN_WORD = 4;
+
+function words(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}+#._-]*/gu) ?? [])
+    // The dot and dash are kept inside a word for the sake of C++, .NET and bge-m3,
+    // and that same class swallows the full stop ending a sentence -- which made
+    // "Яндекса." and "Яндекса" two different words and lost the match.
+    .map((word) => word.replace(/[._-]+$/u, ""))
+    .filter((word) => word.length >= MIN_WORD);
 }
 
 /**
- * The anchor is the rarest candidate, not the longest.
+ * Which message the fact was most likely drawn from.
  *
- * Measured on the live graph: expanding "Вит изучал C++ 2 года назад" anchored on
- * "Вит", which opens the episode and appears in almost every line of it, so the
- * window landed on the greeting and said nothing about C++. A word that appears
- * once points at one passage; a word that appears thirty times points at the
- * episode, which the reader already has.
+ * Overlap of words, counted once each: a message repeating one word of the fact ten
+ * times is not ten times the match. Nothing matched means the last message, because
+ * within a batch the conversation runs forward and a freshly written fact most often
+ * came from its end.
  */
-/**
- * How often a word may appear and still point somewhere.
- *
- * A name scattered through the episode describes the whole of it, and a window
- * around its first occurrence is then no better than an arbitrary cut -- worse,
- * because it looks deliberate. Past this many, the tail is the honest answer.
- */
-const ANCHOR_MAX_OCCURRENCES = 3;
+export function bestMessage(messages: readonly EpisodeMessage[], fact: string): number {
+  const wanted = new Set(words(fact));
+  if (wanted.size === 0 || messages.length === 0) return messages.length - 1;
 
-export function chooseAnchor(text: string, candidates: readonly string[]): string | undefined {
-  const lower = text.toLowerCase();
-  let best: { word: string; count: number } | undefined;
-  for (const word of candidates) {
-    const needle = word.toLowerCase();
-    let count = 0;
-    for (let at = lower.indexOf(needle); at >= 0; at = lower.indexOf(needle, at + needle.length)) {
-      count += 1;
-      if (count > 64) break;
-    }
-    if (count === 0) continue;
-    if (!best || count < best.count || (count === best.count && word.length > best.word.length)) {
-      best = { word, count };
+  let bestAt = -1;
+  let bestScore = 0;
+  for (let at = 0; at < messages.length; at += 1) {
+    const seen = new Set(words(messages[at]?.text ?? ""));
+    let score = 0;
+    for (const word of wanted) if (seen.has(word)) score += 1;
+    if (score > bestScore) {
+      bestScore = score;
+      bestAt = at;
     }
   }
-  return best && best.count <= ANCHOR_MAX_OCCURRENCES ? best.word : undefined;
+  return bestAt >= 0 ? bestAt : messages.length - 1;
+}
+
+function render(message: EpisodeMessage, budget: number): string {
+  const head = `[${message.speaker}] `;
+  const room = Math.max(0, budget - head.length);
+  const text = message.text.trim();
+  if (text.length <= room) return `${head}${text}`;
+  // Cut from the middle: the opening says what is being talked about and the closing
+  // often carries the point, and losing either to keep the other reads worse than
+  // losing the middle and saying so.
+  const side = Math.max(8, Math.floor((room - OMITTED.length) / 2));
+  return `${head}${text.slice(0, side)}${OMITTED}${text.slice(-side)}`;
 }
 
 /**
- * Shrink a cut to whole lines without letting go of the anchor.
+ * The messages around the chosen one, as many as the budget allows.
  *
- * Snapping the start forward is what keeps a window from opening mid-word, and it
- * is also what can step straight over the line the window exists to show, when the
- * anchor sits near the top of the cut. So the snap stops at the anchor's own line
- * in both directions.
+ * Grown outward one message at a time, later first: what was said after a statement
+ * is usually the reply to it, and a reply is what makes a statement legible.
  */
-function toLineBounds(text: string, start: number, end: number, at: number): [number, number] {
-  const anchorLineStart = at < 0 ? start : text.lastIndexOf("\n", at) + 1;
-  const anchorLineEnd = at < 0 ? end : (text.indexOf("\n", at) + 1 || text.length + 1) - 1;
+export function excerptAround(
+  messages: readonly EpisodeMessage[],
+  at: number,
+  budget: number,
+): string {
+  if (messages.length === 0 || at < 0) return "";
 
-  const snappedStart = start === 0 ? 0 : text.indexOf("\n", start) + 1;
-  const snappedEnd = end >= text.length ? text.length : text.lastIndexOf("\n", end);
-  const from = snappedStart > 0 ? Math.min(snappedStart, anchorLineStart) : 0;
-  const to = snappedEnd > from ? Math.max(snappedEnd, anchorLineEnd) : end;
-  if (to <= from) return [start, end];
+  const centre = render(messages[at] as EpisodeMessage, budget);
+  const lines = new Map<number, string>([[at, centre]]);
+  let used = centre.length;
 
-  // Whole lines are a courtesy, the budget is not. One pasted wall of text is a
-  // single line thousands of characters long, and rounding out to it would inject
-  // the wall. Past twice what was asked for, the character cut wins.
-  const bounded = Math.min(to, text.length);
-  if (bounded - from > (end - start) * 2) return [start, end];
-  return [from, bounded];
+  let before = at - 1;
+  let after = at + 1;
+  let takeAfter = true;
+  while (before >= 0 || after < messages.length) {
+    const next = takeAfter && after < messages.length ? after : before;
+    if (next < 0 || next >= messages.length) {
+      takeAfter = !takeAfter;
+      continue;
+    }
+    const line = render(messages[next] as EpisodeMessage, budget);
+    if (used + line.length + 1 > budget) break;
+    lines.set(next, line);
+    used += line.length + 1;
+    if (next === after) after += 1;
+    else before -= 1;
+    takeAfter = !takeAfter;
+  }
+
+  const shown = [...lines.keys()].sort((left, right) => left - right);
+  const body = shown.map((index) => lines.get(index) as string);
+  if ((shown[0] ?? 0) > 0) body.unshift(ELISION);
+  if ((shown[shown.length - 1] ?? 0) < messages.length - 1) body.push(ELISION);
+  return body.join("\n");
 }
 
-/**
- * The window, with an ellipsis wherever text was cut away.
- *
- * Falls back to the end of the episode when no anchor is found: within a batch the
- * conversation runs forward in time, so the newest statement is the likeliest source
- * of a fact that was just written.
- */
-export function windowAround(text: string, anchors: readonly string[], chars: number): string {
-  if (!text) return "";
-  const anchor = chooseAnchor(text, anchors);
-  const at = anchor ? text.toLowerCase().indexOf(anchor.toLowerCase()) : -1;
-
-  const rawStart = at < 0 ? Math.max(0, text.length - chars * 2) : Math.max(0, at - chars);
-  const rawEnd = at < 0 ? text.length : Math.min(text.length, at + (anchor?.length ?? 0) + chars);
-  const [start, end] = toLineBounds(text, rawStart, rawEnd, at);
-  const cut = text.slice(start, end).trim();
-  if (!cut) return "";
-  return `${start > 0 ? "…" : ""}${cut}${end < text.length ? "…" : ""}`;
-}
-
-/** The episode uuids the top facts were drawn from, in order, without repeats. */
+/** Every episode uuid the facts name, in order, without repeats. */
 function sourceUuids(facts: readonly JsonObject[]): string[] {
   const uuids: string[] = [];
   for (const fact of facts) {
@@ -125,47 +132,48 @@ function sourceUuids(facts: readonly JsonObject[]): string[] {
 }
 
 /**
- * A window of conversation per fact, aligned with the facts given.
+ * Where each fact came from, and what was said around the first few.
  *
- * One fetch for every episode involved rather than one per fact: several of the top
- * facts routinely come from the same batch. An entry is empty when the fact names no
- * source, when the episode is gone, or when it rendered to nothing -- recall must
- * still return its facts.
+ * The episode is named for every fact, not only the quoted ones: naming it costs a
+ * line and turns each fact into something she can go and read for herself. One fetch
+ * covers them all, because the returned facts routinely share a batch.
  */
-export type FactContext = { anchor: string; text: string };
-
-export async function expandFacts(
+export async function factSources(
   client: GraphitiMcpClient,
   agentId: string,
   facts: readonly JsonObject[],
+  quoteTop: number,
   chars: number,
-): Promise<(FactContext | undefined)[]> {
+): Promise<(FactSource | undefined)[]> {
   const uuids = sourceUuids(facts);
   if (uuids.length === 0) return facts.map(() => undefined);
 
   const episodes = await client.getEpisodesByRef(agentId, { uuids });
-  const rendered = new Map<string, FactContext>();
+  const known = new Map<string, { name: string; messages: EpisodeMessage[] }>();
   for (const episode of episodes) {
     if (typeof episode.uuid !== "string") continue;
-    const name = typeof episode.name === "string" ? episode.name : "";
-    // The renderer opens with the episode name in brackets. It belongs in the label
-    // the reader sees, not inside the quoted conversation -- printed there it shows
-    // up only when the window happens to start at the top, which reads as noise
-    // appearing at random.
-    const body = renderEpisode(episode).replace(/^\[[^\]\n]*\]\n/, "");
-    rendered.set(episode.uuid, { anchor: name, text: body });
+    known.set(episode.uuid, {
+      name: typeof episode.name === "string" ? episode.name : "",
+      messages: episodeMessages(typeof episode.content === "string" ? episode.content : ""),
+    });
   }
 
-  return facts.map((fact) => {
+  // Facts ranked together routinely come from the same batch, and two of them often
+  // point at the same passage of it. Printing that passage twice spends the budget on
+  // nothing: the second fact still names its episode, and the quote is already above.
+  const quoted = new Set<string>();
+
+  return facts.map((fact, index) => {
     const episodeUuids = Array.isArray(fact.episodes) ? fact.episodes : [];
     const uuid = episodeUuids.find((value: unknown): value is string => typeof value === "string" && value !== "");
-    const source = uuid ? rendered.get(uuid) : undefined;
-    if (!source?.text) return undefined;
-    const window = windowAround(
-      source.text,
-      anchorCandidates(typeof fact.fact === "string" ? fact.fact : ""),
-      chars,
-    );
-    return window ? { anchor: source.anchor, text: window } : undefined;
+    const source = uuid ? known.get(uuid) : undefined;
+    if (!source?.name) return undefined;
+    if (index >= quoteTop) return { episode: source.name };
+
+    const text = typeof fact.fact === "string" ? fact.fact : "";
+    const excerpt = excerptAround(source.messages, bestMessage(source.messages, text), chars * 2);
+    if (!excerpt || quoted.has(excerpt)) return { episode: source.name };
+    quoted.add(excerpt);
+    return { episode: source.name, excerpt };
   });
 }

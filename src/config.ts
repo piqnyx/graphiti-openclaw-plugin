@@ -16,6 +16,16 @@ export type GraphitiPluginConfig = {
   autoRecall: boolean;
   requestTimeoutMs: number;
   recallLimit: number;
+  /**
+   * How many of the returned facts are shown with the conversation behind them.
+   *
+   * Zero keeps recall as a list of sentences. Each expansion costs its own window
+   * twice over, so the ceiling on what recall can inject is this times twice
+   * recallExpandChars -- no third setting is needed to bound it.
+   */
+  recallExpandTop: number;
+  /** Characters of conversation kept on each side of the point a fact came from. */
+  recallExpandChars: number;
   recallQueryMaxChars: number;
   recallMaxInjectedChars: number;
   /**
@@ -105,6 +115,8 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   autoRecall: true,
   requestTimeoutMs: 45_000,
   recallLimit: 8,
+  recallExpandTop: 2,
+  recallExpandChars: 512,
   recallQueryMaxChars: 6_000,
   recallMaxInjectedChars: 8_000,
   recallPool: 0,
@@ -266,6 +278,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
     "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore",
+    "recallExpandTop", "recallExpandChars",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
     "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
     "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
@@ -283,6 +296,8 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     autoRecall: booleanValue(raw.autoRecall, DEFAULT_CONFIG.autoRecall, "autoRecall"),
     requestTimeoutMs: integerValue(raw.requestTimeoutMs, DEFAULT_CONFIG.requestTimeoutMs, "requestTimeoutMs", 1_000, 300_000),
     recallLimit: integerValue(raw.recallLimit, DEFAULT_CONFIG.recallLimit, "recallLimit", 1, 100),
+    recallExpandTop: integerValue(raw.recallExpandTop, DEFAULT_CONFIG.recallExpandTop, "recallExpandTop", 0, 100),
+    recallExpandChars: integerValue(raw.recallExpandChars, DEFAULT_CONFIG.recallExpandChars, "recallExpandChars", 64, 65_536),
     recallQueryMaxChars: integerValue(raw.recallQueryMaxChars, DEFAULT_CONFIG.recallQueryMaxChars, "recallQueryMaxChars", 32, 32_000),
     recallPool: integerValue(raw.recallPool, DEFAULT_CONFIG.recallPool, "recallPool", 0, 500),
     recallRerank: booleanValue(raw.recallRerank, DEFAULT_CONFIG.recallRerank, "recallRerank"),

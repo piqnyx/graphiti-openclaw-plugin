@@ -13,11 +13,13 @@ import { GraphitiMcpClient } from "./mcp-client.js";
 import {
   buildRecallBlockDetailed,
   buildRecallQuery,
+  factsInForce,
   factTextsInForce,
   isSupersededFact,
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
+import { expandFacts } from "./recall-expand.js";
 import { createGraphitiTools } from "./tools.js";
 import type {
   BeforePromptBuildEvent,
@@ -227,8 +229,33 @@ export function register(api: OpenClawPluginApi): void {
             // transcript around it. The transcript is what found the candidates.
             focus: currentPrompt,
           });
-          const factTexts = factTextsInForce(facts);
-          const recallBlock = buildRecallBlockDetailed(factTexts, cfg.recallMaxInjectedChars);
+          const inForce = factsInForce(facts);
+          const factTexts = inForce.map((fact) => fact.fact as string);
+
+          // A window of the conversation behind the first few facts. It is an extra:
+          // a store that cannot be read, or an episode that is gone, costs the
+          // context and never the recall.
+          let contexts: string[] = [];
+          if (cfg.recallExpandTop > 0 && inForce.length > 0) {
+            try {
+              contexts = await expandFacts(
+                client,
+                agentId,
+                inForce.slice(0, cfg.recallExpandTop),
+                cfg.recallExpandChars,
+              );
+            } catch (error) {
+              logger.warn("recall_expand_failed", {
+                agentId,
+                group_id: agentId,
+                error: errorText(error),
+              });
+            }
+          }
+          const entries = factTexts.map((fact, index) =>
+            contexts[index] ? { fact, context: contexts[index] } : fact,
+          );
+          const recallBlock = buildRecallBlockDetailed(entries, cfg.recallMaxInjectedChars);
           const block = recallBlock.block;
           logger.debugContent(
             "recall_payload",
@@ -241,6 +268,9 @@ export function register(api: OpenClawPluginApi): void {
               skippedFacts: recallBlock.skippedFacts,
               recallLimit: cfg.recallLimit,
               maxInjectedChars: cfg.recallMaxInjectedChars,
+              expandTop: cfg.recallExpandTop,
+              expandedFacts: contexts.filter(Boolean).length,
+              expandedChars: contexts.reduce((sum, context) => sum + context.length, 0),
               injectedChars: block?.length ?? 0,
             },
             { facts: factTexts, injectedBlock: block ?? "" },

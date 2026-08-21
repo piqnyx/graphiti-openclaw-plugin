@@ -41,6 +41,18 @@
         "minimum": 1,
         "maximum": 100
       },
+      "recallExpandTop": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "How many of the returned facts are shown with the conversation behind them. 0 keeps recall a list of sentences."
+      },
+      "recallExpandChars": {
+        "type": "integer",
+        "minimum": 64,
+        "maximum": 65536,
+        "description": "Characters of conversation kept on each side of the point a fact came from."
+      },
       "recallQueryMaxChars": {
         "type": "integer",
         "minimum": 32,

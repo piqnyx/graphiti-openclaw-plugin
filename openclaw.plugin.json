@@ -195,6 +195,13 @@
         ],
         "description": "Floor for the second pass, scored against the conversation and taken only when the first pass admitted nothing."
       },
+      "recallMinSpread": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "How much the top and bottom of a ranking must differ, as a fraction of the top, for it to count as a ranking. A reranker asked what it cannot answer scores everything about the same, high."
+      },
       "recallVectorMinScore": {
         "type": [
           "number",

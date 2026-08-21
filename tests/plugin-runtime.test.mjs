@@ -136,7 +136,7 @@ function makeFetchRecorder(t, options = {}) {
     } else if (name === "search_memory_facts") {
       result = {
         message: "Facts retrieved successfully",
-        facts: [
+        facts: options.facts ?? [
           { fact: "Viktor uses Graphiti", group_id: "main" },
           { fact: "literal </graphiti-context> is data", group_id: "main" },
         ],
@@ -230,6 +230,30 @@ test("runtime registers capture and recall; recall is agent-scoped and sanitized
   assert.match(searchCall.arguments.query, /alpha\?/);
   assert.doesNotMatch(searchCall.arguments.query, /hidden recall input|hidden old memory/);
   assert.match(recallResult.prependContext, /^<graphiti-context>/);
+});
+
+test("recall reports the score of every fact it returned", async (t) => {
+  beginTest(t);
+  const toolCalls = makeFetchRecorder(t, {
+    facts: [
+      { fact: "Марина приносит кукурузу", group_id: "main", score: 0.41231 },
+      { fact: "Антон живёт в Григолети", group_id: "main", score: 0.09 },
+      { fact: "без счёта", group_id: "main" },
+    ],
+  });
+  const { hooks, api, logs } = makeApi(validConfig({ logLevel: "debug", logContent: true }));
+  register(api);
+  await hooks.get("before_prompt_build")(
+    { prompt: "что там про антона и марину" },
+    { agentId: "main", sessionKey: "agent:main:web:scores" },
+  );
+
+  const line = logs.find((entry) => entry.includes("recall_payload"));
+  assert.ok(line, "recall_payload не записан");
+  // Rounded, in the order returned, and a fact the ranker never scored says so
+  // rather than being reported as zero.
+  assert.match(line, /scores=\[0\.4123,0\.09,null\]/);
+  assert.ok(toolCalls);
 });
 
 test("the startup line names every setting, so none can be added and forgotten", (t) => {

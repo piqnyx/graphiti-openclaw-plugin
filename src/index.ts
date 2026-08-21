@@ -264,6 +264,13 @@ export function register(api: OpenClawPluginApi): void {
               agentId,
               group_id: agentId,
               retrievedFacts: factTexts.length,
+              // The scores the cross-encoder gave, in the order they came back. The
+              // floor is a number someone has to choose, and until these were logged
+              // the only evidence available was which facts survived it -- never how
+              // close the rest came, which is the half that says where to put it.
+              scores: inForce.map((fact) =>
+                typeof fact.score === "number" ? Number(fact.score.toFixed(4)) : null,
+              ),
               supersededFacts: facts.filter(isSupersededFact).length,
               injectedFacts: recallBlock.injectedFacts,
               skippedFacts: recallBlock.skippedFacts,

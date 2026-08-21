@@ -73,10 +73,41 @@ test("a turn at the edge is cut, not dropped: its tail above, its opening below"
 });
 
 test("a fragment too small to say anything is not printed at all", () => {
-  const messages = episodeMessages(body([long(0, 300), long(1, 20)]));
+  // Both sides long, so neither hands the other its share and the radius stays as
+  // given -- otherwise the extra room is enough to print the very fragment this is
+  // about.
+  const messages = episodeMessages(body([long(0, 300), long(1, 20), long(2, 300)]));
   const excerpt = excerptAround(messages, 1, 30);
   assert.doesNotMatch(excerpt, /omitted/, `напечатан огрызок:\n${excerpt}`);
   assert.match(excerpt, /^…\n/);
+  assert.match(excerpt, /\n…$/);
+});
+
+test("a side with nothing to show gives its share to the other", () => {
+  const messages = episodeMessages(
+    body([
+      { role: "user", text: "факт тут" },
+      { role: "assistant", text: "б".repeat(300) },
+      { role: "user", text: "в".repeat(300) },
+    ]),
+  );
+  // Nothing above the first turn, so the whole radius is spent below rather than
+  // half of it being thrown away for sitting at the edge of the episode.
+  const excerpt = excerptAround(messages, 0, 150);
+  assert.ok(excerpt.length > 280, `окно ужалось у края: ${excerpt.length}`);
+  assert.ok(excerpt.length < 420, `окно превысило потолок: ${excerpt.length}`);
+});
+
+test("an excerpt that fits carries no marks at all", () => {
+  // A mark says something was cut. Nothing was.
+  const messages = episodeMessages(
+    body([
+      { role: "user", text: "раз" },
+      { role: "assistant", text: "два" },
+      { role: "user", text: "три" },
+    ]),
+  );
+  assert.equal(excerptAround(messages, 1, 150), "[Вит] раз\n[Эва] два\n[Вит] три");
 });
 
 test("the marks are only at the two edges of the window", () => {

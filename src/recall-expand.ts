@@ -110,6 +110,15 @@ function headOf(message: EpisodeMessage, budget: number): string {
  * came from is shown whole -- it is the reason the window exists, and cutting it
  * put a mark in the middle of the quote rather than at its edge.
  */
+/** What a stretch of turns would cost if it were all shown. */
+function span(messages: readonly EpisodeMessage[], from: number, to: number): number {
+  let total = 0;
+  for (let index = from; index <= to; index += 1) {
+    total += line(messages[index] as EpisodeMessage).length + 1;
+  }
+  return total;
+}
+
 export function excerptAround(
   messages: readonly EpisodeMessage[],
   at: number,
@@ -117,8 +126,18 @@ export function excerptAround(
 ): string {
   if (messages.length === 0 || at < 0 || at >= messages.length) return "";
 
+  // A side that cannot spend its share gives it to the other. The radius is meant as
+  // "about this much conversation around the fact", and holding each side to its half
+  // shrinks the window for no reason whenever the fact sits near the start or the end
+  // of an episode -- exactly where there is least context to spare. The ceiling is
+  // unchanged: what one side gains the other could not have used.
+  const aboveAvailable = at > 0 ? span(messages, 0, at - 1) : 0;
+  const belowAvailable = at < messages.length - 1 ? span(messages, at + 1, messages.length - 1) : 0;
+  const aboveRadius = radius + Math.max(0, radius - belowAvailable);
+  const belowRadius = radius + Math.max(0, radius - aboveAvailable);
+
   const above: string[] = [];
-  let room = radius;
+  let room = aboveRadius;
   let first = at;
   for (let index = at - 1; index >= 0; index -= 1) {
     const whole = line(messages[index] as EpisodeMessage);
@@ -137,7 +156,7 @@ export function excerptAround(
   }
 
   const below: string[] = [];
-  room = radius;
+  room = belowRadius;
   let last = at;
   for (let index = at + 1; index < messages.length; index += 1) {
     const whole = line(messages[index] as EpisodeMessage);

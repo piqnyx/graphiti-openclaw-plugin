@@ -19,7 +19,7 @@ import {
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
-import { expandFacts, type FactContext } from "./recall-expand.js";
+import { factSources, type FactSource } from "./recall-expand.js";
 import { createGraphitiTools } from "./tools.js";
 import type {
   BeforePromptBuildEvent,
@@ -232,16 +232,17 @@ export function register(api: OpenClawPluginApi): void {
           const inForce = factsInForce(facts);
           const factTexts = inForce.map((fact) => fact.fact as string);
 
-          // A window of the conversation behind the first few facts. It is an extra:
-          // a store that cannot be read, or an episode that is gone, costs the
-          // context and never the recall.
-          let contexts: (FactContext | undefined)[] = [];
-          if (cfg.recallExpandTop > 0 && inForce.length > 0) {
+          // Where each fact came from, and what was said around the first few. Both
+          // are extras: a store that cannot be read, or an episode that is gone,
+          // costs the attribution and never the recall.
+          let sources: (FactSource | undefined)[] = [];
+          if (inForce.length > 0) {
             try {
-              contexts = await expandFacts(
+              sources = await factSources(
                 client,
                 agentId,
-                inForce.slice(0, cfg.recallExpandTop),
+                inForce,
+                cfg.recallExpandTop,
                 cfg.recallExpandChars,
               );
             } catch (error) {
@@ -253,7 +254,7 @@ export function register(api: OpenClawPluginApi): void {
             }
           }
           const entries = factTexts.map((fact, index) =>
-            contexts[index] ? { fact, context: contexts[index] } : fact,
+            sources[index] ? { fact, source: sources[index] } : fact,
           );
           const recallBlock = buildRecallBlockDetailed(entries, cfg.recallMaxInjectedChars);
           const block = recallBlock.block;
@@ -269,8 +270,8 @@ export function register(api: OpenClawPluginApi): void {
               recallLimit: cfg.recallLimit,
               maxInjectedChars: cfg.recallMaxInjectedChars,
               expandTop: cfg.recallExpandTop,
-              expandedFacts: contexts.filter(Boolean).length,
-              expandedChars: contexts.reduce((sum, context) => sum + (context?.text.length ?? 0), 0),
+              expandedFacts: sources.filter((source) => source?.excerpt).length,
+              expandedChars: sources.reduce((sum, source) => sum + (source?.excerpt?.length ?? 0), 0),
               injectedChars: block?.length ?? 0,
             },
             { facts: factTexts, injectedBlock: block ?? "" },

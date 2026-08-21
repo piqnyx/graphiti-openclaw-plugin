@@ -119,7 +119,8 @@ test("recall tuning is absent from the request until it is configured", () => {
   assert.equal(defaults.recallPool, 0);
   assert.equal(defaults.recallRerank, false);
   assert.equal(defaults.recallMinScore, null);
-  assert.equal(defaults.recallContextWeight, 0);
+  assert.equal(defaults.recallContextMinScore, null);
+  assert.equal(defaults.recallVectorMinScore, null);
 });
 
 test("a floor may be zero, and zero is not absent", () => {
@@ -131,9 +132,8 @@ test("a floor may be zero, and zero is not absent", () => {
 });
 
 test("recall tuning rejects what it cannot use", () => {
-  assert.throws(() => parseConfig({ recallContextWeight: 1.5 }), /recallContextWeight/);
-  assert.throws(() => parseConfig({ recallContextWeight: -0.1 }), /recallContextWeight/);
-  assert.throws(() => parseConfig({ recallContextWeight: "half" }), /recallContextWeight/);
+  assert.throws(() => parseConfig({ recallContextMinScore: "0.3" }), /recallContextMinScore/);
+  assert.throws(() => parseConfig({ recallVectorMinScore: "0.25" }), /recallVectorMinScore/);
   assert.throws(() => parseConfig({ recallMinScore: "0.1" }), /recallMinScore/);
   assert.throws(() => parseConfig({ recallPool: 1.5 }), /recallPool/);
   assert.throws(() => parseConfig({ recallRerank: "yes" }), /recallRerank/);

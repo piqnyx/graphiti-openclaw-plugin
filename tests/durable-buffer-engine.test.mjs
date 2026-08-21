@@ -393,3 +393,64 @@ test("a synthetic note joins the same session buffer without advancing transcrip
   assert.deepEqual(state.cursor, mark);
   assert.deepEqual(state.active.messages.map((m) => m.text), ["ordinary", "remember this"]);
 });
+
+test("the same turn twice in one buffer is kept once, and the next batch keeps its own", async (t) => {
+  const root = withRoot(t);
+  const sent = [];
+  // Three messages to a batch, so the repeat and its neighbours share one buffer.
+  const engine = new DurableBufferEngine(root, actors, 3, 30, async (_agentId, entry) => {
+    sent.push(entry.buffer.messages.map((message) => `${message.role}:${message.text}`));
+  });
+  t.after(async () => { await engine.shutdown(500); });
+
+  // A run that fails before replying leaves the question unanswered, and it gets
+  // asked again in the same words. A rewind arrives looking exactly the same.
+  engine.ingest("main", "s1", [
+    { role: "user", text: "а что там с ноутбуком?" },
+    { role: "user", text: "  а что там с ноутбуком?  " },
+    { role: "assistant", text: "ответ" },
+    { role: "user", text: "дальше" },
+  ], watermark("main", "s1", 4));
+  await waitFor(() => sent.length === 1);
+
+  assert.deepEqual(sent[0], [
+    "user:а что там с ноутбуком?",
+    "assistant:ответ",
+    "user:дальше",
+  ]);
+});
+
+test("what has gone to the queue has gone: a later batch may repeat it", async (t) => {
+  const root = withRoot(t);
+  const sent = [];
+  const engine = new DurableBufferEngine(root, actors, 1, 30, async (_agentId, entry) => {
+    sent.push(entry.buffer.messages[0].text);
+  });
+  t.after(async () => { await engine.shutdown(500); });
+
+  // The graph may already hold the first one. A buffer that knew better than the
+  // graph would be a worse problem than a repeated sentence.
+  engine.ingest("main", "s1", [{ role: "user", text: "одно и то же" }], watermark("main", "s1"));
+  await waitFor(() => sent.length === 1);
+  engine.ingest("main", "s1", [{ role: "user", text: "одно и то же" }], watermark("main", "s1", 2));
+  await waitFor(() => sent.length === 2);
+
+  assert.deepEqual(sent, ["одно и то же", "одно и то же"]);
+});
+
+test("the same words from the other speaker are a different turn", async (t) => {
+  const root = withRoot(t);
+  const sent = [];
+  const engine = new DurableBufferEngine(root, actors, 2, 30, async (_agentId, entry) => {
+    sent.push(entry.buffer.messages.map((message) => message.role));
+  });
+  t.after(async () => { await engine.shutdown(500); });
+
+  engine.ingest("main", "s1", [
+    { role: "user", text: "ага" },
+    { role: "assistant", text: "ага" },
+  ], watermark("main", "s1", 2));
+  await waitFor(() => sent.length === 1);
+
+  assert.deepEqual(sent[0], ["user", "assistant"]);
+});

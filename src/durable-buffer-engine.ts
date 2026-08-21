@@ -223,6 +223,19 @@ export class DurableBufferEngine {
       const text = message.text.trim();
       if (!text) continue;
       active ??= this.newBuffer(agentId, sessionKey, now);
+      // The same turn, word for word, twice in one batch. It arrives that way from a
+      // rewind -- the gateway repoints the session at a fresh one and the resent
+      // message is genuinely new -- and equally from a run that failed before
+      // replying, where the question simply gets asked again. The second kind leaves
+      // no marker of any sort, so recognising the text is the only thing that catches
+      // both.
+      //
+      // Only here, in the buffer nothing has been promised about yet. What has gone
+      // to the queue has gone: the graph may already hold it, and a buffer that knew
+      // better than the graph would be a worse problem than a repeated sentence.
+      if (active.messages.some((held) => held.role === message.role && held.text === text)) {
+        continue;
+      }
       active.messages.push({ role: message.role, text });
       active.lastActivityAt = now;
       if (active.messages.length >= this.bufferLimit) {

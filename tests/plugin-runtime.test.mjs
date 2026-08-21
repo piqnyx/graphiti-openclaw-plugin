@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_CONFIG } from "../dist/config.js";
 import { register } from "../dist/index.js";
 import { resetCaptureRuntimeForTests } from "../dist/capture-runtime.js";
 import { makeAgentStore } from "./helpers-agent-store.mjs";
@@ -229,6 +230,20 @@ test("runtime registers capture and recall; recall is agent-scoped and sanitized
   assert.match(searchCall.arguments.query, /alpha\?/);
   assert.doesNotMatch(searchCall.arguments.query, /hidden recall input|hidden old memory/);
   assert.match(recallResult.prependContext, /^<graphiti-context>/);
+});
+
+test("the startup line names every setting, so none can be added and forgotten", (t) => {
+  beginTest(t);
+  const { api, logs } = makeApi(validConfig({ recallRerank: true, recallMinScore: 0.08 }));
+  register(api);
+
+  const line = logs.find((entry) => entry.includes("plugin_loaded"));
+  assert.ok(line, "startup did not log plugin_loaded");
+  // Every configurable key, not a hand-kept subset: the subset is what rotted.
+  const missing = Object.keys(DEFAULT_CONFIG).filter((key) => !line.includes(`${key}=`));
+  assert.deepEqual(missing, [], `settings absent from the startup line: ${missing.join(", ")}`);
+  assert.match(line, /recallRerank=true/);
+  assert.match(line, /recallMinScore=0\.08/);
 });
 
 test("llm_input diagnostics are opt-in and show the assembled host prompt only when enabled", (t) => {

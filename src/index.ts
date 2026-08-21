@@ -323,30 +323,22 @@ export function register(api: OpenClawPluginApi): void {
     });
   }
 
+  // Spread the settings rather than listing them. The list was written once and
+  // then stopped being updated: recallPool, recallRerank and both score floors were
+  // added and never appeared here, so a deployment running recall wide open looked
+  // in the log exactly like one running it switched off, and the difference cost a
+  // day to find. A key that exists in the config now names itself here.
   logger.info("plugin_loaded", {
-    autoCapture: cfg.autoCapture,
-    autoRecall: cfg.autoRecall,
-    captureMode: cfg.autoCapture ? "segmented_durable_fifo_v1" : "disabled",
-    captureRuntime: captureOutcome,
-    bufferLimit: cfg.bufferLimit,
-    bufferTimeout: cfg.bufferTimeout,
-    captureDurableQueue: Boolean(capture),
-    captureRoot: capture?.durableRoot,
-    captureLeasePath: capture?.captureLease.path,
-    excludeSessionPatterns: cfg.excludeSessionPatterns,
-    agentTools: cfg.agentTools && Boolean(api.registerTool),
+    ...cfg,
     agents: Object.entries(cfg.agents).map(
       ([agentId, actors]) => `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
     ),
-    requestTimeoutMs: cfg.requestTimeoutMs,
-    recallLimit: cfg.recallLimit,
-    recallQueryMaxChars: cfg.recallQueryMaxChars,
-    recallMaxInjectedChars: cfg.recallMaxInjectedChars,
-    recallUseHistory: cfg.recallUseHistory,
-    recallHistoryMaxMessages: cfg.recallHistoryMaxMessages,
-    recallHistoryMaxChars: cfg.recallHistoryMaxChars,
-    logLevel: cfg.logLevel,
-    logContent: cfg.logContent,
+    captureMode: cfg.autoCapture ? "segmented_durable_fifo_v1" : "disabled",
+    captureRuntime: captureOutcome,
+    captureDurableQueue: Boolean(capture),
+    captureRoot: capture?.durableRoot,
+    captureLeasePath: capture?.captureLease.path,
+    agentTools: cfg.agentTools && Boolean(api.registerTool),
     rawModelInputLogging:
       cfg.logModelInput && cfg.logOperations && cfg.logLevel === "debug" && cfg.logContent,
   });

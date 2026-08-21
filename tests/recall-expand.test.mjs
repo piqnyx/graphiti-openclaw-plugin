@@ -201,6 +201,18 @@ test("plain strings still build a block, so an unsourced recall is unchanged", (
   assert.match(block, /- первый\n- второй/);
 });
 
+test("a sentence said twice takes one place, not two", () => {
+  const kept = factsInForce([
+    { fact: "Вит владеет крузаком", episodes: ["e1"] },
+    { fact: "Вит владеет крузаком", episodes: ["e2"] },
+    { fact: "  Вит владеет крузаком  ", episodes: ["e3"] },
+    { fact: "Вит живёт в фургоне", episodes: ["e4"] },
+  ]);
+  // The graph keeps all three; recall has eight places and spends one.
+  assert.deepEqual(kept.map((fact) => fact.fact), ["Вит владеет крузаком", "Вит живёт в фургоне"]);
+  assert.deepEqual(kept[0].episodes, ["e1"]);
+});
+
 test("superseded facts are dropped before any source is looked up", () => {
   const kept = factsInForce([
     { fact: "живой", episodes: ["e1"] },

@@ -135,3 +135,13 @@ test("the manifest config schema and the parser accept exactly the same keys", (
   assert.deepEqual(parsedKeys, schemaKeys, "a key in one place and not the other silently breaks config");
   assert.equal(manifest.configSchema.additionalProperties, false);
 });
+
+test("every setting is described in the README, so the table cannot drift", () => {
+  // The recall settings shipped and the table was not touched for weeks. A reader
+  // had the manifest's one-liners and nothing else, and the startup line -- fixed
+  // for the same reason -- only says what a setting is, never why its number is
+  // that number.
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const missing = Object.keys(DEFAULT_CONFIG).filter((key) => !readme.includes(`\`${key}\``));
+  assert.deepEqual(missing, [], `не описаны в README: ${missing.join(", ")}`);
+});

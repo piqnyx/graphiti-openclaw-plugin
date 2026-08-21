@@ -77,6 +77,14 @@ There is deliberately no destructive tool. The Graphiti MCP delete endpoints tak
 | `bufferTimeout` | `900` | Seconds of silence after which a partial batch is committed anyway. Minimum 30 |
 | `requestTimeoutMs` | `45000` | MCP request timeout, also the budget for the recall hook |
 | `recallLimit` | `8` | Maximum facts retrieved per recall |
+| `recallPool` | `0` | Candidates examined before choosing `recallLimit` of them. `0` keeps the two one number, which means the ranker re-sorts exactly the facts the weaker ordering already chose |
+| `recallVectorMinScore` | *(unset)* | Cosine floor on what the vector search returns **at all**, before anything ranks it. Unset leaves the library's `0.6`, which two paraphrases of one sentence routinely miss: measured here, a pool of 40 arrived as 2 candidates, and every floor above this one was re-deciding what it had already decided |
+| `recallRerank` | `false` | Score candidates with a cross-encoder against the message just sent, instead of fusing by rank. Rank fusion has no way to say "none of these are relevant": its top result scores highest whether the graph holds the answer or holds cafe dishes |
+| `recallMinScore` | *(unset)* | Floor below which a fact is not injected. Applies to the reranker's scale, and reaches the recipe only when `recallRerank` is on — without a reranker the recipe scores by `1/(position+1)`, where the same number would mean a depth rather than a relevance |
+| `recallMinSpread` | *(unset)* | How much the top and bottom of a ranking must differ, as a fraction of the top, for it to count as a ranking. A reranker asked something it cannot answer does not say so; it scores everything about the same, high. Measured here: `0.6178 … 0.1354` when it knew the answer, `0.8088 … 0.7922` when it did not. Below four results the spread cannot be read and the test stands aside |
+| `recallContextMinScore` | *(unset)* | Floor for a second pass scored against the conversation, taken only when the first admitted nothing. For a remark carrying no word to rank by. Its scale is not the first pass's: measured here its noise sits near `0.8`, so a number tuned for the remark means nothing here |
+| `recallExpandTop` | `2` | How many of the returned facts are shown with the conversation behind them. `0` keeps recall a list of sentences; the episode is still named for every fact either way |
+| `recallExpandChars` | `512` | Conversation kept on each side of the turn a fact came from. A side with less text than its share gives the remainder to the other, so a fact at the edge of an episode still gets a whole window |
 | `recallQueryMaxChars` | `6000` | Character budget for the whole recall query |
 | `recallMaxInjectedChars` | `8000` | Character budget for the injected `<graphiti-context>` block |
 | `recallUseHistory` | `true` | Enrich the recall query with recent conversation |
@@ -89,5 +97,6 @@ There is deliberately no destructive tool. The Graphiti MCP delete endpoints tak
 | `logOperations` | `true` | Emit operational info/debug events |
 | `logLevel` | `info` | `error`, `warn`, `info` or `debug` |
 | `logContent` | `false` | Also log message bodies and payloads. Diagnostics only: it writes conversations to the journal |
+| `logModelInput` | `false` | Also log the assembled host prompt. Needs `logOperations`, `logLevel: debug` and `logContent` together, and writes the whole prompt to the journal |
 
 An unknown key, an invalid regular expression or an out-of-range number fails the plugin at load rather than silently degrading.

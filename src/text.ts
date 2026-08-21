@@ -457,13 +457,29 @@ export function isSupersededFact(entry: unknown): boolean {
   return typeof invalidAt === "string" && invalidAt.trim().length > 0;
 }
 
+/**
+ * The facts recall may inject, in the order it received them.
+ *
+ * A sentence appearing twice is dropped the second time. The graph holds edges that
+ * say the same thing in the same words -- two nodes joined twice, or one statement
+ * extracted again under a different relation name -- and each copy would take one of
+ * the eight places recall has to give, to tell the reader something already said.
+ *
+ * Only here. The duplicates stay in the graph, where graphiti_status is meant to find
+ * them: hiding them at the point of use would leave nothing to find, and the reason
+ * they exist is a defect in extraction rather than in recall.
+ */
 export function factsInForce(facts: readonly unknown[]): Record<string, unknown>[] {
   const kept: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
   for (const entry of facts) {
     if (isSupersededFact(entry)) continue;
     if (typeof entry !== "object" || entry === null) continue;
     const fact = entry as { fact?: unknown };
     if (typeof fact.fact !== "string" || !fact.fact.trim()) continue;
+    const text = fact.fact.trim();
+    if (seen.has(text)) continue;
+    seen.add(text);
     kept.push(entry as Record<string, unknown>);
   }
   return kept;

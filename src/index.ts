@@ -224,7 +224,8 @@ export function register(api: OpenClawPluginApi): void {
             pool: cfg.recallPool,
             rerank: cfg.recallRerank,
             minScore: cfg.recallMinScore,
-            contextWeight: cfg.recallContextWeight,
+            contextMinScore: cfg.recallContextMinScore,
+            vectorMinScore: cfg.recallVectorMinScore,
             // What the reranker scores against: the message just sent, not the
             // transcript around it. The transcript is what found the candidates.
             focus: currentPrompt,

@@ -188,11 +188,19 @@
         ],
         "description": "Below this a fact is not injected. Null keeps whatever the search recipe declares."
       },
-      "recallContextWeight": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "description": "How much a candidate's score against the conversation counts when the remark itself cannot judge it. 0 leaves that second pass unrun."
+      "recallContextMinScore": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Floor for the second pass, scored against the conversation and taken only when the first pass admitted nothing."
+      },
+      "recallVectorMinScore": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cosine floor on what the vector search returns at all. Null leaves the library's 0.6, which makes a wide pool arrive narrow."
       }
     }
   }

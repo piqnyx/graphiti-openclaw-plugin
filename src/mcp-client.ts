@@ -511,7 +511,8 @@ export class GraphitiMcpClient {
       pool?: number;
       rerank?: boolean;
       minScore?: number | null;
-      contextWeight?: number;
+      contextMinScore?: number | null;
+      vectorMinScore?: number | null;
       focus?: string;
     } = {},
   ): Promise<JsonObject[]> {
@@ -525,10 +526,13 @@ export class GraphitiMcpClient {
     if (tuning.pool && tuning.pool > 0) args.pool = tuning.pool;
     if (tuning.rerank) args.rerank = true;
     if (typeof tuning.minScore === "number") args.min_score = tuning.minScore;
-    // Only alongside a reranker: the server reads it in the cross-encoder branch and
-    // nowhere else, so sending it on its own would change the request and nothing else.
-    if (tuning.rerank && typeof tuning.contextWeight === "number" && tuning.contextWeight > 0) {
-      args.context_weight = tuning.contextWeight;
+    if (typeof tuning.contextMinScore === "number") {
+      args.context_min_score = tuning.contextMinScore;
+    }
+    // Sent whether or not anything reranks: this floor decides what the database
+    // hands over, and everything downstream only re-sorts what got out.
+    if (typeof tuning.vectorMinScore === "number") {
+      args.vector_min_score = tuning.vectorMinScore;
     }
     // Bounded like the query is. The focus is a whole message, and a pasted wall of
     // text went to the cross-encoder unabridged -- which is what used to return HTTP

@@ -232,6 +232,50 @@ test("runtime registers capture and recall; recall is agent-scoped and sanitized
   assert.match(recallResult.prependContext, /^<graphiti-context>/);
 });
 
+test("every recall floor reaches the request under the name the server has", async (t) => {
+  beginTest(t);
+  const toolCalls = makeFetchRecorder(t);
+  const { hooks, api } = makeApi(
+    validConfig({
+      recallRerank: true,
+      recallPool: 40,
+      recallMinScore: 0.08,
+      recallContextMinScore: 0.3,
+      recallVectorMinScore: 0.25,
+    }),
+  );
+  register(api);
+  await hooks.get("before_prompt_build")(
+    { prompt: "что там про антона" },
+    { agentId: "main", sessionKey: "agent:main:web:floors" },
+  );
+
+  const search = toolCalls.find((call) => call.name === "search_memory_facts");
+  assert.ok(search, "поиск не вызван");
+  // A floor sent under a name the server does not have is a floor that does nothing,
+  // and nothing in the response says so.
+  assert.equal(search.arguments.pool, 40);
+  assert.equal(search.arguments.min_score, 0.08);
+  assert.equal(search.arguments.context_min_score, 0.3);
+  assert.equal(search.arguments.vector_min_score, 0.25);
+});
+
+test("floors left unset are absent from the request, not sent as zero", async (t) => {
+  beginTest(t);
+  const toolCalls = makeFetchRecorder(t);
+  const { hooks, api } = makeApi(validConfig({}));
+  register(api);
+  await hooks.get("before_prompt_build")(
+    { prompt: "что там про антона" },
+    { agentId: "main", sessionKey: "agent:main:web:bare" },
+  );
+
+  const search = toolCalls.find((call) => call.name === "search_memory_facts");
+  for (const key of ["pool", "min_score", "context_min_score", "vector_min_score", "focus"]) {
+    assert.ok(!(key in search.arguments), `${key} ушёл в запрос без настройки`);
+  }
+});
+
 test("recall reports the score of every fact it returned", async (t) => {
   beginTest(t);
   const toolCalls = makeFetchRecorder(t, {

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { bestMessage, excerptAround, factSources } from "../dist/recall-expand.js";
+
+const OMITTED = "(…omitted…)";
 import { buildRecallBlockDetailed, episodeMessages, factsInForce } from "../dist/text.js";
 
 const body = (messages) =>
@@ -77,13 +79,31 @@ test("a fragment too small to say anything is not printed at all", () => {
   assert.match(excerpt, /^…\n/);
 });
 
-test("the turn the fact came from loses its middle rather than either end", () => {
-  const messages = episodeMessages(body([{ role: "user", text: `начало ${"х".repeat(2000)} конец` }]));
-  const excerpt = excerptAround(messages, 0, 200);
-  assert.ok(excerpt.length < 460, `радиус превышен: ${excerpt.length}`);
-  assert.match(excerpt, /начало/);
-  assert.match(excerpt, /конец$/);
-  assert.match(excerpt, /\(…omitted…\)/);
+test("an over-long turn is cut to one run, never spliced from two", () => {
+  // Keeping both ends and joining them produced sentences nobody said: one message
+  // came out as "и всё всё всё про те(…omitted…)м старом Opel Omega". Losing an end
+  // is a gap; welding two ends together is a fabrication.
+  const messages = episodeMessages(
+    body([{ role: "user", text: `начало ${"болтовня ".repeat(300)} у них Mercedes Sprinter в конце` }]),
+  );
+  const excerpt = excerptAround(messages, 0, 200, "Антон живёт в Mercedes Sprinter");
+  const inner = excerpt.slice(OMITTED.length + 10, -OMITTED.length - 10);
+  assert.doesNotMatch(inner, /omitted/, `середина склеена:\n${excerpt}`);
+  assert.ok(excerpt.length < 480, `радиус превышен: ${excerpt.length}`);
+});
+
+test("the run is taken where the fact's own words are, not at the start", () => {
+  const messages = episodeMessages(
+    body([{ role: "user", text: `${"пустая болтовня ".repeat(60)} у них Mercedes Sprinter и они в нём живут` }]),
+  );
+  const excerpt = excerptAround(messages, 0, 150, "Антон живёт в Mercedes Sprinter");
+  assert.match(excerpt, /Mercedes Sprinter/, `вырезано мимо факта:\n${excerpt}`);
+  assert.match(excerpt, /^\[Вит\] \(…omitted…\)/, `начало не отмечено:\n${excerpt}`);
+});
+
+test("a turn that fits is shown whole, with no marks at all", () => {
+  const messages = episodeMessages(body([{ role: "user", text: "короткая реплика целиком" }]));
+  assert.equal(excerptAround(messages, 0, 200, "короткая реплика"), "[Вит] короткая реплика целиком");
 });
 
 test("nothing to quote yields nothing", () => {

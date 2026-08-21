@@ -24,7 +24,7 @@ type JsonObject = Record<string, unknown>;
 /** The name of the episode a fact came from, and optionally the conversation itself. */
 export type FactSource = { episode: string; excerpt?: string };
 
-/** Marks a message shown only in part. */
+/** Marks a turn shown only in part. */
 const OMITTED = "(…omitted…)";
 /** Marks messages dropped above or below the excerpt. */
 const ELISION = "…";
@@ -66,57 +66,109 @@ export function bestMessage(messages: readonly EpisodeMessage[], fact: string): 
   return bestAt >= 0 ? bestAt : messages.length - 1;
 }
 
-function render(message: EpisodeMessage, budget: number): string {
+/** A whole turn, with the name its speaker was given. */
+function line(message: EpisodeMessage): string {
+  return `[${message.speaker}] ${message.text.trim()}`;
+}
+
+/** The shortest fragment worth printing: less than this says nothing but its own cost. */
+const MIN_FRAGMENT = 24;
+
+/**
+ * The end of a turn, for the side above the anchor.
+ *
+ * What was said last is what the anchor answers, so a turn arriving from above is
+ * cut at its start and keeps its tail.
+ */
+function tailOf(message: EpisodeMessage, budget: number): string {
   const head = `[${message.speaker}] `;
-  const room = Math.max(0, budget - head.length);
+  const room = budget - head.length - OMITTED.length;
+  if (room < MIN_FRAGMENT) return "";
+  return `${head}${OMITTED}${message.text.trim().slice(-room)}`;
+}
+
+/** The start of a turn, for the side below: a reply is understood from its opening. */
+function headOf(message: EpisodeMessage, budget: number): string {
+  const head = `[${message.speaker}] `;
+  const room = budget - head.length - OMITTED.length;
+  if (room < MIN_FRAGMENT) return "";
+  return `${head}${message.text.trim().slice(0, room)}${OMITTED}`;
+}
+
+/** A turn too long to show whole loses its middle: both ends carry more than one. */
+function middleTruncated(message: EpisodeMessage, budget: number): string {
+  const head = `[${message.speaker}] `;
   const text = message.text.trim();
+  const room = budget - head.length;
   if (text.length <= room) return `${head}${text}`;
-  // Cut from the middle: the opening says what is being talked about and the closing
-  // often carries the point, and losing either to keep the other reads worse than
-  // losing the middle and saying so.
-  const side = Math.max(8, Math.floor((room - OMITTED.length) / 2));
+  const side = Math.max(MIN_FRAGMENT, Math.floor((room - OMITTED.length) / 2));
   return `${head}${text.slice(0, side)}${OMITTED}${text.slice(-side)}`;
 }
 
 /**
- * The messages around the chosen one, as many as the budget allows.
+ * The conversation within a radius of the message a fact came from.
  *
- * Grown outward one message at a time, later first: what was said after a statement
- * is usually the reply to it, and a reply is what makes a statement legible.
+ * A radius in characters, not in turns: turns vary from two words to a page, so a
+ * count of them promises nothing about how much is shown. Each side gets its own
+ * budget and spends it independently -- one shared budget lets a long reply below
+ * eat everything above it, which is what happened on the first live turn: the
+ * excerpt opened on the fact's own message with nothing before it, and the reason
+ * was arithmetic rather than the conversation.
+ *
+ * A turn that does not fit whole is not dropped, it is cut: from above the tail is
+ * kept, from below the opening, and the cut says so. What is lost that way is the
+ * far end of a turn already at the edge of the radius; what is gained is that the
+ * radius means what it says.
  */
 export function excerptAround(
   messages: readonly EpisodeMessage[],
   at: number,
-  budget: number,
+  radius: number,
 ): string {
-  if (messages.length === 0 || at < 0) return "";
+  if (messages.length === 0 || at < 0 || at >= messages.length) return "";
 
-  const centre = render(messages[at] as EpisodeMessage, budget);
-  const lines = new Map<number, string>([[at, centre]]);
-  let used = centre.length;
-
-  let before = at - 1;
-  let after = at + 1;
-  let takeAfter = true;
-  while (before >= 0 || after < messages.length) {
-    const next = takeAfter && after < messages.length ? after : before;
-    if (next < 0 || next >= messages.length) {
-      takeAfter = !takeAfter;
+  const above: string[] = [];
+  let room = radius;
+  let first = at;
+  for (let index = at - 1; index >= 0; index -= 1) {
+    const whole = line(messages[index] as EpisodeMessage);
+    if (whole.length + 1 <= room) {
+      above.unshift(whole);
+      room -= whole.length + 1;
+      first = index;
       continue;
     }
-    const line = render(messages[next] as EpisodeMessage, budget);
-    if (used + line.length + 1 > budget) break;
-    lines.set(next, line);
-    used += line.length + 1;
-    if (next === after) after += 1;
-    else before -= 1;
-    takeAfter = !takeAfter;
+    const fragment = tailOf(messages[index] as EpisodeMessage, room - 1);
+    if (fragment) {
+      above.unshift(fragment);
+      first = index;
+    }
+    break;
   }
 
-  const shown = [...lines.keys()].sort((left, right) => left - right);
-  const body = shown.map((index) => lines.get(index) as string);
-  if ((shown[0] ?? 0) > 0) body.unshift(ELISION);
-  if ((shown[shown.length - 1] ?? 0) < messages.length - 1) body.push(ELISION);
+  const below: string[] = [];
+  room = radius;
+  let last = at;
+  for (let index = at + 1; index < messages.length; index += 1) {
+    const whole = line(messages[index] as EpisodeMessage);
+    if (whole.length + 1 <= room) {
+      below.push(whole);
+      room -= whole.length + 1;
+      last = index;
+      continue;
+    }
+    const fragment = headOf(messages[index] as EpisodeMessage, room - 1);
+    if (fragment) {
+      below.push(fragment);
+      last = index;
+    }
+    break;
+  }
+
+  const centre = middleTruncated(messages[at] as EpisodeMessage, radius * 2);
+  const body = [...above, centre, ...below];
+  if (first > 0) body.unshift(ELISION);
+  if (last < messages.length - 1) body.push(ELISION);
   return body.join("\n");
 }
 
@@ -171,7 +223,7 @@ export async function factSources(
     if (index >= quoteTop) return { episode: source.name };
 
     const text = typeof fact.fact === "string" ? fact.fact : "";
-    const excerpt = excerptAround(source.messages, bestMessage(source.messages, text), chars * 2);
+    const excerpt = excerptAround(source.messages, bestMessage(source.messages, text), chars);
     if (!excerpt || quoted.has(excerpt)) return { episode: source.name };
     quoted.add(excerpt);
     return { episode: source.name, excerpt };

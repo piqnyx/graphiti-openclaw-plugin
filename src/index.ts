@@ -19,7 +19,7 @@ import {
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
-import { expandFacts } from "./recall-expand.js";
+import { expandFacts, type FactContext } from "./recall-expand.js";
 import { createGraphitiTools } from "./tools.js";
 import type {
   BeforePromptBuildEvent,
@@ -224,7 +224,7 @@ export function register(api: OpenClawPluginApi): void {
             pool: cfg.recallPool,
             rerank: cfg.recallRerank,
             minScore: cfg.recallMinScore,
-            contextMinScore: cfg.recallContextMinScore,
+            contextWeight: cfg.recallContextWeight,
             // What the reranker scores against: the message just sent, not the
             // transcript around it. The transcript is what found the candidates.
             focus: currentPrompt,
@@ -235,7 +235,7 @@ export function register(api: OpenClawPluginApi): void {
           // A window of the conversation behind the first few facts. It is an extra:
           // a store that cannot be read, or an episode that is gone, costs the
           // context and never the recall.
-          let contexts: string[] = [];
+          let contexts: (FactContext | undefined)[] = [];
           if (cfg.recallExpandTop > 0 && inForce.length > 0) {
             try {
               contexts = await expandFacts(
@@ -270,7 +270,7 @@ export function register(api: OpenClawPluginApi): void {
               maxInjectedChars: cfg.recallMaxInjectedChars,
               expandTop: cfg.recallExpandTop,
               expandedFacts: contexts.filter(Boolean).length,
-              expandedChars: contexts.reduce((sum, context) => sum + context.length, 0),
+              expandedChars: contexts.reduce((sum, context) => sum + (context?.text.length ?? 0), 0),
               injectedChars: block?.length ?? 0,
             },
             { facts: factTexts, injectedBlock: block ?? "" },

@@ -319,7 +319,7 @@ function xmlEscape(text: string): string {
 }
 
 /** A fact on its own, or a fact with the conversation it was drawn from. */
-export type RecallEntry = string | { fact: string; context?: string };
+export type RecallEntry = string | { fact: string; context?: { anchor: string; text: string } };
 
 export function buildRecallBlockDetailed(
   facts: readonly RecallEntry[],
@@ -356,13 +356,16 @@ export function buildRecallBlockDetailed(
     // The context is an extra, never a reason to lose the fact it belongs to: it is
     // offered only once its own fact is already in, and dropped in silence when the
     // budget cannot hold it.
-    const context = sanitizeConversationText(source.context ?? "");
+    const context = sanitizeConversationText(source.context?.text ?? "");
     if (!context) continue;
     const quoted = context
       .split("\n")
       .map((row) => `    ${xmlEscape(row)}`)
       .join("\n");
-    const attached = `  ↳ сказано так:\n${quoted}`;
+    // The anchor is named because it is the handle: she can hand it to
+    // graphiti_browse and read the rest of that conversation herself.
+    const from = source.context?.anchor ? ` (${xmlEscape(source.context.anchor)})` : "";
+    const attached = `  ↳ сказано так${from}:\n${quoted}`;
     if (used + attached.length + 1 > maxChars) continue;
     lines.push(attached);
     used += attached.length + 1;

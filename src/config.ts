@@ -71,7 +71,13 @@ export type GraphitiPluginConfig = {
    * differ, hence a floor of its own -- a transcript resembles everything a
    * little, so its numbers run several times higher.
    */
-  recallContextMinScore: number | null;
+  /**
+   * How much a candidate's score against the conversation counts when the remark
+   * itself cannot judge it. Zero leaves that second pass unrun, which is the
+   * default for the same reason the other three are off: an untouched deployment
+   * sends the request it sent before any of this existed.
+   */
+  recallContextWeight: number;
   recallUseHistory: boolean;
   recallHistoryMaxMessages: number;
   recallHistoryMaxChars: number;
@@ -122,7 +128,7 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   recallPool: 0,
   recallRerank: false,
   recallMinScore: null,
-  recallContextMinScore: null,
+  recallContextWeight: 0,
   recallUseHistory: true,
   recallHistoryMaxMessages: 6,
   recallHistoryMaxChars: 4_000,
@@ -183,6 +189,15 @@ function integerValue(raw: unknown, fallback: number, name: string, min: number,
   if (raw === undefined) return fallback;
   if (typeof raw !== "number" || !Number.isInteger(raw) || raw < min || raw > max) {
     throw new Error(`${name} must be an integer in [${min}, ${max}]`);
+  }
+  return raw;
+}
+
+/** A bounded fraction. Unlike a threshold, absent means the default, not "no value". */
+function fractionValue(raw: unknown, fallback: number, name: string, min: number, max: number): number {
+  if (raw === undefined) return fallback;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < min || raw > max) {
+    throw new Error(`${name} must be a number between ${min} and ${max}`);
   }
   return raw;
 }
@@ -277,7 +292,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
   const allowed = new Set<keyof GraphitiPluginConfig>([
     "baseUrl", "autoCapture", "autoRecall", "requestTimeoutMs", "recallLimit",
     "recallQueryMaxChars", "recallMaxInjectedChars", "recallUseHistory",
-    "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore",
+    "recallPool", "recallRerank", "recallMinScore", "recallContextWeight",
     "recallExpandTop", "recallExpandChars",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
     "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
@@ -302,10 +317,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     recallPool: integerValue(raw.recallPool, DEFAULT_CONFIG.recallPool, "recallPool", 0, 500),
     recallRerank: booleanValue(raw.recallRerank, DEFAULT_CONFIG.recallRerank, "recallRerank"),
     recallMinScore: optionalNumberValue(raw.recallMinScore, "recallMinScore"),
-    recallContextMinScore: optionalNumberValue(
-      raw.recallContextMinScore,
-      "recallContextMinScore",
-    ),
+    recallContextWeight: fractionValue(raw.recallContextWeight, DEFAULT_CONFIG.recallContextWeight, "recallContextWeight", 0, 1),
     recallMaxInjectedChars: integerValue(raw.recallMaxInjectedChars, DEFAULT_CONFIG.recallMaxInjectedChars, "recallMaxInjectedChars", 128, 64_000),
     recallUseHistory: booleanValue(raw.recallUseHistory, DEFAULT_CONFIG.recallUseHistory, "recallUseHistory"),
     recallHistoryMaxMessages: integerValue(raw.recallHistoryMaxMessages, DEFAULT_CONFIG.recallHistoryMaxMessages, "recallHistoryMaxMessages", 1, 100),

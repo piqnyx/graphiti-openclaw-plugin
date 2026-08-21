@@ -46,17 +46,41 @@ test("a fact of nothing but short words chooses nothing and falls back", () => {
   assert.equal(bestMessage(conversation, "это как был"), conversation.length - 1);
 });
 
-test("the excerpt keeps whole messages and says where it was cut", () => {
-  const excerpt = excerptAround(conversation, 2, 150);
-  assert.match(excerpt, /\[Вит\] в 14 лет Basic/);
-  assert.match(excerpt, /^…\n/, `нет отметки об опущенном сверху:\n${excerpt}`);
-  assert.match(excerpt, /\n…$/, `нет отметки об опущенном снизу:\n${excerpt}`);
+const long = (id, chars) => ({ role: id % 2 ? "assistant" : "user", text: `${id}${"я".repeat(chars)}${id}` });
+
+test("each side gets its own radius, so a long reply below cannot eat what is above", () => {
+  // One shared budget spent later-first is what produced an excerpt opening on the
+  // fact's own message with nothing before it.
+  const messages = episodeMessages(body([long(0, 200), long(1, 60), long(2, 60), long(3, 400)]));
+  const excerpt = excerptAround(messages, 2, 150);
+  const shown = excerpt.split("\n").filter((row) => row.startsWith("["));
+  assert.equal(shown.length, 4, `не обе стороны:\n${excerpt}`);
+  // The first turn is shown in part, so the omission is marked inside it; there is
+  // no earlier turn left to mark with an elision line.
+  assert.match(shown[0], /\(…omitted…\)/, `сверху ничего не осталось:\n${excerpt}`);
 });
 
-test("a message too long for the budget loses its middle, not its ends", () => {
-  const long = episodeMessages(body([{ role: "user", text: `начало ${"х".repeat(2000)} конец` }]));
-  const excerpt = excerptAround(long, 0, 200);
-  assert.ok(excerpt.length < 260, `бюджет превышен: ${excerpt.length}`);
+test("a turn at the edge is cut, not dropped: its tail above, its opening below", () => {
+  const messages = episodeMessages(body([long(0, 300), long(1, 20), long(2, 300)]));
+  const excerpt = excerptAround(messages, 1, 120);
+  const rows = excerpt.split("\n").filter((row) => row.startsWith("["));
+  // Above keeps the end of the turn, because that is what the anchor answers.
+  assert.match(rows[0], /\(…omitted…\)я+0$/, `сверху обрезано не с начала:\n${excerpt}`);
+  // Below keeps the opening, because that is where a reply says what it replies to.
+  assert.match(rows[2], /^\[Вит\] 2я+\(…omitted…\)$/, `снизу обрезано не с конца:\n${excerpt}`);
+});
+
+test("a fragment too small to say anything is not printed at all", () => {
+  const messages = episodeMessages(body([long(0, 300), long(1, 20)]));
+  const excerpt = excerptAround(messages, 1, 30);
+  assert.doesNotMatch(excerpt, /omitted/, `напечатан огрызок:\n${excerpt}`);
+  assert.match(excerpt, /^…\n/);
+});
+
+test("the turn the fact came from loses its middle rather than either end", () => {
+  const messages = episodeMessages(body([{ role: "user", text: `начало ${"х".repeat(2000)} конец` }]));
+  const excerpt = excerptAround(messages, 0, 200);
+  assert.ok(excerpt.length < 460, `радиус превышен: ${excerpt.length}`);
   assert.match(excerpt, /начало/);
   assert.match(excerpt, /конец$/);
   assert.match(excerpt, /\(…omitted…\)/);

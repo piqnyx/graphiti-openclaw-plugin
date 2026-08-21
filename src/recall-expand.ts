@@ -95,14 +95,45 @@ function headOf(message: EpisodeMessage, budget: number): string {
   return `${head}${message.text.trim().slice(0, room)}${OMITTED}`;
 }
 
-/** A turn too long to show whole loses its middle: both ends carry more than one. */
-function middleTruncated(message: EpisodeMessage, budget: number): string {
+/**
+ * Where inside a turn the fact was established.
+ *
+ * The median of the positions where the fact's own words occur. A turn can raise a
+ * subject at its start and settle it at its end, and the median sits between them
+ * rather than on whichever came first.
+ */
+function whereItWasSaid(text: string, fact: string): number {
+  const lower = text.toLowerCase();
+  const found: number[] = [];
+  for (const word of new Set(words(fact))) {
+    const at = lower.indexOf(word);
+    if (at >= 0) found.push(at);
+  }
+  if (found.length === 0) return 0;
+  found.sort((left, right) => left - right);
+  return found[Math.floor(found.length / 2)] as number;
+}
+
+/**
+ * The turn the fact came from, cut to one continuous run.
+ *
+ * Never spliced. An earlier version kept both ends of an over-long turn and joined
+ * them, which produced sentences nobody said -- "и всё всё всё про те(…omitted…)м
+ * старом Opel Omega" was one message, cut in the middle and welded back, and it
+ * reads as a single broken clause written by the user. Losing one end is a gap;
+ * joining two ends is a fabrication, and only one of those is honest.
+ */
+function centreOf(message: EpisodeMessage, fact: string, radius: number): string {
   const head = `[${message.speaker}] `;
   const text = message.text.trim();
-  const room = budget - head.length;
+  const room = radius * 2 - head.length;
   if (text.length <= room) return `${head}${text}`;
-  const side = Math.max(MIN_FRAGMENT, Math.floor((room - OMITTED.length) / 2));
-  return `${head}${text.slice(0, side)}${OMITTED}${text.slice(-side)}`;
+
+  const at = whereItWasSaid(text, fact);
+  let start = Math.max(0, at - Math.floor(room / 2));
+  const end = Math.min(text.length, start + room);
+  start = Math.max(0, end - room);
+  return `${head}${start > 0 ? OMITTED : ""}${text.slice(start, end)}${end < text.length ? OMITTED : ""}`;
 }
 
 /**
@@ -124,6 +155,7 @@ export function excerptAround(
   messages: readonly EpisodeMessage[],
   at: number,
   radius: number,
+  fact = "",
 ): string {
   if (messages.length === 0 || at < 0 || at >= messages.length) return "";
 
@@ -165,7 +197,7 @@ export function excerptAround(
     break;
   }
 
-  const centre = middleTruncated(messages[at] as EpisodeMessage, radius * 2);
+  const centre = centreOf(messages[at] as EpisodeMessage, fact, radius);
   const body = [...above, centre, ...below];
   if (first > 0) body.unshift(ELISION);
   if (last < messages.length - 1) body.push(ELISION);
@@ -223,7 +255,7 @@ export async function factSources(
     if (index >= quoteTop) return { episode: source.name };
 
     const text = typeof fact.fact === "string" ? fact.fact : "";
-    const excerpt = excerptAround(source.messages, bestMessage(source.messages, text), chars);
+    const excerpt = excerptAround(source.messages, bestMessage(source.messages, text), chars, text);
     if (!excerpt || quoted.has(excerpt)) return { episode: source.name };
     quoted.add(excerpt);
     return { episode: source.name, excerpt };

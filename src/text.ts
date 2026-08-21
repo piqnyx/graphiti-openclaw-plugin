@@ -318,8 +318,11 @@ function xmlEscape(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
+/** A fact on its own, or a fact with the conversation it was drawn from. */
+export type RecallEntry = string | { fact: string; context?: string };
+
 export function buildRecallBlockDetailed(
-  facts: readonly string[],
+  facts: readonly RecallEntry[],
   maxChars: number,
 ): RecallBlockResult {
   const prefix = [
@@ -332,9 +335,13 @@ export function buildRecallBlockDetailed(
   const lines: string[] = [];
   let used = prefix.length + suffix.length;
   let skippedFacts = 0;
+  // Counted apart from the lines: an expanded fact writes several of them, and the
+  // caller is reporting how much memory it injected, not how tall the block is.
+  let injectedFacts = 0;
 
-  for (const fact of facts) {
-    const clean = sanitizeConversationText(fact);
+  for (const entry of facts) {
+    const source = typeof entry === "string" ? { fact: entry } : entry;
+    const clean = sanitizeConversationText(source.fact);
     if (!clean) continue;
     const line = `- ${xmlEscape(clean)}`;
     const extra = line.length + (lines.length > 0 ? 1 : 0);
@@ -344,6 +351,21 @@ export function buildRecallBlockDetailed(
     }
     lines.push(line);
     used += extra;
+    injectedFacts += 1;
+
+    // The context is an extra, never a reason to lose the fact it belongs to: it is
+    // offered only once its own fact is already in, and dropped in silence when the
+    // budget cannot hold it.
+    const context = sanitizeConversationText(source.context ?? "");
+    if (!context) continue;
+    const quoted = context
+      .split("\n")
+      .map((row) => `    ${xmlEscape(row)}`)
+      .join("\n");
+    const attached = `  ↳ сказано так:\n${quoted}`;
+    if (used + attached.length + 1 > maxChars) continue;
+    lines.push(attached);
+    used += attached.length + 1;
   }
 
   if (lines.length === 0) {
@@ -351,7 +373,7 @@ export function buildRecallBlockDetailed(
   }
   return {
     block: `${prefix}${lines.join("\n")}${suffix}`,
-    injectedFacts: lines.length,
+    injectedFacts,
     skippedFacts,
   };
 }
@@ -376,13 +398,18 @@ export function isSupersededFact(entry: unknown): boolean {
   return typeof invalidAt === "string" && invalidAt.trim().length > 0;
 }
 
-export function factTextsInForce(facts: readonly unknown[]): string[] {
-  const texts: string[] = [];
+export function factsInForce(facts: readonly unknown[]): Record<string, unknown>[] {
+  const kept: Record<string, unknown>[] = [];
   for (const entry of facts) {
     if (isSupersededFact(entry)) continue;
+    if (typeof entry !== "object" || entry === null) continue;
     const fact = entry as { fact?: unknown };
     if (typeof fact.fact !== "string" || !fact.fact.trim()) continue;
-    texts.push(fact.fact);
+    kept.push(entry as Record<string, unknown>);
   }
-  return texts;
+  return kept;
+}
+
+export function factTextsInForce(facts: readonly unknown[]): string[] {
+  return factsInForce(facts).map((fact) => fact.fact as string);
 }

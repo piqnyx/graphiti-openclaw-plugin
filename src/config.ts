@@ -1,3 +1,4 @@
+import { parseMessageRule, MAX_MESSAGE_RULES, type MessageRule } from "./message-rules.js";
 import { MIN_BUFFER_TIMEOUT_SEC } from "./capture-constants.js";
 import { compileSessionPattern } from "./session-filter.js";
 
@@ -116,6 +117,7 @@ export type GraphitiPluginConfig = {
    */
   adoptExistingHistoryOnFirstSight: boolean;
   excludeSessionPatterns: string[];
+  messageRules: MessageRule[];
   agentTools: boolean;
   browseChars: number;
   browseMaxChars: number;
@@ -183,6 +185,9 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
     ":setup-inference:",
     "incognito-probe",
   ],
+  // Пусто намеренно. Правило стирает сказанное, и включать такое
+  // по умолчанию нельзя -- это делается руками и осознанно.
+  messageRules: [],
   agents: {
     main: { user: "Вит", assistant: "Краб" },
   },
@@ -244,6 +249,23 @@ function nonEmptyName(value: unknown, what: string): string {
   return value.trim();
 }
 
+function messageRulesValue(raw: unknown): MessageRule[] {
+  if (raw === undefined) return [...DEFAULT_CONFIG.messageRules];
+  if (!Array.isArray(raw)) throw new Error("messageRules must be an array of objects");
+  if (raw.length > MAX_MESSAGE_RULES) {
+    throw new Error(`messageRules accepts at most ${MAX_MESSAGE_RULES} rules`);
+  }
+  const rules = raw.map((rule, index) => parseMessageRule(rule, index));
+  const seen = new Set<string>();
+  for (const rule of rules) {
+    // Two rules under one name make the log ambiguous, and the log is the only
+    // way to see that a rule fired at all.
+    if (seen.has(rule.name)) throw new Error(`messageRules has two rules named "${rule.name}"`);
+    seen.add(rule.name);
+  }
+  return rules;
+}
+
 const MAX_EXCLUDE_PATTERNS = 64;
 const MAX_EXCLUDE_PATTERN_LENGTH = 512;
 
@@ -303,7 +325,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
     "recallPool", "recallRerank", "recallMinScore", "recallContextMinScore", "recallMinSpread", "recallVectorMinScore",
     "recallExpandTop", "recallExpandChars",
     "recallHistoryMaxMessages", "recallHistoryMaxChars", "logOperations", "logLevel",
-    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "agentTools",
+    "logContent", "logModelInput", "bufferLimit", "bufferTimeout", "agentDbPath", "adoptExistingHistoryOnFirstSight", "excludeSessionPatterns", "messageRules", "agentTools",
     "browseChars", "browseMaxChars", "browseMaxEpisodes", "browseMaxTotalChars", "agents",
   ]);
 
@@ -345,6 +367,7 @@ export function parseConfig(input: unknown): GraphitiPluginConfig {
       "adoptExistingHistoryOnFirstSight",
     ),
     excludeSessionPatterns: excludeSessionPatternsValue(raw.excludeSessionPatterns),
+    messageRules: messageRulesValue(raw.messageRules),
     agentTools: booleanValue(raw.agentTools, DEFAULT_CONFIG.agentTools, "agentTools"),
     browseChars: integerValue(raw.browseChars, DEFAULT_CONFIG.browseChars, "browseChars", 128, 200_000),
     browseMaxChars: integerValue(raw.browseMaxChars, DEFAULT_CONFIG.browseMaxChars, "browseMaxChars", 128, 200_000),

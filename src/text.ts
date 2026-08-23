@@ -1,3 +1,4 @@
+import { applyMessageRules, type CompiledMessageRule } from "./message-rules.js";
 // (text.ts — утилиты санитизации conversation messages и recall)
 
 const GRAPHITI_CONTEXT_RE = /<graphiti-context\b[^>]*>[\s\S]*?<\/graphiti-context>/gi;
@@ -136,6 +137,16 @@ export type ConversationMessage = {
 
 export type RecallQueryOptions = {
   useHistory: boolean;
+  /**
+   * The same rules capture uses, applied here too.
+   *
+   * The query is built from the last few turns, so a table of several thousand
+   * characters sitting among them becomes the query: the search then looks for
+   * whatever the table is about instead of what was asked, and returns nothing
+   * useful. Filtering in one place and not the other would leave recall poisoned
+   * by text the graph itself refused to store.
+   */
+  messageRules?: readonly CompiledMessageRule[];
   historyMaxMessages: number;
   historyMaxChars: number;
   maxChars: number;
@@ -290,15 +301,28 @@ export function buildRecallQuery(
   history: readonly ConversationMessage[],
   options: RecallQueryOptions,
 ): string {
-  const currentPrompt = sanitizeConversationText(prompt);
+  const rules = options.messageRules ?? [];
+  const sanitized = sanitizeConversationText(prompt);
+  const ruledPrompt = sanitized ? applyMessageRules(sanitized, rules) : undefined;
+  // A prompt that is itself a report leaves nothing to search for. Answering
+  // with silence is right: the alternative is searching the graph for the
+  // contents of a status table.
+  const currentPrompt = ruledPrompt?.kept ? ruledPrompt.text : "";
   if (!currentPrompt) return "";
 
   if (!options.useHistory) {
     return keepTail(currentPrompt, options.maxChars).trim();
   }
 
+  const ruledHistory = rules.length
+    ? history.flatMap((message) => {
+        const outcome = applyMessageRules(message.text, rules);
+        return outcome.kept ? [{ ...message, text: outcome.text }] : [];
+      })
+    : history;
+
   const rendered = prepareRecallHistory(
-    history,
+    ruledHistory,
     options.historyMaxMessages,
     options.historyMaxChars,
     currentPrompt,

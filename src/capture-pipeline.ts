@@ -8,6 +8,7 @@ import {
 import { CaptureLease } from "./capture-lease.js";
 import { resolveCaptureSpoolPath, resolveOpenClawStateDir } from "./capture-spool.js";
 import { DEFAULT_ACTORS, type GraphitiPluginConfig } from "./config.js";
+import { applyMessageRules, type CompiledMessageRule } from "./message-rules.js";
 import {
   DurableBufferEngine,
   type DurableAgentSink,
@@ -124,8 +125,9 @@ export function createCapturePipeline(params: {
   cfg: GraphitiPluginConfig;
   logger: GraphitiLogger;
   excludedSessionPatterns: readonly RegExp[];
+  messageRules: readonly CompiledMessageRule[];
 }): CapturePipeline {
-  const { api, cfg, logger, excludedSessionPatterns } = params;
+  const { api, cfg, logger, excludedSessionPatterns, messageRules } = params;
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs, (kind, body) => {
     logger.debugContent(
       kind === "request" ? "mcp_raw_request" : "mcp_raw_response",
@@ -696,6 +698,29 @@ export function createCapturePipeline(params: {
         let logged = 0;
         for (const row of fresh) {
           const [message] = extractConversationMessages([row.message]);
+          // A rule may drop the turn or rewrite it. Applied after sanitisation
+          // so patterns are written against the text the graph would receive,
+          // not against whatever markup the transcript happened to carry.
+          const ruled = message ? applyMessageRules(message.text, messageRules) : undefined;
+          const kept = message && ruled?.kept ? { ...message, text: ruled.text } : undefined;
+
+          if (ruled?.rule) {
+            // Always logged, never sampled: this is the one mechanism here that
+            // deletes what was said, and a silent deletion is indistinguishable
+            // from a bug. The rule name and the size of what went are enough to
+            // recognise a rule that is eating more than it was meant to.
+            logger.info("capture_message_rule", {
+              agentId,
+              group_id: agentId,
+              saga: sessionKey,
+              seq: row.seq,
+              rule: ruled.rule.name,
+              mode: ruled.rule.mode,
+              role: message?.role,
+              originalChars: ruled.original.length,
+            });
+          }
+
           if (logged < MAX_LOGGED_ROWS) {
             logged += 1;
               logger.debugContent(
@@ -703,12 +728,18 @@ export function createCapturePipeline(params: {
               { agentId, group_id: agentId, saga: sessionKey, seq: row.seq, eventId: row.eventId },
               {
                 rawText: describeContent(row.message),
-                sanitized: message?.text ?? "",
-                verdict: message ? "captured" : "dropped_by_sanitisation",
+                sanitized: kept?.text ?? "",
+                verdict: !message
+                  ? "dropped_by_sanitisation"
+                  : !ruled?.kept
+                    ? `dropped_by_rule:${ruled?.rule?.name ?? "?"}`
+                    : ruled.rule
+                      ? `replaced_by_rule:${ruled.rule.name}`
+                      : "captured",
               },
             );
           }
-          if (message) delta.push(message);
+          if (kept) delta.push(kept);
         }
         if (fresh.length > MAX_LOGGED_ROWS) {
           logger.debug("capture_rows_not_logged", {

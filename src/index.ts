@@ -1,3 +1,4 @@
+import { compileMessageRules } from "./message-rules.js";
 import {
   createCapturePipeline,
   resolveDurableCaptureRoot,
@@ -55,6 +56,8 @@ export function register(api: OpenClawPluginApi): void {
 
   const logger = createGraphitiLogger(api.logger, cfg);
   const excludedSessionPatterns = compileSessionPatterns(cfg.excludeSessionPatterns);
+  // Compiled once: a rule is tested against every conversational row.
+  const messageRules = compileMessageRules(cfg.messageRules);
 
   let capture: CapturePipeline | undefined;
   let client: GraphitiMcpClient;
@@ -66,7 +69,7 @@ export function register(api: OpenClawPluginApi): void {
       acquired = acquireCaptureRuntime<CapturePipeline>({
         fingerprint: JSON.stringify({ cfg, durableRoot: resolveDurableCaptureRoot() }),
         isStopped: (candidate) => candidate.engine.isStopped(),
-        create: () => createCapturePipeline({ api, cfg, logger, excludedSessionPatterns }),
+        create: () => createCapturePipeline({ api, cfg, logger, excludedSessionPatterns, messageRules }),
       });
     } catch (error) {
       // Losing the race for the spool costs this registration its writing, and
@@ -200,6 +203,7 @@ export function register(api: OpenClawPluginApi): void {
             maxChars: cfg.recallQueryMaxChars,
             userName: cfg.agents[agentId]?.user,
             assistantName: cfg.agents[agentId]?.assistant,
+            messageRules,
           },
         );
         if (!query) return;
@@ -345,6 +349,9 @@ export function register(api: OpenClawPluginApi): void {
     agents: Object.entries(cfg.agents).map(
       ([agentId, actors]) => `${agentId}:user=${actors.user}:assistant=${actors.assistant}`,
     ),
+    // Names and modes, not the patterns: the startup line should let you see at
+    // a glance which rules are live without becoming unreadable.
+    messageRules: cfg.messageRules.map((rule) => `${rule.name}:${rule.mode}`),
     captureMode: cfg.autoCapture ? "segmented_durable_fifo_v1" : "disabled",
     captureRuntime: captureOutcome,
     captureDurableQueue: Boolean(capture),

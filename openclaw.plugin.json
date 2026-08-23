@@ -208,6 +208,51 @@
           "null"
         ],
         "description": "Cosine floor on what the vector search returns at all. Null leaves the library's 0.6, which makes a wide pool arrive narrow."
+      },
+      "messageRules": {
+        "type": "array",
+        "maxItems": 32,
+        "description": "Rules applied to every conversational message before it reaches the graph and before it becomes a recall query. Use them for text that is answered once and stale within the hour -- a tool's status table stored as a fact will still be asserted tomorrow, when it is wrong. Empty by default: a rule deletes what was said, so it is switched on deliberately.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "pattern",
+            "mode"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "description": "What the log reports when this rule fires. Must be unique."
+            },
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "Regular expression searched for anywhere in the message text."
+            },
+            "flags": {
+              "type": "string",
+              "pattern": "^[imsu]*$",
+              "description": "Regular expression flags. Only i, m, s and u are accepted."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "ignore",
+                "replace"
+              ],
+              "description": "ignore drops the message. replace keeps the turn and substitutes its text, so the chronology survives and there is still nothing to extract."
+            },
+            "replacement": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "The whole message text under mode replace. Required there, unused under ignore."
+            }
+          }
+        }
       }
     }
   }

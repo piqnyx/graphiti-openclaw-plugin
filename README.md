@@ -61,6 +61,49 @@ Every tool, read-only ones included, refuses a run with no session: memory belon
 
 There is deliberately no destructive tool. The Graphiti MCP delete endpoints take no group id and run against the driver's default database rather than the agent's graph, so exposing them to an agent could not be made isolation-safe. See `TODO.md` for what would have to be true first.
 
+## Text that is true for an hour
+
+A tool that answers with a table is read once and is stale by morning. The graph
+has no such notion: what it is given is stored as a fact and asserted from then
+on, and asking the same question daily entrenches it rather than correcting it.
+Superseding what is already stored is the least reliable part of the pipeline, so
+the cheap moment to act is before the text is stored at all.
+
+`messageRules` is that moment. Each rule carries a name, a regular expression
+searched for anywhere in the message, and what to do on a match:
+
+```json
+"messageRules": [
+  {
+    "name": "proxy-status-report",
+    "pattern": "\u27e6gemini_proxy_status\u27e7",
+    "mode": "replace",
+    "replacement": "[отчёт по ключам]"
+  }
+]
+```
+
+`replace` is usually the right mode. Dropping an assistant turn leaves the graph
+holding a question that was never answered; replacing it keeps the chronology and
+the fact that something was said, with nothing left to extract.
+
+The same rules run over the recall query. It is built from the last few turns, so
+a table sitting among them would become the thing being searched for — filtering
+in one place and not the other would leave recall poisoned by text the graph
+itself refused to store.
+
+Two cautions from how this was arrived at. Write the pattern against something
+that cannot be typed in conversation: a rule matching the words a report happens
+to use will eventually eat a real message about the same subject, and a silently
+eaten message is only noticed weeks later as a hole in memory. And prefer a
+pattern the generating tool emits deliberately — a marker present in every one of
+its answers — over one drawn from a report's contents, which vary with what the
+report has to say.
+
+Every firing is logged at info level as `capture_message_rule` with the rule
+name, the mode and the size of what was removed. This mechanism deletes data;
+a deletion nobody can see is indistinguishable from a bug.
+
 ## Configuration
 
 | Key | Default | Meaning |
@@ -71,6 +114,7 @@ There is deliberately no destructive tool. The Graphiti MCP delete endpoints tak
 | `agentTools` | `true` | Register the `graphiti_*` tools |
 | `agents` | `{main: …}` | Maps `agentId` to the canonical participant names written into every episode. An unlisted agent is still captured, under default names, and is reported once in the log |
 | `excludeSessionPatterns` | cron/heartbeat/subagent/slug/setup probes | Regular expressions tested against the session key **and** the run trigger. A match excludes the session from capture, recall and tools alike. Overriding the list replaces the whole policy |
+| `messageRules` | none | Rules applied to each conversational message before it is captured **and** before it becomes a recall query. `mode: "ignore"` drops the message; `mode: "replace"` keeps the turn and substitutes its text. First match wins. Empty by default — a rule deletes what was said |
 | `bufferLimit` | `4` | Messages per batch. Larger batches extract richer entities and call the LLM less often; the ceiling is what your Graphiti LLM backend digests reliably |
 | `agentDbPath` | *(empty)* | Where an agent's transcript store lives; `{agentId}` is substituted. Empty resolves to `<state dir>/agents/{agentId}/agent/openclaw-agent.sqlite`. A store that exists but no longer matches the columns capture reads stops the plugin loading; a store that does not exist yet is normal and simply waited for |
 | `adoptExistingHistoryOnFirstSight` | `false` | Skip whatever a session already holds the first time it is seen. Off, because a conversation that starts now is written and read in the same turn and skipping it would drop its opening exchange. Turn on only when the plugin's own state was discarded while the memory it fed still holds that history |

@@ -561,9 +561,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         "[episode] a piece of conversation that matched. " +
         "The number after the kind is how well it matches the query, not its position: 0.4 is a good answer, 0.15 is a distant one. " +
         "Anything too weak to be worth reading is withheld, so an empty answer means memory has nothing — not that the search failed. " +
-        "This is a survey, not the record: a fact is one sentence somebody else wrote about a conversation, so it settles who, where and whether — " +
-        "'is Марина Антон's wife' is answered here and needs nothing more. " +
-        "It cannot give you the wording, the tone, what was said around it or why. For that, take the anchors to graphiti_browse with the same query you searched with. " +
+        "This is a survey, not the record: a fact is one sentence somebody else wrote about a conversation, so it settles who, where and whether. " +
+        "A short factual question is answered here and needs nothing further. " +
+        "It cannot give you the wording, the tone, what was said around it or why — for that, take the anchors to graphiti_browse with the same query you searched with. " +
         "Each hit lists anchors like 8248439450-12; the number beside one is how many hits point at it, so the biggest number is where the answer lives. " +
         "Memory is injected automatically before each reply — search when that was not enough. Found nothing? Try the OpenViking search tools.",
       parameters: {

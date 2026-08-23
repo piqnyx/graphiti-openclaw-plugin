@@ -603,23 +603,26 @@ test("a window of zero on both sides leaves the anchor alone, without its neighb
   );
   const shown = result.content[0].text;
   assert.match(shown, /реплика 8248439450-12/);
-  assert.ok(!shown.includes("8248439450-11"), "сосед не должен попасть в нулевое окно");
-  assert.ok(!shown.includes("8248439450-13"), "сосед не должен попасть в нулевое окно");
+  assert.ok(!shown.includes("реплика 8248439450-11"), "содержимое соседа не должно попасть в нулевое окно");
+  assert.ok(!shown.includes("реплика 8248439450-13"), "содержимое соседа не должно попасть в нулевое окно");
 });
 
-test("neighbours reaches further back than the default three when asked", async (t) => {
+test("a window that runs out of episode reaches into the one next to it", async (t) => {
   const calls = installFetch(t, neighbourhood());
   const { tools } = makeRuntime();
-  await call(
+  const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: ["8248439450-12"], neighbours: 6 },
+    { episodes: ["8248439450-12"], query: "реплика" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
+  // Эпизод из одной реплики исчерпывается сразу, бюджет остаётся — значит шов.
   const asked = calls
     .filter((c) => c.name === "get_episodes_by_ref")
     .flatMap((c) => c.arguments.names ?? []);
-  assert.ok(asked.includes("8248439450-6"), "шестой сосед назад должен запрашиваться");
+  assert.ok(asked.includes("8248439450-11"), "сосед сверху должен запрашиваться");
+  assert.ok(asked.includes("8248439450-13"), "сосед снизу должен запрашиваться");
+  assert.match(result.content[0].text, /is before this one|is after it/);
 });
 
 test("a trimmed window says how many messages it left out", async (t) => {
@@ -637,7 +640,7 @@ test("a trimmed window says how many messages it left out", async (t) => {
     { episodes: [{ episode: "8248439450-12", before: 600, after: 600 }] },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
-  assert.match(result.content[0].text, /message\(s\) not shown/);
+  assert.match(result.content[0].text, /more in this episode — call again with/);
 });
 
 test("several anchors each get a share, so the first cannot spend the whole reply", async (t) => {
@@ -661,11 +664,17 @@ test("several anchors each get a share, so the first cannot spend the whole repl
   }
 });
 
-test("trimming cuts between messages, never inside one", async (t) => {
+test("only the edges of a window are cut, and a cut edge says so", async (t) => {
   installFetch(t, {
     get_episodes_by_ref: (args) => ({
       episodes: (args.names ?? []).map((name) =>
-        episodeWith(name, ...Array.from({ length: 30 }, (_, i) => `КОНЕЦ${i}${"ю".repeat(300)}ХВОСТ${i}`)),
+        episodeWith(
+          name,
+          ...Array.from(
+            { length: 12 },
+            (_, i) => `начало${i} ${"слово ".repeat(60)}конец${i}`,
+          ),
+        ),
       ),
     }),
   });
@@ -673,17 +682,16 @@ test("trimming cuts between messages, never inside one", async (t) => {
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: [{ episode: "8248439450-12", before: 400, after: 400 }] },
+    { episodes: [{ episode: "8248439450-12", before: 500, after: 500 }], query: "начало6 конец6" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
-  // Каждое сообщение начинается КОНЕЦ и кончается ХВОСТ. Если резали посреди,
-  // хотя бы одно начало останется без своего конца.
   const shown = result.content[0].text;
-  const starts = (shown.match(/КОНЕЦ\d+/g) ?? []).length;
-  const ends = (shown.match(/ХВОСТ\d+/g) ?? []).length;
-  assert.ok(starts > 0, "проверять нечего, если не показано ни одного сообщения");
-  assert.ok(shown.includes("message(s) not shown"), "окно в 400 символов обязано что-то отрезать");
-  assert.equal(starts, ends, "обрезка не должна рубить сообщение пополам");
+  // Найденное сообщение показывается целиком: у него есть и начало, и конец.
+  assert.ok(shown.includes("начало6") && shown.includes("конец6"), "центр окна не режется");
+  // Обрезанный край помечается, а не обрывается молча.
+  if (/начало5/.test(shown) && !/конец5/.test(shown)) {
+    assert.match(shown, /\(…omitted…\)/, "срезанный край обязан быть помечен");
+  }
 });
 
 test("overlapping anchors point at each other instead of repeating the same episodes", async (t) => {
@@ -745,4 +753,54 @@ test("the default window is a glance, not a whole batch", async (t) => {
   const shown = result.content[0].text;
   assert.ok(shown.length < 20_000, `окно по умолчанию слишком широкое: ${shown.length} символов`);
   assert.match(shown, /8248439450-12/, "сам якорь обязан присутствовать");
+});
+
+test("a one-sided window walks forward without re-reading what is above", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(
+          name,
+          ...Array.from({ length: 12 }, (_, i) => `${name}реплика${i} ${"слово ".repeat(40)}`),
+        ),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 0, after: 2000 }], query: "8248439450-12реплика6" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  const shown = result.content[0].text;
+  assert.ok(shown.includes("8248439450-12реплика6"), "центр обязан присутствовать");
+  assert.ok(shown.includes("8248439450-12реплика7"), "вперёд читать обязано");
+  assert.ok(!shown.includes("8248439450-12реплика5"), "назад при before: 0 не смотрим");
+});
+
+test("the window centres on the query, not on the start of the episode", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(
+          name,
+          ...Array.from({ length: 12 }, (_, i) => `${name}реплика${i} ${"слово ".repeat(40)}`),
+        ),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const focused = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 400, after: 400 }], query: "8248439450-12реплика9" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.ok(focused.content[0].text.includes("8248439450-12реплика9"), "наводка обязана попасть в окно");
+  assert.ok(
+    !focused.content[0].text.includes("8248439450-12реплика0"),
+    "начало этого же эпизода не должно вытеснять наводку",
+  );
+  assert.match(focused.content[0].text, /centred on/);
 });

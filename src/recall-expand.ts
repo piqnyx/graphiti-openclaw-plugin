@@ -123,8 +123,34 @@ export function excerptAround(
   messages: readonly EpisodeMessage[],
   at: number,
   radius: number,
+  below?: number,
 ): string {
-  if (messages.length === 0 || at < 0 || at >= messages.length) return "";
+  return excerptSpan(messages, at, radius, below).text;
+}
+
+/** The same window, with where it started and stopped. */
+export type Excerpt = { text: string; first: number; last: number };
+
+/**
+ * The window, and the two indices it reached.
+ *
+ * A caller that can fetch more conversation -- the neighbouring episode, say --
+ * needs to know whether the window stopped because the budget ran out or because
+ * the episode did. The text alone cannot say: an elision means messages were left
+ * behind, and its absence means the edge was reached, which is the same shape for
+ * both answers.
+ */
+export function excerptSpan(
+  messages: readonly EpisodeMessage[],
+  at: number,
+  aboveBudget: number,
+  belowBudget?: number,
+): Excerpt {
+  const radius = aboveBudget;
+  const belowAsked = belowBudget ?? aboveBudget;
+  if (messages.length === 0 || at < 0 || at >= messages.length) {
+    return { text: "", first: 0, last: -1 };
+  }
 
   // A side that cannot spend its share gives it to the other. The radius is meant as
   // "about this much conversation around the fact", and holding each side to its half
@@ -133,8 +159,11 @@ export function excerptAround(
   // unchanged: what one side gains the other could not have used.
   const aboveAvailable = at > 0 ? span(messages, 0, at - 1) : 0;
   const belowAvailable = at < messages.length - 1 ? span(messages, at + 1, messages.length - 1) : 0;
-  const aboveRadius = radius + Math.max(0, radius - belowAvailable);
-  const belowRadius = radius + Math.max(0, radius - aboveAvailable);
+  // A side asked for nothing is given nothing: the spill exists to widen a window
+  // cramped by an edge, not to overrule a caller who said which way to read. That
+  // is what makes `before: 0, after: 4000` walk forward instead of drifting back.
+  const aboveRadius = radius > 0 ? radius + Math.max(0, belowAsked - belowAvailable) : 0;
+  const belowRadius = belowAsked > 0 ? belowAsked + Math.max(0, radius - aboveAvailable) : 0;
 
   const above: string[] = [];
   let room = aboveRadius;
@@ -180,7 +209,7 @@ export function excerptAround(
   const body = [...above, centre, ...below];
   if (first > 0) body.unshift(ELISION);
   if (last < messages.length - 1) body.push(ELISION);
-  return body.join("\n");
+  return { text: body.join("\n"), first, last };
 }
 
 /** Every episode uuid the facts name, in order, without repeats. */

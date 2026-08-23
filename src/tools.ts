@@ -3,8 +3,9 @@ import { episodeNamePrefix } from "./episode-sequence.js";
 import { requireAgentId } from "./identity.js";
 import type { GraphitiLogger } from "./logging.js";
 import type { GraphitiMcpClient } from "./mcp-client.js";
+import { bestMessage, excerptSpan } from "./recall-expand.js";
 import { matchSessionExclusion } from "./session-filter.js";
-import { sanitizeConversationText } from "./text.js";
+import { episodeMessages, sanitizeConversationText } from "./text.js";
 import type { PluginToolContext, PluginToolDefinition, PluginToolResult } from "./types.js";
 
 /** Every agent-facing tool carries this prefix so operators can allowlist them as a group. */
@@ -33,9 +34,10 @@ const TOP_ENTITIES = 10;
 const DEFAULT_CONTEXT_CHARS = 2_000;
 const MAX_CONTEXT_CHARS = 20_000;
 /** How many batches either side of an anchor graphiti_browse reads. */
-/** Episodes fetched either side of an anchor, unless the caller says otherwise. */
-const BROWSE_NEIGHBOURS = 3;
-const MAX_BROWSE_NEIGHBOURS = 12;
+// Neighbours are no longer a depth. The window is centred inside one episode, and
+// the episode next to it is reached only when the window runs out of episode with
+// budget to spare -- one step, because a caller who wants the one after that has
+// its name and can ask for it as an anchor of its own.
 
 /**
  * Split an episode name into the dialog it belongs to and its batch number.
@@ -302,97 +304,116 @@ function omitted(count: number, where: string, widen: string): string {
     : "";
 }
 
+/**
+ * The conversation around what was asked about, inside one episode.
+ *
+ * An episode is a batch of twenty messages and runs to thousands of characters, so
+ * opening one and reading from its start answers a question nobody asked. The point
+ * of an anchor is that something in it matched; the window belongs around that
+ * something. Which message it is comes from the same word-overlap that puts the
+ * quote under a recalled fact -- one mechanism, so a passage found by search and a
+ * passage found by recall are chosen the same way.
+ *
+ * Without a focus there is nothing to centre on and the episode is read from its
+ * start, which is the one case where the old behaviour is still the right answer.
+ */
 async function readAround(
   client: GraphitiMcpClient,
   agentId: string,
   anchor: string,
   before: number,
   after: number,
-  neighbours: number,
   share: number,
   seen: Set<string>,
+  focus: string,
 ): Promise<string> {
   const centre = (await client.getEpisodesByRef(agentId, { names: [anchor] }))[0];
   if (!centre) return "";
 
   const centreName = typeof centre.name === "string" ? centre.name : anchor;
+  if (seen.has(centreName)) return `── ${centreName} ── already shown above`;
+  seen.add(centreName);
+
+  const messages = episodeMessages(typeof centre.content === "string" ? centre.content : "");
+  if (messages.length === 0) return "";
+
+  const at = focus ? bestMessage(messages, focus) : 0;
+  const window = excerptSpan(messages, at, Math.min(before, share), Math.min(after, share));
+  if (!window.text) return "";
+
+  const sections = [window.text];
+  let room = Math.max(0, share - window.text.length);
+
+  // Only when the window ran out of episode rather than out of budget. Reaching the
+  // edge with room left is the one case where the neighbour is what the caller was
+  // reaching for; every other time it is conversation they did not ask to see.
   const position = splitEpisodeName(centreName);
-  let window: Record<string, unknown>[] = [centre];
-  if (position && neighbours > 0) {
-    const names: string[] = [];
-    for (let step = 1; step <= neighbours; step += 1) {
-      if (position.number - step > 0) names.push(`${position.prefix}-${position.number - step}`);
-      names.push(`${position.prefix}-${position.number + step}`);
+  if (position && room > 0) {
+    const wanted: { name: string; side: "above" | "below" }[] = [];
+    if (window.first === 0 && before > 0 && position.number > 1) {
+      wanted.push({ name: `${position.prefix}-${position.number - 1}`, side: "above" });
     }
-    const found = await client.getEpisodesByRef(agentId, { names });
-    window = [...found, centre];
+    if (window.last === messages.length - 1 && after > 0) {
+      wanted.push({ name: `${position.prefix}-${position.number + 1}`, side: "below" });
+    }
+    // One request for both sides, and each episode is labelled with the name it
+    // came back under rather than the one that was asked for: a server free to
+    // answer with something adjacent would otherwise have its reply filed under
+    // the wrong episode, which is worse than not showing it.
+    const found = await client.getEpisodesByRef(agentId, { names: wanted.map((w) => w.name) });
+    for (const { name, side } of wanted) {
+      if (room <= 0) continue;
+      if (seen.has(name)) {
+        // Silence here reads as "there is nothing next to this", which is the
+        // opposite of what happened: it is next to it and already on screen.
+        if (side === "above") sections.unshift(`[${name} — shown above]`);
+        else sections.push(`[${name} — shown above]`);
+        continue;
+      }
+      const neighbour = found.find((episode) => text(episode.name) === name);
+      if (!neighbour) continue;
+      const lines = episodeMessages(typeof neighbour.content === "string" ? neighbour.content : "");
+      if (lines.length === 0) continue;
+      // From above take the end of it, from below the beginning: the conversation
+      // continues across the seam, and what is next to the seam is what continues.
+      const edge = side === "above"
+        ? excerptSpan(lines, lines.length - 1, Math.min(room, before), 0)
+        : excerptSpan(lines, 0, 0, Math.min(room, after));
+      if (!edge.text || edge.text.length > room) continue;
+      seen.add(name);
+      room -= edge.text.length;
+      if (side === "above") sections.unshift(`[${name}]\n${edge.text}`);
+      else sections.push(`[${name}]\n${edge.text}`);
+    }
   }
 
-  const ordered = window
-    .map((episode) => ({ episode, at: splitEpisodeName(typeof episode.name === "string" ? episode.name : "")?.number ?? 0 }))
-    .sort((a, b) => a.at - b.at)
-    .filter((entry, index, all) => index === 0 || entry.episode.name !== all[index - 1]?.episode.name);
-
-  const centreIndex = Math.max(ordered.findIndex((entry) => entry.episode.name === centreName), 0);
-  let parts = ordered.map((entry) => renderEpisodeParts(entry.episode));
-
-  // Anchors close together share neighbours, and printing the same exchange under
-  // each of them doubles the reply for nothing -- two anchors four episodes apart
-  // repeated three episodes verbatim, which is what pushed a reply past the host's
-  // own ceiling. An episode already shown becomes a reference to where it is.
-  if (seen.has(parts[centreIndex]?.header ?? "")) {
-    return `── ${centreName} ── already shown above`;
+  const reached: string[] = [];
+  if (window.first === 0 && position && position.number > 1) {
+    reached.push(`${position.prefix}-${position.number - 1} is before this one`);
   }
-  parts = parts.map((section, index) =>
-    index !== centreIndex && seen.has(section.header)
-      ? { header: `${section.header} — shown above`, messages: [] }
-      : section,
-  );
-  for (const section of parts) seen.add(section.header);
+  if (window.last === messages.length - 1 && position) {
+    reached.push(`${position.prefix}-${position.number + 1} is after it`);
+  }
+  const edges = reached.length > 0 ? `\n[start/end of this episode — ${reached.join(", ")}]` : "";
 
-  // The anchor is the answer and the neighbours are context, so the anchor is
-  // served first and only what is left goes to either side. Before this the
-  // anchor was never trimmed at all: one episode of eleven thousand characters
-  // consumed the whole reply, and everything after it was cut mid-sentence by a
-  // blind slice over the assembled text.
-  const centreParts = parts[centreIndex] ?? { header: `[${centreName}]`, messages: [] };
-  const body = fitMessages([centreParts], share, false);
-  let left = Math.max(0, share - body.text.length);
+  const aim = focus
+    ? `centred on "${focus.slice(0, 60)}${focus.length > 60 ? "…" : ""}"`
+    : "no focus given — read from the start; pass query to centre it";
+  const widen =
+    window.first > 0 || window.last < messages.length - 1
+      ? `\n[… more in this episode — call again with before: ${before * 4 || 2048} or after: ${after * 4 || 2048}]`
+      : "";
 
-  // Each side is capped by what was asked for and by what the anchor left over.
-  const headBudget = Math.min(before, left);
-  const head = fitMessages(parts.slice(0, centreIndex), headBudget, true);
-  left = Math.max(0, left - head.text.length);
-  const tail = fitMessages(parts.slice(centreIndex + 1), Math.min(after, left), false);
-
-  const transcript = [
-    omitted(head.droppedMessages, "earlier", `before: ${before * 4 || 2048}, after: 0`),
-    head.text,
-    body.text,
-    tail.text,
-    omitted(
-      tail.droppedMessages + body.droppedMessages,
-      "later",
-      `before: 0, after: ${after * 4 || 2048}`,
-    ),
-  ]
-    .filter(Boolean)
-    .join("\n");
-  if (!transcript) return "";
-
-  // The heading names the anchor, and the episodes under it are whatever the
-  // window reached. Saying only the anchor made a section of four episodes look
-  // like one, which is the difference between "this is all there is" and "this is
-  // where I stopped".
-  const span = [...head.shown, ...body.shown, ...tail.shown];
-  const reach = span.length > 1 ? ` (${span[0]} … ${span[span.length - 1]})` : "";
-  return `── ${centreName}${reach} ──\n${transcript}`;
+  return `── ${centreName} — ${aim} ──\n${sections.join("\n")}${widen}${edges}`;
 }
 
 function limitParam(params: Record<string, unknown>, key: string, fallback: number, max: number): number {
   const value = params[key];
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  return Math.min(Math.max(Math.trunc(value), 1), max);
+  // Zero is an answer, not a mistake. A floor of one turned `before: 0` into one
+  // character and quietly took back the only way to say "read forward from here,
+  // I have already seen what is above".
+  return Math.min(Math.max(Math.trunc(value), 0), max);
 }
 
 /** What the local pipeline is holding for one agent right now. */
@@ -715,11 +736,13 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_browse",
       label: "Read the conversation behind a hit (Graphiti)",
       description:
-        "Read what was actually said, in the dialog it was said in. " +
+        "Read what was actually said, around the thing you were looking for. " +
         "Anchors come from two places: the hits of graphiti_search, and the memory injected before a reply — every quoted memory names the episode it came from. " +
-        "Pass several at once, from different hits if you like. " +
-        "The window is small by design and meant to be widened: read the little that comes back, and if the answer is not in it, call again with a bigger before/after — " +
-        "or one side only, like before: 0, after: 4000, to walk forward through the conversation without re-reading what you have. " +
+        "Give the anchors and a query: the query is what the window is centred on, so pass the fact or the name you are chasing, not a new question. " +
+        "An episode holds twenty messages; without a query you get its opening, which is rarely what you wanted. " +
+        "Per anchor you may say {episode, around, before, after} when different episodes hold different parts of the answer. " +
+        "The window is small by design and meant to be widened: read what comes back, and if the answer is not in it, call again with a bigger before/after — " +
+        "or one side only, like before: 0, after: 4000, to walk forward without re-reading what you have. " +
         "Several calls in a row is how this tool is used, not a sign the first one failed. " +
         "Costlier than searching: use it when the exact wording, tone or surrounding exchange matters.",
       parameters: {
@@ -734,6 +757,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
                   type: "object",
                   properties: {
                     episode: { type: "string" },
+                    around: { type: "string", description: "What to centre on in this episode, when it differs from query." },
                     before: { type: "number" },
                     after: { type: "number" },
                   },
@@ -747,10 +771,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               "read one exchange closely and glance at the rest in the same call.",
           },
           episode: { type: "string", description: "A single anchor, if you have only one." },
-          query: { type: "string", description: "Used only when no anchors are given: finds the conversation behind the best match." },
+          query: { type: "string", description: "What to centre the window on inside each episode — the fact, name or phrase you are chasing. With no anchors it also finds which episode to read." },
           before: { type: "number", description: `Characters before an anchor that did not size itself. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
           after: { type: "number", description: `Characters after such an anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
-          neighbours: { type: "number", description: `Episodes fetched either side of an anchor. Default ${BROWSE_NEIGHBOURS}, maximum ${MAX_BROWSE_NEIGHBOURS}. Raise it to reach further back than the default window can.` },
         },
       },
       async execute(_toolCallId, params, ctx) {
@@ -759,13 +782,12 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
 
         const before = limitParam(params, "before", cfg.browseChars, cfg.browseMaxChars);
         const after = limitParam(params, "after", cfg.browseChars, cfg.browseMaxChars);
-        const neighbours = limitParam(params, "neighbours", BROWSE_NEIGHBOURS, MAX_BROWSE_NEIGHBOURS);
 
         // An anchor is either a bare name or a name with its own window. Both
         // forms are accepted whatever the schema says, because a model that only
         // ever emits strings must not lose the feature, and one that sizes every
         // anchor must not be forced to repeat the default.
-        const asked: { name: string; before: number; after: number }[] = [];
+        const asked: { name: string; before: number; after: number; around: string }[] = [];
         const seen = new Set<string>();
         const remember = (raw: unknown): void => {
           const entry = isRecord(raw) ? raw : { episode: raw };
@@ -776,6 +798,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             name,
             before: limitParam(entry, "before", before, cfg.browseMaxChars),
             after: limitParam(entry, "after", after, cfg.browseMaxChars),
+            around: sanitizeConversationText(text(entry.around)).trim(),
           });
         };
         if (Array.isArray(params.episodes)) for (const item of params.episodes) remember(item);
@@ -804,7 +827,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               : [...(await resolveEpisodeNames(client, resolved.agentId, viaFacts)).values()];
             anchors = [...new Set(names)]
               .slice(0, cfg.browseMaxEpisodes)
-              .map((name) => ({ name, before, after }));
+              .map((name) => ({ name, before, after, around: query }));
           }
 
           if (anchors.length === 0) {
@@ -832,9 +855,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               anchor.name,
               anchor.before,
               anchor.after,
-              neighbours,
               Math.min(share, budget),
               seen,
+              anchor.around || query,
             );
             if (!section) continue;
             const trimmed = section.length > budget ? `${section.slice(0, budget)}…` : section;

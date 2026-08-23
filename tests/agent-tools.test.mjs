@@ -685,3 +685,64 @@ test("trimming cuts between messages, never inside one", async (t) => {
   assert.ok(shown.includes("message(s) not shown"), "окно в 400 символов обязано что-то отрезать");
   assert.equal(starts, ends, "обрезка не должна рубить сообщение пополам");
 });
+
+test("overlapping anchors point at each other instead of repeating the same episodes", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) => episodeWith(name, `реплика ${name}`)),
+    }),
+  });
+  const { tools } = makeRuntime();
+  // Два якоря через два эпизода: их окна по три соседа перекрываются целиком.
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-4", "8248439450-6"], neighbours: 3 },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  const shown = result.content[0].text;
+  const repeated = (shown.match(/реплика 8248439450-5\b/g) ?? []).length;
+  assert.equal(repeated, 1, "общий эпизод должен быть напечатан один раз");
+  assert.match(shown, /shown above/);
+});
+
+test("a cut window names the argument that widens it", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(name, ...Array.from({ length: 20 }, (_, i) => `${name} сообщение ${i} ${"я".repeat(300)}`)),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  const shown = result.content[0].text;
+  assert.match(shown, /call again with/, "подсказка обязана назвать выход, а не только счёт");
+  assert.match(shown, /after: \d+/, "в подсказке должен стоять конкретный аргумент");
+});
+
+test("the default window is a glance, not a whole batch", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(name, ...Array.from({ length: 20 }, (_, i) => `${name} строка ${i} ${"о".repeat(300)}`)),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  // Якорь показывается целиком, соседи — только на 512 символов в каждую сторону.
+  const shown = result.content[0].text;
+  assert.ok(shown.length < 20_000, `окно по умолчанию слишком широкое: ${shown.length} символов`);
+  assert.match(shown, /8248439450-12/, "сам якорь обязан присутствовать");
+});

@@ -158,10 +158,14 @@ export const DEFAULT_CONFIG: GraphitiPluginConfig = {
   // Defaults reproduce the background/slug-generator filtering that used to be
   // hardcoded. They are ordinary config: override or extend them freely.
   agentTools: true,
-  // Generous on purpose: reading the real conversation is the expensive half of
-  // remembering well, and the host manages the context budget. The ceilings are
-  // there to stop an absurd request, not to economise.
-  browseChars: 16_000,
+  // Small on purpose, and raised by asking. Sixteen thousand each side was set
+  // when browse was the only way to read a conversation at all; recall now quotes
+  // the passage behind a fact and search hands out anchors, so the common case is
+  // a glance rather than a whole batch. A window that starts small and says how to
+  // grow costs one extra call when it is too narrow, while one that starts large
+  // costs the reply every time it is too wide -- and the reader cannot give those
+  // characters back. The ceiling below is what a deliberate deep read gets.
+  browseChars: 512,
   browseMaxChars: 32_000,
   browseMaxEpisodes: 10,
   browseMaxTotalChars: 120_000,

@@ -259,7 +259,7 @@ function fitMessages(
   sections: { header: string; messages: string[] }[],
   budget: number,
   fromEnd: boolean,
-): { text: string; droppedMessages: number } {
+): { text: string; droppedMessages: number; shown: string[] } {
   const order = fromEnd ? [...sections].reverse() : sections;
   const kept: { header: string; messages: string[] }[] = [];
   let dropped = 0;
@@ -289,11 +289,17 @@ function fitMessages(
   const text = ordered
     .map((section) => `${section.header}\n${section.messages.join("\n")}`)
     .join("\n");
-  return { text, droppedMessages: dropped };
+  return { text, droppedMessages: dropped, shown: ordered.map((section) => section.header) };
 }
 
-function omitted(count: number, where: string): string {
-  return count > 0 ? `[… ${count} ${where} message(s) not shown; ask for a bigger window]` : "";
+function omitted(count: number, where: string, widen: string): string {
+  // A count alone tells the reader something was cut and nothing about what to do
+  // with that. The window starts deliberately narrow, so the note carries the way
+  // out: the argument to change, and that calling again is how one reads on rather
+  // than an admission that the first call failed.
+  return count > 0
+    ? `[… ${count} ${where} message(s) not shown — call again with ${widen} to read on]`
+    : "";
 }
 
 async function readAround(
@@ -304,6 +310,7 @@ async function readAround(
   after: number,
   neighbours: number,
   share: number,
+  seen: Set<string>,
 ): Promise<string> {
   const centre = (await client.getEpisodesByRef(agentId, { names: [anchor] }))[0];
   if (!centre) return "";
@@ -327,7 +334,21 @@ async function readAround(
     .filter((entry, index, all) => index === 0 || entry.episode.name !== all[index - 1]?.episode.name);
 
   const centreIndex = Math.max(ordered.findIndex((entry) => entry.episode.name === centreName), 0);
-  const parts = ordered.map((entry) => renderEpisodeParts(entry.episode));
+  let parts = ordered.map((entry) => renderEpisodeParts(entry.episode));
+
+  // Anchors close together share neighbours, and printing the same exchange under
+  // each of them doubles the reply for nothing -- two anchors four episodes apart
+  // repeated three episodes verbatim, which is what pushed a reply past the host's
+  // own ceiling. An episode already shown becomes a reference to where it is.
+  if (seen.has(parts[centreIndex]?.header ?? "")) {
+    return `── ${centreName} ── already shown above`;
+  }
+  parts = parts.map((section, index) =>
+    index !== centreIndex && seen.has(section.header)
+      ? { header: `${section.header} — shown above`, messages: [] }
+      : section,
+  );
+  for (const section of parts) seen.add(section.header);
 
   // The anchor is the answer and the neighbours are context, so the anchor is
   // served first and only what is left goes to either side. Before this the
@@ -345,15 +366,27 @@ async function readAround(
   const tail = fitMessages(parts.slice(centreIndex + 1), Math.min(after, left), false);
 
   const transcript = [
-    omitted(head.droppedMessages, "earlier"),
+    omitted(head.droppedMessages, "earlier", `before: ${before * 4 || 2048}, after: 0`),
     head.text,
     body.text,
     tail.text,
-    omitted(tail.droppedMessages + body.droppedMessages, "later"),
+    omitted(
+      tail.droppedMessages + body.droppedMessages,
+      "later",
+      `before: 0, after: ${after * 4 || 2048}`,
+    ),
   ]
     .filter(Boolean)
     .join("\n");
-  return transcript ? `── ${centreName} ──\n${transcript}` : "";
+  if (!transcript) return "";
+
+  // The heading names the anchor, and the episodes under it are whatever the
+  // window reached. Saying only the anchor made a section of four episodes look
+  // like one, which is the difference between "this is all there is" and "this is
+  // where I stopped".
+  const span = [...head.shown, ...body.shown, ...tail.shown];
+  const reach = span.length > 1 ? ` (${span[0]} … ${span[span.length - 1]})` : "";
+  return `── ${centreName}${reach} ──\n${transcript}`;
 }
 
 function limitParam(params: Record<string, unknown>, key: string, fallback: number, max: number): number {
@@ -685,7 +718,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         "Read what was actually said, in the dialog it was said in. " +
         "Anchors come from two places: the hits of graphiti_search, and the memory injected before a reply — every quoted memory names the episode it came from. " +
         "Pass several at once, from different hits if you like. " +
-        "Cut off mid-thought? Call again with a bigger window. " +
+        "The window is small by design and meant to be widened: read the little that comes back, and if the answer is not in it, call again with a bigger before/after — " +
+        "or one side only, like before: 0, after: 4000, to walk forward through the conversation without re-reading what you have. " +
+        "Several calls in a row is how this tool is used, not a sign the first one failed. " +
         "Costlier than searching: use it when the exact wording, tone or surrounding exchange matters.",
       parameters: {
         type: "object",
@@ -780,6 +815,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           }
 
           const sections: string[] = [];
+          // What has already been printed in this reply, so overlapping windows
+          // point at each other instead of repeating.
+          const seen = new Set<string>();
           let budget = cfg.browseMaxTotalChars;
           // An equal share each, so asking for five anchors returns five. Draining
           // one pot in order let the first anchor spend everything and the last
@@ -796,6 +834,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               anchor.after,
               neighbours,
               Math.min(share, budget),
+              seen,
             );
             if (!section) continue;
             const trimmed = section.length > budget ? `${section.slice(0, budget)}…` : section;

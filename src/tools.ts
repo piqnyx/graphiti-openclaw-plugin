@@ -341,7 +341,11 @@ async function readAround(
   const window = excerptSpan(messages, at, Math.min(before, share), Math.min(after, share));
   if (!window.text) return "";
 
-  const sections = [window.text];
+  // The anchor is labelled like its neighbours are. Without it the excerpt ran
+  // straight on from the neighbour above, under that neighbour's header, and the
+  // whole section read as one episode -- a reader could not tell where the part
+  // they asked for began.
+  const sections = [`[${centreName}]\n${window.text}`];
   let room = Math.max(0, share - window.text.length);
 
   // Only when the window ran out of episode rather than out of budget. Reaching the
@@ -775,6 +779,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           before: { type: "number", description: `Characters before an anchor that did not size itself. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
           after: { type: "number", description: `Characters after such an anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
         },
+        required: ["query"],
       },
       async execute(_toolCallId, params, ctx) {
         const resolved = resolve("graphiti_browse", ctx);
@@ -811,6 +816,19 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             tool: "graphiti_browse",
             reason: "no_anchor",
           });
+        }
+        // Anchors without a focus were answered from the start of the episode, and
+        // the reply said so -- and was read as success anyway. An episode is twenty
+        // messages, so its opening is almost never the part that matched; asking
+        // for it by accident should not be possible. The search that produced these
+        // anchors was run on some query, and that query is the one to pass.
+        if (requested.length > 0 && !query && !requested.some((anchor) => anchor.around)) {
+          return errorResult(
+            "graphiti_browse needs to know what to look for inside those episodes. " +
+              "Pass query with the fact, name or phrase you are chasing — the same one the search used — " +
+              "or give an anchor its own around.",
+            { tool: "graphiti_browse", reason: "no_focus" },
+          );
         }
 
         try {

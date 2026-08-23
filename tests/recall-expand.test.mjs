@@ -223,3 +223,30 @@ test("superseded facts are dropped before any source is looked up", () => {
   assert.deepEqual(kept.map((fact) => fact.fact), ["живой"]);
   assert.deepEqual(kept[0].episodes, ["e1"]);
 });
+
+test("the block tells her to use the fact itself as the query, and how wide the quote is", () => {
+  const { block } = buildRecallBlockDetailed(
+    [{ fact: "Вит приютил Барбоса", source: { episode: "8248439450-3", excerpt: "[Вит] про пса" } }],
+    4000,
+    256,
+  );
+  // Назвать эпизод мало: browse надо сказать, что искать внутри него, а факт
+  // для этого уже готов — он предложение из этого же графа.
+  assert.match(block, /the fact itself, word for word, as the query/);
+  assert.match(block, /256 characters either side/);
+  assert.match(block, /several episodes in one call/);
+});
+
+test("without a radius the block still says what to pass, just not how wide", () => {
+  const { block } = buildRecallBlockDetailed(
+    [{ fact: "Вит приютил Барбоса", source: { episode: "8248439450-3", excerpt: "[Вит] про пса" } }],
+    4000,
+  );
+  assert.match(block, /the fact itself, word for word, as the query/);
+  assert.ok(!/characters either side/.test(block));
+});
+
+test("a block with nothing sourced stays free of instructions it cannot act on", () => {
+  const { block } = buildRecallBlockDetailed(["голый факт"], 4000, 256);
+  assert.ok(!/graphiti_browse/.test(block), "не на что ссылаться — не о чем и говорить");
+});

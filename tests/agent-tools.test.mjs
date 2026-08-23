@@ -842,3 +842,34 @@ test("the anchor is labelled with its own name, not run on from its neighbour", 
   );
   assert.match(result.content[0].text, /\[8248439450-12\]/, "у якоря обязана быть своя подпись");
 });
+
+test("a window that needs no neighbour does not ask the server for none", async (t) => {
+  const calls = installFetch(t, {
+    get_episodes_by_ref: (args) => {
+      // Ровно как отвечает настоящий сервер на пустой список.
+      if ((args.names ?? []).length === 0 && (args.uuids ?? []).length === 0) {
+        return { error: "Provide at least one uuid or name" };
+      }
+      return {
+        episodes: (args.names ?? []).map((name) =>
+          episodeWith(name, ...Array.from({ length: 12 }, (_, i) => `${name}строка${i} ${"слово ".repeat(40)}`)),
+        ),
+      };
+    },
+  });
+  const { tools } = makeRuntime();
+  // Наводка в середине эпизода: окно не достаёт ни до начала, ни до конца.
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 300, after: 300 }], query: "8248439450-12строка6" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.ok(result.details.ok, "чтение не должно падать из-за ненужных соседей");
+  assert.match(result.content[0].text, /8248439450-12строка6/);
+  const asked = calls.filter((c) => c.name === "get_episodes_by_ref");
+  for (const c of asked) {
+    const names = c.arguments.names ?? [];
+    assert.ok(names.length > 0, "запрос с пустым списком имён отправлять нельзя");
+  }
+});

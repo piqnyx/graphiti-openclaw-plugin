@@ -360,11 +360,19 @@ async function readAround(
     if (window.last === messages.length - 1 && after > 0) {
       wanted.push({ name: `${position.prefix}-${position.number + 1}`, side: "below" });
     }
+    // Asking for nothing is not a question. When the window sits inside the
+    // episode it touches neither edge, no neighbour is wanted, and the empty list
+    // that used to be sent anyway came back as "Provide at least one uuid or
+    // name" -- which failed the whole read. The window that needed no help was
+    // the one that could not be shown.
+    //
     // One request for both sides, and each episode is labelled with the name it
     // came back under rather than the one that was asked for: a server free to
     // answer with something adjacent would otherwise have its reply filed under
     // the wrong episode, which is worse than not showing it.
-    const found = await client.getEpisodesByRef(agentId, { names: wanted.map((w) => w.name) });
+    const found = wanted.length > 0
+      ? await client.getEpisodesByRef(agentId, { names: wanted.map((w) => w.name) })
+      : [];
     for (const { name, side } of wanted) {
       if (room <= 0) continue;
       if (seen.has(name)) {

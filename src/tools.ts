@@ -561,8 +561,10 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         "[episode] a piece of conversation that matched. " +
         "The number after the kind is how well it matches the query, not its position: 0.4 is a good answer, 0.15 is a distant one. " +
         "Anything too weak to be worth reading is withheld, so an empty answer means memory has nothing — not that the search failed. " +
-        "Each hit lists episode anchors like 8248439450-12; the number beside one is how many hits point at it, so the biggest number is where the answer lives. " +
-        "Pass anchors to graphiti_browse to read what was actually said. " +
+        "This is a survey, not the record: a fact is one sentence somebody else wrote about a conversation, so it settles who, where and whether — " +
+        "'is Марина Антон's wife' is answered here and needs nothing more. " +
+        "It cannot give you the wording, the tone, what was said around it or why. For that, take the anchors to graphiti_browse with the same query you searched with. " +
+        "Each hit lists anchors like 8248439450-12; the number beside one is how many hits point at it, so the biggest number is where the answer lives. " +
         "Memory is injected automatically before each reply — search when that was not enough. Found nothing? Try the OpenViking search tools.",
       parameters: {
         type: "object",
@@ -740,15 +742,15 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_browse",
       label: "Read the conversation behind a hit (Graphiti)",
       description:
-        "Read what was actually said, around the thing you were looking for. " +
-        "Anchors come from two places: the hits of graphiti_search, and the memory injected before a reply — every quoted memory names the episode it came from. " +
-        "Give the anchors and a query: the query is what the window is centred on, so pass the fact or the name you are chasing, not a new question. " +
-        "An episode holds twenty messages; without a query you get its opening, which is rarely what you wanted. " +
-        "Per anchor you may say {episode, around, before, after} when different episodes hold different parts of the answer. " +
-        "The window is small by design and meant to be widened: read what comes back, and if the answer is not in it, call again with a bigger before/after — " +
-        "or one side only, like before: 0, after: 4000, to walk forward without re-reading what you have. " +
+        "Read what was actually said, around the thing you were looking for. The other half of graphiti_search: that one says what is known, this one says how it was said. " +
+        "Anchors come from two places, and each carries its own query with it. From a search: the anchors of a hit, with the query you searched with. " +
+        "From the memory injected before a reply: the episode id under a quoted memory, with that memory's own sentence, word for word — it came out of this graph and finds its way back into the conversation it was drawn from. " +
+        "Never invent a new question to put here; the window is centred on the query, not answered by it. " +
+        "Several anchors in one call, and per anchor {episode, around, before, after} when different episodes hold different parts of the answer. " +
+        "The window is small on purpose. Read what comes back; if the answer is not in it, call again with a bigger before/after — or one side only, " +
+        "like before: 0, after: 4000 with the last thing you read as the query, to walk forward without re-reading. " +
         "Several calls in a row is how this tool is used, not a sign the first one failed. " +
-        "Costlier than searching: use it when the exact wording, tone or surrounding exchange matters.",
+        "Costlier than searching, and unnecessary when a fact already answers the question.",
       parameters: {
         type: "object",
         properties: {

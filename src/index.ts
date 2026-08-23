@@ -259,7 +259,7 @@ export function register(api: OpenClawPluginApi): void {
           const entries = factTexts.map((fact, index) =>
             sources[index] ? { fact, source: sources[index] } : fact,
           );
-          const recallBlock = buildRecallBlockDetailed(entries, cfg.recallMaxInjectedChars);
+          const recallBlock = buildRecallBlockDetailed(entries, cfg.recallMaxInjectedChars, cfg.recallExpandChars);
           const block = recallBlock.block;
           logger.debugContent(
             "recall_payload",

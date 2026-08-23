@@ -366,7 +366,7 @@ test("browse resolves a query to the conversation around the best match", async 
 test("browse expands several anchors in one call and never searches for them", async (t) => {
   const calls = installFetch(t, { get_episodes_by_ref: (args) => ({ episodes: (args.names ?? []).map((name) => ({ uuid: `u-${name}`, name, content: JSON.stringify({ participants: { user: "Вит", assistant: "Краб" }, messages: [{ role: "user", text: `строка ${name}` }] }) })) }) });
   const { tools } = makeRuntime();
-  const result = await call(tools, "graphiti_browse", { episodes: ["8248439450-12", "8248439450-40"] }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  const result = await call(tools, "graphiti_browse", { episodes: ["8248439450-12", "8248439450-40"], query: "строка" }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
   assert.equal(result.details.shown, 2);
   assert.ok(!calls.some((c) => c.name === "search_memory_combined"));
 });
@@ -583,7 +583,7 @@ test("an anchor may carry its own window, and a bare name still gets the default
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: [{ episode: "8248439450-12", before: 4000, after: 0 }, "8248439450-40"] },
+    { episodes: [{ episode: "8248439450-12", before: 4000, after: 0 }, "8248439450-40"], query: "реплика" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   assert.equal(result.details.shown, 2);
@@ -598,7 +598,7 @@ test("a window of zero on both sides leaves the anchor alone, without its neighb
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: [{ episode: "8248439450-12", before: 0, after: 0 }] },
+    { episodes: [{ episode: "8248439450-12", before: 0, after: 0 }], query: "реплика" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   const shown = result.content[0].text;
@@ -637,7 +637,7 @@ test("a trimmed window says how many messages it left out", async (t) => {
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: [{ episode: "8248439450-12", before: 600, after: 600 }] },
+    { episodes: [{ episode: "8248439450-12", before: 600, after: 600 }], query: "сообщение" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   assert.match(result.content[0].text, /more in this episode — call again with/);
@@ -655,7 +655,7 @@ test("several anchors each get a share, so the first cannot spend the whole repl
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: ["8248439450-12", "8248439450-40", "8248439450-70"] },
+    { episodes: ["8248439450-12", "8248439450-40", "8248439450-70"], query: "строка" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   assert.equal(result.details.shown, 3, "каждый якорь должен получить свою долю");
@@ -705,7 +705,7 @@ test("overlapping anchors point at each other instead of repeating the same epis
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: ["8248439450-4", "8248439450-6"], neighbours: 3 },
+    { episodes: ["8248439450-4", "8248439450-6"], query: "реплика" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   const shown = result.content[0].text;
@@ -726,7 +726,7 @@ test("a cut window names the argument that widens it", async (t) => {
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: ["8248439450-12"] },
+    { episodes: ["8248439450-12"], query: "строка" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   const shown = result.content[0].text;
@@ -746,7 +746,7 @@ test("the default window is a glance, not a whole batch", async (t) => {
   const result = await call(
     tools,
     "graphiti_browse",
-    { episodes: ["8248439450-12"] },
+    { episodes: ["8248439450-12"], query: "строка" },
     { agentId: "main", sessionKey: "agent:main:telegram:1" },
   );
   // Якорь показывается целиком, соседи — только на 512 символов в каждую сторону.
@@ -803,4 +803,42 @@ test("the window centres on the query, not on the start of the episode", async (
     "начало этого же эпизода не должно вытеснять наводку",
   );
   assert.match(focused.content[0].text, /centred on/);
+});
+
+test("anchors without anything to look for are refused, not answered from the start", async (t) => {
+  installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.equal(result.details.reason, "no_focus");
+  assert.match(result.content[0].text, /Pass query with the fact, name or phrase/);
+});
+
+test("an anchor carrying its own around needs no shared query", async (t) => {
+  installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", around: "реплика" }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.notEqual(result.details.reason, "no_focus");
+  assert.match(result.content[0].text, /centred on/);
+});
+
+test("the anchor is labelled with its own name, not run on from its neighbour", async (t) => {
+  installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12"], query: "реплика" },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.match(result.content[0].text, /\[8248439450-12\]/, "у якоря обязана быть своя подпись");
 });

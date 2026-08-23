@@ -413,9 +413,11 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_search",
       label: "Search memory (Graphiti)",
       description:
-        "Search this agent's memory across all its dialogs. Three kinds of hit, each with a score: " +
+        "Search this agent's memory across all its dialogs. Three kinds of hit: " +
         "[fact] what is known, in the extractor's words rather than quoted; [entity] a person, place or project; " +
         "[episode] a piece of conversation that matched. " +
+        "The number after the kind is how well it matches the query, not its position: 0.4 is a good answer, 0.15 is a distant one. " +
+        "Anything too weak to be worth reading is withheld, so an empty answer means memory has nothing — not that the search failed. " +
         "Each hit lists episode anchors like 8248439450-12; the number beside one is how many hits point at it, so the biggest number is where the answer lives. " +
         "Pass anchors to graphiti_browse to read what was actually said. " +
         "Memory is injected automatically before each reply — search when that was not enough. Found nothing? Try the OpenViking search tools.",
@@ -565,6 +567,19 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             entities: entities.length,
             episodes: episodes.length,
           });
+          if (lines.length === 0) {
+            // An empty answer has to say it is empty. The server now withholds
+            // everything that scored below the relevance floor, which is the point
+            // -- but rendering that as a blank tool result tells the model nothing,
+            // and a model that cannot tell "no match" from "the tool broke" will
+            // either invent an answer or retry the same query.
+            return textResult(
+              "Nothing in memory matched that closely enough to be worth showing. " +
+                "Memory has no answer here: say so, or look somewhere it might be — " +
+                "the OpenViking tools, or the web.",
+              { tool: "graphiti_search", facts: 0, entities: 0, episodes: 0, ok: true },
+            );
+          }
           return textResult(lines.join("\n"), {
             tool: "graphiti_search",
             facts: facts.length,
@@ -582,8 +597,10 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
       name: "graphiti_browse",
       label: "Read the conversation behind a hit (Graphiti)",
       description:
-        "Read what was actually said, in the dialog it was said in. graphiti_search gives the anchors; this reads around them — pass several at once, from different hits if you like. " +
-        "Cut off mid-thought? Call again with bigger before/after. " +
+        "Read what was actually said, in the dialog it was said in. " +
+        "Anchors come from two places: the hits of graphiti_search, and the memory injected before a reply — every quoted memory names the episode it came from. " +
+        "Pass several at once, from different hits if you like. " +
+        "Cut off mid-thought? Call again with a bigger window. " +
         "Costlier than searching: use it when the exact wording, tone or surrounding exchange matters.",
       parameters: {
         type: "object",

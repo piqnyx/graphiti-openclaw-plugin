@@ -557,3 +557,131 @@ test("a batch caught by shutdown still gets its chance to land", async (t) => {
     "the queued batch was submitted during the drain, not left for the next start",
   );
 });
+
+function episodeWith(name, ...lines) {
+  return {
+    uuid: `u-${name}`,
+    name,
+    content: JSON.stringify({
+      participants: { user: "Вит", assistant: "Краб" },
+      messages: lines.map((text, index) => ({ role: index % 2 === 0 ? "user" : "assistant", text })),
+    }),
+  };
+}
+
+function neighbourhood() {
+  return {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) => episodeWith(name, `реплика ${name}`)),
+    }),
+  };
+}
+
+test("an anchor may carry its own window, and a bare name still gets the default", async (t) => {
+  const calls = installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 4000, after: 0 }, "8248439450-40"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.equal(result.details.shown, 2);
+  assert.match(result.content[0].text, /8248439450-12/);
+  assert.match(result.content[0].text, /8248439450-40/);
+  assert.ok(!calls.some((c) => c.name === "search_memory_combined"));
+});
+
+test("a window of zero on both sides leaves the anchor alone, without its neighbours", async (t) => {
+  installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 0, after: 0 }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  const shown = result.content[0].text;
+  assert.match(shown, /реплика 8248439450-12/);
+  assert.ok(!shown.includes("8248439450-11"), "сосед не должен попасть в нулевое окно");
+  assert.ok(!shown.includes("8248439450-13"), "сосед не должен попасть в нулевое окно");
+});
+
+test("neighbours reaches further back than the default three when asked", async (t) => {
+  const calls = installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12"], neighbours: 6 },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  const asked = calls
+    .filter((c) => c.name === "get_episodes_by_ref")
+    .flatMap((c) => c.arguments.names ?? []);
+  assert.ok(asked.includes("8248439450-6"), "шестой сосед назад должен запрашиваться");
+});
+
+test("a trimmed window says how many messages it left out", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(name, ...Array.from({ length: 40 }, (_, i) => `${name} сообщение ${i} ${"я".repeat(400)}`)),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 600, after: 600 }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.match(result.content[0].text, /message\(s\) not shown/);
+});
+
+test("several anchors each get a share, so the first cannot spend the whole reply", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(name, ...Array.from({ length: 60 }, (_, i) => `${name} строка ${i} ${"о".repeat(900)}`)),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: ["8248439450-12", "8248439450-40", "8248439450-70"] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.equal(result.details.shown, 3, "каждый якорь должен получить свою долю");
+  for (const name of ["8248439450-12", "8248439450-40", "8248439450-70"]) {
+    assert.ok(result.content[0].text.includes(name), `${name} должен присутствовать`);
+  }
+});
+
+test("trimming cuts between messages, never inside one", async (t) => {
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) =>
+        episodeWith(name, ...Array.from({ length: 30 }, (_, i) => `КОНЕЦ${i}${"ю".repeat(300)}ХВОСТ${i}`)),
+      ),
+    }),
+  });
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", before: 400, after: 400 }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  // Каждое сообщение начинается КОНЕЦ и кончается ХВОСТ. Если резали посреди,
+  // хотя бы одно начало останется без своего конца.
+  const shown = result.content[0].text;
+  const starts = (shown.match(/КОНЕЦ\d+/g) ?? []).length;
+  const ends = (shown.match(/ХВОСТ\d+/g) ?? []).length;
+  assert.ok(starts > 0, "проверять нечего, если не показано ни одного сообщения");
+  assert.ok(shown.includes("message(s) not shown"), "окно в 400 символов обязано что-то отрезать");
+  assert.equal(starts, ends, "обрезка не должна рубить сообщение пополам");
+});

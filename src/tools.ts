@@ -33,7 +33,9 @@ const TOP_ENTITIES = 10;
 const DEFAULT_CONTEXT_CHARS = 2_000;
 const MAX_CONTEXT_CHARS = 20_000;
 /** How many batches either side of an anchor graphiti_browse reads. */
+/** Episodes fetched either side of an anchor, unless the caller says otherwise. */
 const BROWSE_NEIGHBOURS = 3;
+const MAX_BROWSE_NEIGHBOURS = 12;
 
 /**
  * Split an episode name into the dialog it belongs to and its batch number.
@@ -57,17 +59,35 @@ export function splitEpisodeName(name: string): { prefix: string; number: number
  * exactly what makes a transcript legible.
  */
 export function renderEpisode(episode: Record<string, unknown>): string {
+  const { header, messages } = renderEpisodeParts(episode);
+  return messages.length > 0 ? `${header}\n${messages.join("\n")}` : "";
+}
+
+/**
+ * The same rendering, with the messages still separate.
+ *
+ * Trimming a transcript to fit has to cut between messages, never inside one: a
+ * reply severed mid-sentence reads as if the speaker was interrupted, and the
+ * model has no way to tell that from what was actually said. Only the caller that
+ * assembles a window needs the parts, so `renderEpisode` above keeps its shape.
+ */
+export function renderEpisodeParts(
+  episode: Record<string, unknown>,
+): { header: string; messages: string[] } {
   const name = typeof episode.name === "string" ? episode.name : "";
+  const header = `[${name}]`;
   const raw = typeof episode.content === "string" ? episode.content : "";
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     // Not JSON: an episode stored by some other path. Show it as it is.
-    return raw ? `[${name}]\n${raw}` : "";
+    return { header, messages: raw ? [raw] : [] };
   }
 
-  if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return raw ? `[${name}]\n${raw}` : "";
+  if (!isRecord(parsed) || !Array.isArray(parsed.messages)) {
+    return { header, messages: raw ? [raw] : [] };
+  }
   const participants = isRecord(parsed.participants) ? parsed.participants : {};
   const speaker = (role: unknown): string => {
     if (role === "user") return text(participants.user) || "User";
@@ -75,12 +95,11 @@ export function renderEpisode(episode: Record<string, unknown>): string {
     return text(role) || "Unknown";
   };
 
-  const body = parsed.messages
+  const messages = parsed.messages
     .filter(isRecord)
     .map((message) => `${speaker(message.role)}: ${text(message.text)}`.trim())
-    .filter((line) => !line.endsWith(":"))
-    .join("\n");
-  return body ? `[${name}]\n${body}` : "";
+    .filter((line) => !line.endsWith(":"));
+  return { header, messages };
 }
 
 /**
@@ -227,12 +246,64 @@ async function resolveEpisodeNames(
  * numbered, so the exchange either side of a batch is simply the batches next to
  * it, and that holds even when several dialogs were recorded in the same minute.
  */
+/**
+ * Fit whole messages into a budget, keeping the ones nearest the anchor.
+ *
+ * `fromEnd` reads the side before the anchor, where the last message is the
+ * closest one and the oldest is the first to go; the side after the anchor drops
+ * from its own far end instead. What was dropped is counted rather than elided,
+ * because a bare ellipsis tells the reader nothing about whether asking for a
+ * bigger window would bring anything back.
+ */
+function fitMessages(
+  sections: { header: string; messages: string[] }[],
+  budget: number,
+  fromEnd: boolean,
+): { text: string; droppedMessages: number } {
+  const order = fromEnd ? [...sections].reverse() : sections;
+  const kept: { header: string; messages: string[] }[] = [];
+  let dropped = 0;
+  let left = budget;
+
+  for (const section of order) {
+    const messages = fromEnd ? [...section.messages].reverse() : section.messages;
+    const taken: string[] = [];
+    for (const message of messages) {
+      const cost = message.length + 1;
+      if (cost > left) {
+        dropped += 1;
+        continue;
+      }
+      left -= cost;
+      taken.push(message);
+    }
+    if (taken.length > 0) {
+      // The header costs characters too, and a section reduced to its header
+      // alone is noise; charge for it only once something survived under it.
+      left -= section.header.length + 1;
+      kept.push({ header: section.header, messages: fromEnd ? taken.reverse() : taken });
+    }
+  }
+
+  const ordered = fromEnd ? kept.reverse() : kept;
+  const text = ordered
+    .map((section) => `${section.header}\n${section.messages.join("\n")}`)
+    .join("\n");
+  return { text, droppedMessages: dropped };
+}
+
+function omitted(count: number, where: string): string {
+  return count > 0 ? `[… ${count} ${where} message(s) not shown; ask for a bigger window]` : "";
+}
+
 async function readAround(
   client: GraphitiMcpClient,
   agentId: string,
   anchor: string,
   before: number,
   after: number,
+  neighbours: number,
+  share: number,
 ): Promise<string> {
   const centre = (await client.getEpisodesByRef(agentId, { names: [anchor] }))[0];
   if (!centre) return "";
@@ -240,14 +311,14 @@ async function readAround(
   const centreName = typeof centre.name === "string" ? centre.name : anchor;
   const position = splitEpisodeName(centreName);
   let window: Record<string, unknown>[] = [centre];
-  if (position) {
+  if (position && neighbours > 0) {
     const names: string[] = [];
-    for (let step = 1; step <= BROWSE_NEIGHBOURS; step += 1) {
+    for (let step = 1; step <= neighbours; step += 1) {
       if (position.number - step > 0) names.push(`${position.prefix}-${position.number - step}`);
       names.push(`${position.prefix}-${position.number + step}`);
     }
-    const neighbours = await client.getEpisodesByRef(agentId, { names });
-    window = [...neighbours, centre];
+    const found = await client.getEpisodesByRef(agentId, { names });
+    window = [...found, centre];
   }
 
   const ordered = window
@@ -256,15 +327,29 @@ async function readAround(
     .filter((entry, index, all) => index === 0 || entry.episode.name !== all[index - 1]?.episode.name);
 
   const centreIndex = Math.max(ordered.findIndex((entry) => entry.episode.name === centreName), 0);
-  const rendered = ordered.map((entry) => renderEpisode(entry.episode));
-  const head = rendered.slice(0, centreIndex).join("\n");
-  const body = rendered[centreIndex] ?? "";
-  const tail = rendered.slice(centreIndex + 1).join("\n");
+  const parts = ordered.map((entry) => renderEpisodeParts(entry.episode));
+
+  // The anchor is the answer and the neighbours are context, so the anchor is
+  // served first and only what is left goes to either side. Before this the
+  // anchor was never trimmed at all: one episode of eleven thousand characters
+  // consumed the whole reply, and everything after it was cut mid-sentence by a
+  // blind slice over the assembled text.
+  const centreParts = parts[centreIndex] ?? { header: `[${centreName}]`, messages: [] };
+  const body = fitMessages([centreParts], share, false);
+  let left = Math.max(0, share - body.text.length);
+
+  // Each side is capped by what was asked for and by what the anchor left over.
+  const headBudget = Math.min(before, left);
+  const head = fitMessages(parts.slice(0, centreIndex), headBudget, true);
+  left = Math.max(0, left - head.text.length);
+  const tail = fitMessages(parts.slice(centreIndex + 1), Math.min(after, left), false);
 
   const transcript = [
-    head.length > before ? `…${head.slice(head.length - before)}` : head,
-    body,
-    tail.length > after ? `${tail.slice(0, after)}…` : tail,
+    omitted(head.droppedMessages, "earlier"),
+    head.text,
+    body.text,
+    tail.text,
+    omitted(tail.droppedMessages + body.droppedMessages, "later"),
   ]
     .filter(Boolean)
     .join("\n");
@@ -607,24 +692,61 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
         properties: {
           episodes: {
             type: "array",
-            items: { type: "string" },
-            description: "Episode names from a search, such as 8248439450-12. Several may be given.",
+            items: {
+              anyOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    episode: { type: "string" },
+                    before: { type: "number" },
+                    after: { type: "number" },
+                  },
+                  required: ["episode"],
+                },
+              ],
+            },
+            description:
+              "Anchors to read around, such as 8248439450-12. Give a name for the default window, " +
+              "or {episode, before, after} to size that one yourself. The two forms mix freely: " +
+              "read one exchange closely and glance at the rest in the same call.",
           },
           episode: { type: "string", description: "A single anchor, if you have only one." },
           query: { type: "string", description: "Used only when no anchors are given: finds the conversation behind the best match." },
-          before: { type: "number", description: `Characters of conversation before each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
-          after: { type: "number", description: `Characters after each anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
+          before: { type: "number", description: `Characters before an anchor that did not size itself. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
+          after: { type: "number", description: `Characters after such an anchor. Default ${cfg.browseChars}, maximum ${cfg.browseMaxChars}.` },
+          neighbours: { type: "number", description: `Episodes fetched either side of an anchor. Default ${BROWSE_NEIGHBOURS}, maximum ${MAX_BROWSE_NEIGHBOURS}. Raise it to reach further back than the default window can.` },
         },
       },
       async execute(_toolCallId, params, ctx) {
         const resolved = resolve("graphiti_browse", ctx);
         if ("refusal" in resolved) return resolved.refusal;
 
-        const asked = Array.isArray(params.episodes)
-          ? params.episodes.filter((name): name is string => typeof name === "string").map((name) => name.trim()).filter(Boolean)
-          : [];
-        const single = sanitizeConversationText(stringParam(params, "episode")).trim();
-        const requested = [...new Set(single ? [...asked, single] : asked)].slice(0, cfg.browseMaxEpisodes);
+        const before = limitParam(params, "before", cfg.browseChars, cfg.browseMaxChars);
+        const after = limitParam(params, "after", cfg.browseChars, cfg.browseMaxChars);
+        const neighbours = limitParam(params, "neighbours", BROWSE_NEIGHBOURS, MAX_BROWSE_NEIGHBOURS);
+
+        // An anchor is either a bare name or a name with its own window. Both
+        // forms are accepted whatever the schema says, because a model that only
+        // ever emits strings must not lose the feature, and one that sizes every
+        // anchor must not be forced to repeat the default.
+        const asked: { name: string; before: number; after: number }[] = [];
+        const seen = new Set<string>();
+        const remember = (raw: unknown): void => {
+          const entry = isRecord(raw) ? raw : { episode: raw };
+          const name = sanitizeConversationText(text(entry.episode ?? entry.name)).trim();
+          if (!name || seen.has(name)) return;
+          seen.add(name);
+          asked.push({
+            name,
+            before: limitParam(entry, "before", before, cfg.browseMaxChars),
+            after: limitParam(entry, "after", after, cfg.browseMaxChars),
+          });
+        };
+        if (Array.isArray(params.episodes)) for (const item of params.episodes) remember(item);
+        remember(stringParam(params, "episode"));
+
+        const requested = asked.slice(0, cfg.browseMaxEpisodes);
         const query = sanitizeConversationText(stringParam(params, "query"));
         if (requested.length === 0 && !query) {
           return errorResult("graphiti_browse needs either episode names or a query.", {
@@ -632,9 +754,6 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             reason: "no_anchor",
           });
         }
-
-        const before = limitParam(params, "before", cfg.browseChars, cfg.browseMaxChars);
-        const after = limitParam(params, "after", cfg.browseChars, cfg.browseMaxChars);
 
         try {
           let anchors = requested;
@@ -648,7 +767,9 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
             const names = viaEpisode.length > 0
               ? viaEpisode
               : [...(await resolveEpisodeNames(client, resolved.agentId, viaFacts)).values()];
-            anchors = [...new Set(names)].slice(0, cfg.browseMaxEpisodes);
+            anchors = [...new Set(names)]
+              .slice(0, cfg.browseMaxEpisodes)
+              .map((name) => ({ name, before, after }));
           }
 
           if (anchors.length === 0) {
@@ -660,10 +781,22 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
 
           const sections: string[] = [];
           let budget = cfg.browseMaxTotalChars;
+          // An equal share each, so asking for five anchors returns five. Draining
+          // one pot in order let the first anchor spend everything and the last
+          // arrive empty, which is the opposite of what asking for several means.
+          const share = Math.max(1, Math.floor(cfg.browseMaxTotalChars / anchors.length));
           let shown = 0;
           for (const anchor of anchors) {
             if (budget <= 0) break;
-            const section = await readAround(client, resolved.agentId, anchor, before, after);
+            const section = await readAround(
+              client,
+              resolved.agentId,
+              anchor.name,
+              anchor.before,
+              anchor.after,
+              neighbours,
+              Math.min(share, budget),
+            );
             if (!section) continue;
             const trimmed = section.length > budget ? `${section.slice(0, budget)}…` : section;
             budget -= trimmed.length;

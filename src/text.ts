@@ -416,7 +416,15 @@ export function buildRecallBlockDetailed(
             : "To read the conversation behind a memory, call graphiti_browse with the episode id and the fact itself, word for word, as the query — several episodes in one call if you like.",
         ]
       : []),
-    "Relevant memories:",
+    // The list arrives ranked and used to keep that to itself. Order is the only
+    // part of the ranking safe to hand over: the scores measure closeness to the
+    // question, not whether a memory is true, and a reader shown 0.35 hedges
+    // about a fact that is entirely correct and merely tangential.
+    //
+    // Kept to a few words on purpose. This prefix is spent out of the same
+    // character budget as the memories themselves, so every word here is one
+    // that a memory does not get.
+    "Relevant memories, nearest first:",
   ].join("\n") + "\n";
   const suffix = "\n</graphiti-context>";
   const lines: string[] = [];

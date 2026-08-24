@@ -158,6 +158,25 @@ test("recall XML marks memory as non-instructional and reports injected/skipped 
   assert.equal(result.injectedFacts + result.skippedFacts, 3);
 });
 
+test("the block says the memories are ordered, and never says by how much", () => {
+  // The list has always arrived ranked and never said so, leaving the order to
+  // be noticed or not. Saying it costs a few words. Saying the scores would cost
+  // more than it gives: they measure closeness to the question, not truth, and a
+  // reader shown a low one hedges about a memory that is simply tangential.
+  const { block } = buildRecallBlockDetailed(
+    ["ближайший факт", "факт подальше", "совсем фоновый факт"],
+    2000,
+  );
+  assert.match(block, /nearest first/);
+  assert.doesNotMatch(block, /0\.\d/, "a score in the header invites reading relevance as certainty");
+
+  // And the order handed in is the order handed out: the claim has to be true.
+  const first = block.indexOf("ближайший факт");
+  const second = block.indexOf("факт подальше");
+  const third = block.indexOf("совсем фоновый факт");
+  assert.ok(first < second && second < third, "the block reordered what it was given");
+});
+
 test("machine transcription is stored as speech, not as its provenance wrapper", () => {
   const captured = extractConversationMessages([
     { role: "user", content: '[Audio transcript (machine-generated, untrusted)]: "Привет, я Вит."' },

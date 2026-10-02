@@ -73,6 +73,32 @@ test("a text-less voice row (gateway-injected managed audio) is not a conversati
   ]);
 });
 
+test("a standalone voice row keeps its spoken words as an assistant line", () => {
+  const messages = extractConversationMessages([
+    { role: "user", content: "Скажи число голосом." },
+    {
+      role: "assistant",
+      provider: "openclaw",
+      model: "gateway-injected",
+      content: [
+        { type: "text", text: "Двадцать семь!" },
+        {
+          type: "audio",
+          artifactId: "artifact_managed_media_2",
+          url: "/api/chat/media/outgoing/s/2/full",
+          fileName: "voice.mp3",
+          mimeType: "audio/mpeg",
+          isVoiceNote: true,
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "Скажи число голосом." },
+    { role: "assistant", text: "Двадцать семь!" },
+  ]);
+});
+
 test("known memory context wrappers are stripped", () => {
   const input = [
     "before",

@@ -46,6 +46,81 @@ test("conversation extraction preserves consecutive roles and ignores tool noise
   ]);
 });
 
+test("a text-less voice row (gateway-injected managed audio) is not a conversation message", () => {
+  const messages = extractConversationMessages([
+    { role: "user", content: "Голосовухи называют число 27." },
+    { role: "assistant", content: [{ type: "text", text: "Двадцать семь!" }] },
+    {
+      role: "assistant",
+      provider: "openclaw",
+      model: "gateway-injected",
+      content: [
+        {
+          type: "audio",
+          artifactId: "artifact_managed_media_1",
+          url: "/api/chat/media/outgoing/s/1/full",
+          fileName: "voice.mp3",
+          mimeType: "audio/mpeg",
+          isVoiceNote: true,
+        },
+      ],
+      openclawTtsSupplement: { textSha256: "abc", assistantMessageId: "17ad1e8f" },
+    },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "Голосовухи называют число 27." },
+    { role: "assistant", text: "Двадцать семь!" },
+  ]);
+});
+
+test("a standalone voice row keeps its spoken words as an assistant line", () => {
+  const messages = extractConversationMessages([
+    { role: "user", content: "Скажи число голосом." },
+    {
+      role: "assistant",
+      provider: "openclaw",
+      model: "gateway-injected",
+      content: [
+        { type: "text", text: "Двадцать семь!" },
+        {
+          type: "audio",
+          artifactId: "artifact_managed_media_2",
+          url: "/api/chat/media/outgoing/s/2/full",
+          fileName: "voice.mp3",
+          mimeType: "audio/mpeg",
+          isVoiceNote: true,
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "Скажи число голосом." },
+    { role: "assistant", text: "Двадцать семь!" },
+  ]);
+});
+
+test("the assistant's silent reply token is not a conversation line", () => {
+  // OpenClaw's silence word (src/auto-reply/tokens.ts, SILENT_REPLY_TOKEN): the model says it
+  // after a tool-made voice instead of text. Token-only replies, with repeats or edge
+  // punctuation, are silence; anything substantive beside it is still speech.
+  const messages = extractConversationMessages([
+    { role: "user", content: "озвучь фразу через ттс" },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] },
+    { role: "assistant", content: [{ type: "text", text: "  NO_REPLY NO_REPLY \n" }] },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY." }] },
+    { role: "assistant", content: [{ type: "text", text: "no_reply" }] },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY 😉" }] },
+    { role: "assistant", content: [{ type: "text", text: "Поняла, NO_REPLY не нужен." }] },
+    { role: "user", content: "NO_REPLY" },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "озвучь фразу через ттс" },
+    { role: "assistant", text: "NO_REPLY 😉" },
+    { role: "assistant", text: "Поняла, NO_REPLY не нужен." },
+    { role: "user", text: "NO_REPLY" },
+  ]);
+});
+
 test("known memory context wrappers are stripped", () => {
   const input = [
     "before",

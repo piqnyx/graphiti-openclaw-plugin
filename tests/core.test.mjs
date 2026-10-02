@@ -46,6 +46,33 @@ test("conversation extraction preserves consecutive roles and ignores tool noise
   ]);
 });
 
+test("a text-less voice row (gateway-injected managed audio) is not a conversation message", () => {
+  const messages = extractConversationMessages([
+    { role: "user", content: "Голосовухи называют число 27." },
+    { role: "assistant", content: [{ type: "text", text: "Двадцать семь!" }] },
+    {
+      role: "assistant",
+      provider: "openclaw",
+      model: "gateway-injected",
+      content: [
+        {
+          type: "audio",
+          artifactId: "artifact_managed_media_1",
+          url: "/api/chat/media/outgoing/s/1/full",
+          fileName: "voice.mp3",
+          mimeType: "audio/mpeg",
+          isVoiceNote: true,
+        },
+      ],
+      openclawTtsSupplement: { textSha256: "abc", assistantMessageId: "17ad1e8f" },
+    },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "Голосовухи называют число 27." },
+    { role: "assistant", text: "Двадцать семь!" },
+  ]);
+});
+
 test("known memory context wrappers are stripped", () => {
   const input = [
     "before",

@@ -99,6 +99,28 @@ test("a standalone voice row keeps its spoken words as an assistant line", () =>
   ]);
 });
 
+test("the assistant's silent reply token is not a conversation line", () => {
+  // OpenClaw's silence word (src/auto-reply/tokens.ts, SILENT_REPLY_TOKEN): the model says it
+  // after a tool-made voice instead of text. Token-only replies, with repeats or edge
+  // punctuation, are silence; anything substantive beside it is still speech.
+  const messages = extractConversationMessages([
+    { role: "user", content: "озвучь фразу через ттс" },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] },
+    { role: "assistant", content: [{ type: "text", text: "  NO_REPLY NO_REPLY \n" }] },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY." }] },
+    { role: "assistant", content: [{ type: "text", text: "no_reply" }] },
+    { role: "assistant", content: [{ type: "text", text: "NO_REPLY 😉" }] },
+    { role: "assistant", content: [{ type: "text", text: "Поняла, NO_REPLY не нужен." }] },
+    { role: "user", content: "NO_REPLY" },
+  ]);
+  assert.deepEqual(messages, [
+    { role: "user", text: "озвучь фразу через ттс" },
+    { role: "assistant", text: "NO_REPLY 😉" },
+    { role: "assistant", text: "Поняла, NO_REPLY не нужен." },
+    { role: "user", text: "NO_REPLY" },
+  ]);
+});
+
 test("known memory context wrappers are stripped", () => {
   const input = [
     "before",

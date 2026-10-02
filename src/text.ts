@@ -95,6 +95,21 @@ const LEADING_TIMESTAMP_RE =
   /^\s*\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?\d{4}[-/]\d{2}[-/]\d{2}[^\]]*\]\s*/i;
 
 export const SESSION_RESET_PROMPT_PREFIX = "A new session was started via /new or /reset";
+/**
+ * OpenClaw's silence word (`SILENT_REPLY_TOKEN`, src/auto-reply/tokens.ts). The model
+ * answers with it when it has nothing to add -- after a tool-made voice, say -- and the
+ * gateway delivers nothing. Captured, it would become a line the assistant never said.
+ * Same shape as the gateway's own check: the token alone, repeated or wrapped in edge
+ * punctuation, is silence; anything substantive beside it (an emoji, a sentence) is speech.
+ */
+const SILENT_REPLY_RE = /^\s*NO_REPLY(?:\s+NO_REPLY)*\s*$/i;
+
+function isSilentAssistantReply(text: string): boolean {
+  return (
+    SILENT_REPLY_RE.test(text) ||
+    SILENT_REPLY_RE.test(text.trim().replace(/^\p{P}+|\p{P}+$/gu, ""))
+  );
+}
 
 type ContentBlock = {
   type?: unknown;
@@ -241,6 +256,7 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
     if (isInternalSystemMessage(message.provenance)) continue;
     const text = sanitizeConversationText(textFromContent(message.content));
     if (!text) continue;
+    if (message.role === "assistant" && isSilentAssistantReply(text)) continue;
     if (message.role === "user" && text.startsWith(SESSION_RESET_PROMPT_PREFIX)) continue;
     result.push({ role: message.role, text });
   }

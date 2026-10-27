@@ -269,3 +269,47 @@ test("a genuine repetition inside a message is preserved", () => {
   assert.equal(sanitizeConversationText(text), text);
   assert.equal(sanitizeConversationText("тест\nтест\nхвост"), "тест\nтест\nхвост");
 });
+
+test("a picture's description and the person's words reach memory, the gateway's notes for the model do not", () => {
+  // Live 27.10: a photo steered into a running turn reached capture with its number block on top (the
+  // gateway marks every injected context header with ⟦openclaw:ctx⟧ and keys its own strippers on
+  // it), then the attachment path and the hint telling the model how to send a picture back. The
+  // description is the picture's memory, and the person's words are theirs: both stay.
+  const steered = [
+    "Conversation info: ⟦openclaw:ctx⟧",
+    "```json",
+    '{"chat_id":"telegram:8248439450","message_id":"7723","sender":{"name":"Viktor","username":"ppkeen"}}',
+    "```",
+    "",
+    "[media attached: media/inbound/2f1c-adc8.jpg (image)]",
+    "To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath. Keep caption in the text body.",
+    "[Image]",
+    "User text:",
+    "тест подмешивания с картинкой",
+    "Description:",
+    "Паб: на сцене рыжая девушка в кожаной куртке поёт в микрофон, на стенах вывески Löwenbräu и Bitburger.",
+  ].join("\n");
+
+  assert.equal(
+    sanitizeConversationText(steered),
+    [
+      "[Image]",
+      "User text:",
+      "тест подмешивания с картинкой",
+      "Description:",
+      "Паб: на сцене рыжая девушка в кожаной куртке поёт в микрофон, на стенах вывески Löwenbräu и Bitburger.",
+    ].join("\n"),
+  );
+  // Any marked block goes, whatever its label; an album's attachment header too.
+  assert.equal(
+    sanitizeConversationText(
+      'Replied message: ⟦openclaw:ctx⟧\n```json\n{"body":"старое"}\n```\n[media attached: 2 files]\n[media attached 1/2: media/inbound/a.jpg (image)]\nвот альбом',
+    ),
+    "вот альбом",
+  );
+  // The person's own words that only look alike stay.
+  assert.equal(
+    sanitizeConversationText("Я пишу [media attached: тут] прямо в строке и To send an image back смешно"),
+    "Я пишу [media attached: тут] прямо в строке и To send an image back смешно",
+  );
+});

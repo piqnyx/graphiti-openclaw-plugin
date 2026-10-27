@@ -42,6 +42,25 @@ const CONVERSATION_METADATA_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata)\s*(?:\([^)]+\))?\s*:\s*```(?:json)?[\s\S]*?```/gi;
 const SENDER_METADATA_RE = /(?:^|\n)\s*Sender\s*\([^)]*\)\s*:\s*```(?:json)?[\s\S]*?```/gi;
 /**
+ * Context the gateway injects for the model, recognised by its provenance marker.
+ *
+ * OpenClaw stamps every injected context header with `⟦openclaw:ctx⟧` and keys its
+ * own strippers on it, whatever the label (src/auto-reply/reply/inbound-context-marker.ts;
+ * the copy must stay equal, a drifted one silently stops stripping). A steered message
+ * carries such a block -- its number, the sender's name and handle -- in the text this
+ * plugin captures; the label rules above know only the older unmarked labels.
+ */
+const MARKED_CONTEXT_BLOCK_RE = /^[^\n]*⟦openclaw:ctx⟧[ \t]*\n[ \t]*```json[ \t]*\n[\s\S]*?\n[ \t]*```[ \t]*$/gm;
+/**
+ * Prompt lines the gateway adds around a picture for the model: where the file lies, and
+ * how to send a picture back (src/auto-reply/reply/reply-media-hint.ts, kept equal). The
+ * picture's memory is its description and the words the person wrote with it, which stay;
+ * a path or a tool instruction stored as the person's words only mints false entities.
+ */
+const MEDIA_NOTE_LINE_RE = /^\[media attached(?: \d+\/\d+)?: [^\n]*\][ \t]*$/gm;
+const REPLY_MEDIA_HINT_LINE_RE =
+  /^To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath\. Keep caption in the text body\.[ \t]*$/gm;
+/**
  * OpenClaw prefixes machine transcription with a provenance marker, e.g.
  * `[Audio transcript (machine-generated, untrusted)]: "текст"`. The marker exists
  * for the live prompt; storing it would put the wrapper itself into the graph and
@@ -208,8 +227,11 @@ export function sanitizeConversationText(text: string): string {
     unwrapToolCallBlocks(stripInjectedContexts(text))
       .replace(OPENCLAW_INTERNAL_CONTEXT_RE, "")
       .replace(OPENCLAW_UNCLOSED_CONTEXT_RE, "")
+      .replace(MARKED_CONTEXT_BLOCK_RE, "")
       .replace(CONVERSATION_METADATA_RE, "\n")
       .replace(SENDER_METADATA_RE, "\n")
+      .replace(MEDIA_NOTE_LINE_RE, "")
+      .replace(REPLY_MEDIA_HINT_LINE_RE, "")
       // Removed outright rather than replaced by a space: a directive already
       // sits on its own or next to one, and substituting would leave a double
       // space in the middle of the sentence it was attached to.

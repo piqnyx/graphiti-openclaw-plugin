@@ -269,3 +269,48 @@ export async function factSources(
     return { episode: source.name, excerpt };
   });
 }
+
+/** Where a fact was said: in a digest Eva gave, or in the talk between Vit and her. */
+export type FactOrigin = "digest" | "talk" | null;
+
+/**
+ * Where each fact came from: a digest or the talk.
+ *
+ * The news digest reads every post against memory, and a fact Eva once told Vit in a digest
+ * is the story so far, not something the two of them share (Vit 27.10: «отделять надо мы и
+ * дайджест»). A digest lies in its episode right after the trigger the capture rewrote -- the
+ * `digest-trigger` rule turns it into a line such as «Эва по своей инициативе рассказывает
+ * Виту новости дня» -- so the message a fact was drawn from (the same choice the quote makes)
+ * is from a digest when it is that line or comes right after it; any other message of the
+ * conversation, hers or his, is the talk. Nothing is stored: older digests are told apart the
+ * same way. A fact naming no episode, or one that is gone, is unknown (null); with no markers
+ * nothing is looked up.
+ */
+export async function factOrigins(
+  client: Pick<GraphitiMcpClient, "getEpisodesByRef">,
+  agentId: string,
+  facts: readonly JsonObject[],
+  markers: readonly string[],
+): Promise<FactOrigin[]> {
+  const wanted = markers.map((marker) => marker.trim()).filter(Boolean);
+  const uuids = sourceUuids(facts);
+  if (wanted.length === 0 || uuids.length === 0) return facts.map(() => null);
+
+  const episodes = await client.getEpisodesByRef(agentId, { uuids });
+  const known = new Map<string, EpisodeMessage[]>();
+  for (const episode of episodes) {
+    if (typeof episode.uuid !== "string") continue;
+    known.set(episode.uuid, episodeMessages(typeof episode.content === "string" ? episode.content : ""));
+  }
+  const isTrigger = (message: EpisodeMessage | undefined): boolean =>
+    message !== undefined && wanted.some((marker) => message.text.includes(marker));
+
+  return facts.map((fact) => {
+    const episodeUuids = Array.isArray(fact.episodes) ? fact.episodes : [];
+    const uuid = episodeUuids.find((value: unknown): value is string => typeof value === "string" && value !== "");
+    const messages = uuid ? known.get(uuid) : undefined;
+    if (!messages || messages.length === 0) return null;
+    const at = bestMessage(messages, typeof fact.fact === "string" ? fact.fact : "");
+    return isTrigger(messages[at]) || isTrigger(messages[at - 1]) ? "digest" : "talk";
+  });
+}

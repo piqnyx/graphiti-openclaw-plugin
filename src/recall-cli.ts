@@ -9,9 +9,10 @@
  *
  *   node dist/recall-cli.js [--config ~/.openclaw/openclaw.json] < request.json
  *
- * The request on stdin: {"agentId": "main", "prompt": "..."}. On stdout, one JSON
- * object: {"query", "block", "facts", "rankedBy", "scores"} -- `block` is null when the
- * prompt leaves nothing to search for or nothing was found. The plugin's own log lines
+ * The request on stdin: {"agentId": "main", "prompt": "...", "digestMarkers"?: [...]}. On
+ * stdout, one JSON object: {"query", "block", "facts", "rankedBy", "scores"} -- `block` is
+ * null when the prompt leaves nothing to search for or nothing was found -- and, when
+ * digestMarkers are given, "origins": per fact "digest", "talk" or null (factOrigins). The plugin's own log lines
  * go to stderr. A failure exits 1 with the reason on stderr and nothing on stdout.
  */
 
@@ -24,6 +25,7 @@ import { requireAgentId } from "./identity.js";
 import { createGraphitiLogger } from "./logging.js";
 import { GraphitiMcpClient } from "./mcp-client.js";
 import { compileMessageRules } from "./message-rules.js";
+import { factOrigins, type FactOrigin } from "./recall-expand.js";
 import { recallFacts, recallQuery } from "./recall.js";
 import { sanitizeConversationText, SESSION_RESET_PROMPT_PREFIX } from "./text.js";
 import type { PluginLogger } from "./types.js";
@@ -36,6 +38,7 @@ export type RecallCommandResult = {
   facts: string[];
   rankedBy: string | null;
   scores: (number | null)[];
+  origins?: FactOrigin[];
 };
 
 export async function runRecallCommand(params: {
@@ -49,10 +52,13 @@ export async function runRecallCommand(params: {
   if (!entry) throw new Error(`the gateway config has no plugins.entries["${PLUGIN_ID}"]`);
   const cfg = parseConfig(entry.config ?? {});
 
-  const request = (params.request ?? {}) as { agentId?: unknown; prompt?: unknown };
+  const request = (params.request ?? {}) as { agentId?: unknown; prompt?: unknown; digestMarkers?: unknown };
   if (request.agentId === undefined) throw new Error("the request has no agentId");
   const agentId = requireAgentId(request.agentId);
   if (typeof request.prompt !== "string") throw new Error("the request has no prompt string");
+  const markers = Array.isArray(request.digestMarkers)
+    ? request.digestMarkers.filter((marker): marker is string => typeof marker === "string" && marker.trim() !== "")
+    : [];
 
   const nothing: RecallCommandResult = { query: "", block: null, facts: [], rankedBy: null, scores: [] };
   const currentPrompt = sanitizeConversationText(request.prompt);
@@ -64,13 +70,15 @@ export async function runRecallCommand(params: {
   const client = new GraphitiMcpClient(cfg.baseUrl, cfg.requestTimeoutMs);
   try {
     const found = await recallFacts({ client, cfg, logger, agentId, query, focus: currentPrompt });
-    return {
+    const result: RecallCommandResult = {
       query,
       block: found.recallBlock.block ?? null,
       facts: found.factTexts,
       rankedBy: found.rankedBy,
       scores: found.inForce.map((fact) => (typeof fact.score === "number" ? fact.score : null)),
     };
+    if (markers.length > 0) result.origins = await factOrigins(client, agentId, found.inForce, markers);
+    return result;
   } finally {
     client.close();
   }

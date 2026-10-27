@@ -281,8 +281,9 @@ export type FactOrigin = "digest" | "talk" | null;
  * дайджест»). A digest lies in its episode right after the trigger the capture rewrote -- the
  * `digest-trigger` rule turns it into a line such as «Эва по своей инициативе рассказывает
  * Виту новости дня» -- so the message a fact was drawn from (the same choice the quote makes)
- * is from a digest when it is that line or comes right after it; any other message of the
- * conversation, hers or his, is the talk. Nothing is stored: older digests are told apart the
+ * is from a digest when it is that line, or when the run of messages it belongs to -- one
+ * speaker's messages in a row, a reply that took several (a tool called in the middle) --
+ * comes right after it; any other message of the conversation, hers or his, is the talk. Nothing is stored: older digests are told apart the
  * same way. A fact naming no episode, or one that is gone, is unknown (null); with no markers
  * nothing is looked up.
  */
@@ -311,6 +312,9 @@ export async function factOrigins(
     const messages = uuid ? known.get(uuid) : undefined;
     if (!messages || messages.length === 0) return null;
     const at = bestMessage(messages, typeof fact.fact === "string" ? fact.fact : "");
-    return isTrigger(messages[at]) || isTrigger(messages[at - 1]) ? "digest" : "talk";
+    if (isTrigger(messages[at])) return "digest";
+    let start = at;
+    while (start > 0 && messages[start - 1]?.speaker === messages[at]?.speaker) start -= 1;
+    return isTrigger(messages[start - 1]) ? "digest" : "talk";
   });
 }

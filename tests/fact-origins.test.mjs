@@ -34,6 +34,30 @@ const EPISODES = [
   },
 ];
 
+// A digest that lay in the episode as several messages in a row (a tool called in the middle
+// of the reply), and a talk where her answer came in two parts after his question.
+EPISODES.push(
+  {
+    uuid: "e-split",
+    name: "saga-9",
+    content: body([
+      { role: "user", text: `${MARKER}.` },
+      { role: "assistant", text: "Начну с перемирия в Алешках: его продлили на сутки." },
+      { role: "assistant", text: "А ещё адвокат Георгиевская подала жалобу на СИЗО-4 из-за досмотров." },
+      { role: "user", text: "ого, про досмотры не знал" },
+    ]),
+  },
+  {
+    uuid: "e-talk-split",
+    name: "saga-10",
+    content: body([
+      { role: "user", text: "что там с курсом биткоина?" },
+      { role: "assistant", text: "Сейчас посмотрю." },
+      { role: "assistant", text: "Биткоин вырос до девяноста тысяч долларов за неделю." },
+    ]),
+  },
+);
+
 function client(asked = []) {
   return {
     getEpisodesByRef: async (groupId, refs) => {
@@ -70,4 +94,14 @@ test("without markers nothing is looked up and nothing is known", async () => {
   const origins = await factOrigins(client(asked), "main", [{ fact: "Политолог Кынев объявил голодовку.", episodes: ["e-digest"] }], []);
   assert.deepEqual(origins, [null]);
   assert.deepEqual(asked, []);
+});
+
+
+test("a digest is her whole reply after the trigger, however many messages it took", async () => {
+  const facts = [
+    { fact: "Адвокат Георгиевская подала жалобу на СИЗО-4 из-за досмотров.", episodes: ["e-split"] },
+    { fact: "Вит не знал про досмотры.", episodes: ["e-split"] },
+    { fact: "Биткоин вырос до девяноста тысяч долларов за неделю.", episodes: ["e-talk-split"] },
+  ];
+  assert.deepEqual(await factOrigins(client(), "main", facts, [MARKER]), ["digest", "talk", "talk"]);
 });

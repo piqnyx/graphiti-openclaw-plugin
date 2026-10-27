@@ -12,15 +12,12 @@ import { createGraphitiLogger } from "./logging.js";
 import { compileSessionPatterns, matchSessionExclusion } from "./session-filter.js";
 import { GraphitiMcpClient } from "./mcp-client.js";
 import {
-  buildRecallBlockDetailed,
-  buildRecallQuery,
-  factsInForce,
   factTextsInForce,
   isSupersededFact,
   sanitizeConversationText,
   SESSION_RESET_PROMPT_PREFIX,
 } from "./text.js";
-import { factSources, type FactSource } from "./recall-expand.js";
+import { recallFacts, recallQuery } from "./recall.js";
 import { createGraphitiTools } from "./tools.js";
 import type {
   BeforePromptBuildEvent,
@@ -193,19 +190,7 @@ export function register(api: OpenClawPluginApi): void {
         const history = capture
           ? capture.recentConversation(agentId, ctx?.sessionKey ?? "", cfg.recallHistoryMaxMessages)
           : [];
-        const query = buildRecallQuery(
-          currentPrompt,
-          history,
-          {
-            useHistory: cfg.recallUseHistory,
-            historyMaxMessages: cfg.recallHistoryMaxMessages,
-            historyMaxChars: cfg.recallHistoryMaxChars,
-            maxChars: cfg.recallQueryMaxChars,
-            userName: cfg.agents[agentId]?.user,
-            assistantName: cfg.agents[agentId]?.assistant,
-            messageRules,
-          },
-        );
+        const query = recallQuery(cfg, agentId, currentPrompt, history, messageRules);
         if (!query) return;
 
         logger.debugContent(
@@ -224,46 +209,8 @@ export function register(api: OpenClawPluginApi): void {
 
         const started = Date.now();
         try {
-          const found = await client.searchFacts(query, agentId, cfg.recallLimit, {
-            pool: cfg.recallPool,
-            rerank: cfg.recallRerank,
-            minScore: cfg.recallMinScore,
-            contextMinScore: cfg.recallContextMinScore,
-            minSpread: cfg.recallMinSpread,
-            vectorMinScore: cfg.recallVectorMinScore,
-            // What the reranker scores against: the message just sent, not the
-            // transcript around it. The transcript is what found the candidates.
-            focus: currentPrompt,
-          });
-          const facts = found.facts;
-          const inForce = factsInForce(facts);
-          const factTexts = inForce.map((fact) => fact.fact as string);
-
-          // Where each fact came from, and what was said around the first few. Both
-          // are extras: a store that cannot be read, or an episode that is gone,
-          // costs the attribution and never the recall.
-          let sources: (FactSource | undefined)[] = [];
-          if (inForce.length > 0) {
-            try {
-              sources = await factSources(
-                client,
-                agentId,
-                inForce,
-                cfg.recallExpandTop,
-                cfg.recallExpandChars,
-              );
-            } catch (error) {
-              logger.warn("recall_expand_failed", {
-                agentId,
-                group_id: agentId,
-                error: errorText(error),
-              });
-            }
-          }
-          const entries = factTexts.map((fact, index) =>
-            sources[index] ? { fact, source: sources[index] } : fact,
-          );
-          const recallBlock = buildRecallBlockDetailed(entries, cfg.recallMaxInjectedChars, cfg.recallExpandChars);
+          const found = await recallFacts({ client, cfg, logger, agentId, query, focus: currentPrompt });
+          const { facts, inForce, factTexts, sources, recallBlock } = found;
           const block = recallBlock.block;
           logger.debugContent(
             "recall_payload",

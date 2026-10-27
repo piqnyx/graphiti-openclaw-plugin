@@ -61,6 +61,21 @@ Every tool, read-only ones included, refuses a run with no session: memory belon
 
 There is deliberately no destructive tool. The Graphiti MCP delete endpoints take no group id and run against the driver's default database rather than the agent's graph, so exposing them to an agent could not be made isolation-safe. See `TODO.md` for what would have to be true first.
 
+## Recall from outside the gateway
+
+`dist/recall-cli.js` gives what auto-recall would put before a prompt on a turn, for a caller
+that is not the gateway -- the news digest reads each post against memory this way. It runs
+the same functions the `before_prompt_build` hook runs, with this plugin's settings read from
+the gateway's `openclaw.json` and parsed the plugin's way; the prompt is taken as a turn with
+no conversation before it.
+
+```bash
+echo '{"agentId": "main", "prompt": "..."}' | node dist/recall-cli.js --config ~/.openclaw/openclaw.json
+```
+
+On stdout, one JSON object: `query`, `block` (null when nothing is found or nothing is left to
+search for), `facts`, `rankedBy`, `scores`. Log lines go to stderr; a failure exits 1.
+
 ## Text that is true for an hour
 
 A tool that answers with a table is read once and is stale by morning. The graph

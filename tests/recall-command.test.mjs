@@ -148,6 +148,23 @@ test("the reranker scores against the prompt cleaned the way a turn cleans it", 
   assert.doesNotMatch(calls[0].arguments.query, /чужая память/);
 });
 
+test("with digest markers the command says where each fact came from: a digest or the talk", async (t) => {
+  const calls = fakeFetch(t);
+  const ask = (digestMarkers) => runRecallCommand({
+    gatewayConfig: gatewayConfig(pluginConfig()),
+    request: { agentId: "main", prompt: POST, ...(digestMarkers ? { digestMarkers } : {}) },
+    logSink: quietSink,
+  });
+  // The episode opens with the line taken as the marker: both facts come from right after it.
+  assert.deepEqual((await ask(["Серёга опять в гараже"])).origins, ["digest", "digest"]);
+  assert.deepEqual((await ask(["Эва по своей инициативе рассказывает Виту новости дня"])).origins, ["talk", "talk"]);
+  // No markers asked for -- no origins, and no extra lookup.
+  const before = calls.filter((call) => call.name === "get_episodes_by_ref").length;
+  const plain = await ask(undefined);
+  assert.equal("origins" in plain, false);
+  assert.equal(calls.filter((call) => call.name === "get_episodes_by_ref").length, before + 1);
+});
+
 test("a gateway config without the plugin's entry, or a request without an agent, is an error", async () => {
   await assert.rejects(
     runRecallCommand({ gatewayConfig: { plugins: { entries: {} } }, request: { agentId: "main", prompt: POST }, logSink: quietSink }),

@@ -76,6 +76,12 @@ echo '{"agentId": "main", "prompt": "..."}' | node dist/recall-cli.js --config ~
 On stdout, one JSON object: `query`, `block` (null when nothing is found or nothing is left to
 search for), `facts`, `rankedBy`, `scores`. Log lines go to stderr; a failure exits 1.
 
+With `"digestMarkers": [...]` in the request -- the lines the `digest-trigger` message rule turns
+the digest trigger into -- the answer also carries `origins`: per fact `"digest"` when it was
+drawn from that line or the message right after it (a digest Eva gave), `"talk"` for any other
+message of the conversation, `null` when its episode is unknown. Worked out from the stored
+episodes on every call; nothing is written.
+
 ## Text that is true for an hour
 
 A tool that answers with a table is read once and is stale by morning. The graph

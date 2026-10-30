@@ -144,6 +144,17 @@ test("recall query strips injected context before bounding", () => {
   assert.equal(query, "hello   world");
 });
 
+test("recall query is bounded on a whole character", () => {
+  // Kept from the end, an odd bound used to open the query on the second half of
+  // an emoji.
+  const query = buildRecallQuery(
+    "😀".repeat(10),
+    [],
+    { useHistory: false, historyMaxMessages: 1, historyMaxChars: 100, maxChars: 5 },
+  );
+  assert.equal(query, "😀".repeat(2));
+});
+
 test("recall query labels the current turn like the history it follows", () => {
   const query = buildRecallQuery(
     "и вот что дальше",

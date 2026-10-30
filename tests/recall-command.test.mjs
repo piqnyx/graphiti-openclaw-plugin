@@ -148,6 +148,18 @@ test("the reranker scores against the prompt cleaned the way a turn cleans it", 
   assert.doesNotMatch(calls[0].arguments.query, /чужая память/);
 });
 
+test("the reranker's focus is bounded on a whole character", async (t) => {
+  // Two thousand UTF-16 units, and an emoji is two: the last unit was half of one,
+  // sent on to the cross-encoder.
+  const calls = fakeFetch(t);
+  await runRecallCommand({
+    gatewayConfig: gatewayConfig(pluginConfig()),
+    request: { agentId: "main", prompt: `${"а".repeat(1999)}😀` },
+    logSink: quietSink,
+  });
+  assert.equal(calls[0].arguments.focus, "а".repeat(1999));
+});
+
 test("with digest markers the command says where each fact came from: a digest or the talk", async (t) => {
   const calls = fakeFetch(t);
   const ask = (digestMarkers) => runRecallCommand({

@@ -1,6 +1,6 @@
 import type { GraphitiMcpClient } from "./mcp-client.js";
 import type { EpisodeMessage } from "./text.js";
-import { episodeMessages } from "./text.js";
+import { clipHead, clipTail, episodeMessages } from "./text.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -84,7 +84,7 @@ function tailOf(message: EpisodeMessage, budget: number): string {
   const head = `[${message.speaker}] `;
   const room = budget - head.length - OMITTED.length;
   if (room < MIN_FRAGMENT) return "";
-  return `${head}${OMITTED}${message.text.trim().slice(-room)}`;
+  return `${head}${OMITTED}${clipTail(message.text.trim(), room)}`;
 }
 
 /** The start of a turn, for the side below: a reply is understood from its opening. */
@@ -92,7 +92,7 @@ function headOf(message: EpisodeMessage, budget: number): string {
   const head = `[${message.speaker}] `;
   const room = budget - head.length - OMITTED.length;
   if (room < MIN_FRAGMENT) return "";
-  return `${head}${message.text.trim().slice(0, room)}${OMITTED}`;
+  return `${head}${clipHead(message.text.trim(), room)}${OMITTED}`;
 }
 
 /**

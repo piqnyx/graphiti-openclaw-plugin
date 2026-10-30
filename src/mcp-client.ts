@@ -1,3 +1,5 @@
+import { clipHead } from "./text.js";
+
 type JsonObject = Record<string, unknown>;
 
 /** Ceiling on the text handed to the cross-encoder as the thing to rank against. */
@@ -541,7 +543,7 @@ export class GraphitiMcpClient {
     // Bounded like the query is. The focus is a whole message, and a pasted wall of
     // text went to the cross-encoder unabridged -- which is what used to return HTTP
     // 500 from the local reranker on a single long pair.
-    if (tuning.rerank && tuning.focus) args.focus = tuning.focus.slice(0, FOCUS_MAX_CHARS);
+    if (tuning.rerank && tuning.focus) args.focus = clipHead(tuning.focus, FOCUS_MAX_CHARS);
 
     const result = await this.callTool("search_memory_facts", args);
     if (typeof result.error === "string") throw new Error(result.error);

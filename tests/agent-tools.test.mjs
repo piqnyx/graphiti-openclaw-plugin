@@ -212,6 +212,18 @@ test("a note joins the dialog's own saga, carrying its title", async (t) => {
   ]);
 });
 
+test("a note title is cut on a whole character", async (t) => {
+  // Eighty UTF-16 units, and an emoji is two: the eightieth unit was half of one.
+  const calls = installFetch(t, committingCaptureHandlers());
+  const { tools } = makeCaptureRuntime(t, { bufferLimit: 1 });
+  await call(tools, "graphiti_note", { note: "Басю отдали в добрые руки", title: `${"т".repeat(79)}😀` }, { agentId: "main", sessionKey: "agent:main:telegram:1" });
+  await waitForCall(calls, "add_memory");
+  const submitted = calls.find((params) => params.name === "add_memory");
+  assert.deepEqual(JSON.parse(submitted.arguments.episode_body).messages, [
+    { role: "assistant", text: `[note] ${"т".repeat(79)}: Басю отдали в добрые руки` },
+  ]);
+});
+
 test("note refuses empty and oversized text", async (t) => {
   const calls = installFetch(t);
   const { tools } = makeRuntime();
@@ -803,6 +815,40 @@ test("the window centres on the query, not on the start of the episode", async (
     "начало этого же эпизода не должно вытеснять наводку",
   );
   assert.match(focused.content[0].text, /centred on/);
+});
+
+test("the focus named in a window's header is cut on a whole character", async (t) => {
+  installFetch(t, neighbourhood());
+  const { tools } = makeRuntime();
+  const result = await call(
+    tools,
+    "graphiti_browse",
+    { episodes: [{ episode: "8248439450-12", around: `${"ф".repeat(59)}😀😀` }] },
+    { agentId: "main", sessionKey: "agent:main:telegram:1" },
+  );
+  assert.ok(result.content[0].text.includes(`centred on "${"ф".repeat(59)}…"`), result.content[0].text);
+});
+
+test("a section cut to the reply's budget is cut on a whole character", async (t) => {
+  // The turn a window is centred on is shown whole, so one long turn overruns the
+  // budget and the section is cut to it -- at either parity of the budget.
+  installFetch(t, {
+    get_episodes_by_ref: (args) => ({
+      episodes: (args.names ?? []).map((name) => episodeWith(name, "😀".repeat(3000))),
+    }),
+  });
+  for (const browseMaxTotalChars of [1000, 1001]) {
+    const { tools } = makeRuntime({ browseMaxTotalChars });
+    const result = await call(
+      tools,
+      "graphiti_browse",
+      { episodes: ["8248439450-12"], query: "смайлы" },
+      { agentId: "main", sessionKey: "agent:main:telegram:1" },
+    );
+    const shown = result.content[0].text;
+    assert.ok(shown.isWellFormed(), `бюджет ${browseMaxTotalChars}: половина эмодзи на срезе`);
+    assert.ok(shown.includes("😀…"), `бюджет ${browseMaxTotalChars}: секция не обрезана\n${shown.slice(-200)}`);
+  }
 });
 
 test("anchors without anything to look for are refused, not answered from the start", async (t) => {

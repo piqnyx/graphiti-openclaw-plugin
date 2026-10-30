@@ -72,6 +72,21 @@ test("a turn at the edge is cut, not dropped: its tail above, its opening below"
   assert.match(rows[2], /^\[Вит\] 2я+\(…omitted…\)$/, `снизу обрезано не с конца:\n${excerpt}`);
 });
 
+test("a cut edge never splits a character in two", () => {
+  // The cut is counted in UTF-16 units, and an emoji is two of them. Cut between
+  // the two, it left half an emoji -- not text at all: JSON carries it as a lone
+  // \ud83d escape, and a reader encoding that to UTF-8 fails outright.
+  const smiles = (role) => ({ role, text: "😀".repeat(300) });
+  const messages = episodeMessages(body([smiles("user"), { role: "assistant", text: "ага" }, smiles("user")]));
+  for (let radius = 60; radius < 70; radius += 1) {
+    const excerpt = excerptAround(messages, 1, radius);
+    assert.ok(excerpt.isWellFormed(), `радиус ${radius}: половина эмодзи\n${excerpt}`);
+    const rows = excerpt.split("\n").filter((row) => row.startsWith("["));
+    assert.match(rows[0], /^\[Вит\] \(…omitted…\)(?:😀)+$/u, `радиус ${radius}: сверху не хвост`);
+    assert.match(rows[2], /^\[Вит\] (?:😀)+\(…omitted…\)$/u, `радиус ${radius}: снизу не начало`);
+  }
+});
+
 test("a fragment too small to say anything is not printed at all", () => {
   // Both sides long, so neither hands the other its share and the radius stays as
   // given -- otherwise the extra room is enough to print the very fragment this is

@@ -5,7 +5,7 @@ import type { GraphitiLogger } from "./logging.js";
 import type { GraphitiMcpClient } from "./mcp-client.js";
 import { bestMessage, excerptSpan } from "./recall-expand.js";
 import { matchSessionExclusion } from "./session-filter.js";
-import { episodeMessages, sanitizeConversationText } from "./text.js";
+import { clipHead, episodeMessages, sanitizeConversationText } from "./text.js";
 import type { PluginToolContext, PluginToolDefinition, PluginToolResult } from "./types.js";
 
 /** Every agent-facing tool carries this prefix so operators can allowlist them as a group. */
@@ -409,7 +409,7 @@ async function readAround(
   const edges = reached.length > 0 ? `\n[start/end of this episode — ${reached.join(", ")}]` : "";
 
   const aim = focus
-    ? `centred on "${focus.slice(0, 60)}${focus.length > 60 ? "…" : ""}"`
+    ? `centred on "${clipHead(focus, 60)}${focus.length > 60 ? "…" : ""}"`
     : "no focus given — read from the start; pass query to centre it";
   const widen =
     window.first > 0 || window.last < messages.length - 1
@@ -888,7 +888,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
               anchor.around || query,
             );
             if (!section) continue;
-            const trimmed = section.length > budget ? `${section.slice(0, budget)}…` : section;
+            const trimmed = section.length > budget ? `${clipHead(section, budget)}…` : section;
             budget -= trimmed.length;
             shown += 1;
             sections.push(trimmed);
@@ -973,7 +973,7 @@ export function createGraphitiTools(deps: ToolDependencies): PluginToolDefinitio
           );
         }
 
-        const title = sanitizeConversationText(stringParam(params, "title")).slice(0, 80);
+        const title = clipHead(sanitizeConversationText(stringParam(params, "title")), 80);
         const body = title ? `${title}: ${note}` : note;
 
         try {

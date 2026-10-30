@@ -285,9 +285,28 @@ export function extractConversationMessages(messages: unknown[]): ConversationMe
   return result;
 }
 
+/**
+ * The first `units` UTF-16 units of a text, one fewer when the last of them opens
+ * a pair. An emoji is two units, and half of one is not text: JSON carries it as a
+ * lone `\ud83d` escape, and a reader encoding that to UTF-8 fails outright.
+ */
+export function clipHead(text: string, units: number): string {
+  if (text.length <= units) return text;
+  const code = text.charCodeAt(units - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? units - 1 : units);
+}
+
+/** The last `units` UTF-16 units, one fewer when the first of them closes a pair. */
+export function clipTail(text: string, units: number): string {
+  if (text.length <= units) return text;
+  const start = text.length - units;
+  const code = text.charCodeAt(start);
+  return text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start);
+}
+
 function keepTail(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
-  return text.slice(-maxChars).trimStart();
+  return clipTail(text, maxChars).trimStart();
 }
 
 function formatRecallMessage(

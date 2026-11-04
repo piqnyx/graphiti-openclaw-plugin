@@ -18,6 +18,14 @@
       "graphiti_status"
     ]
   },
+  "toolMetadata": {
+    "graphiti_search": {
+      "recallsMemory": true
+    },
+    "graphiti_browse": {
+      "recallsMemory": true
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

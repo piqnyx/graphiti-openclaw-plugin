@@ -300,6 +300,20 @@ test("the manifest declares exactly the tools the code registers", () => {
   assert.deepEqual([...(manifest.contracts?.tools ?? [])].sort(), [...TOOL_NAMES].sort());
 });
 
+// The gateway's day chronicle does not retell recalled memory as the day's events: the tools that
+// bring back earlier events and past conversations say so in the manifest (OpenClaw `recallsMemory`).
+test("the manifest marks the tools that recall memory, and only them", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+  const recalling = Object.entries(manifest.toolMetadata ?? {})
+    .filter(([, metadata]) => metadata?.recallsMemory === true)
+    .map(([name]) => name)
+    .sort();
+  assert.deepEqual(recalling, ["graphiti_browse", "graphiti_search"]);
+  for (const name of Object.keys(manifest.toolMetadata ?? {})) {
+    assert.ok(manifest.contracts.tools.includes(name), name);
+  }
+});
+
 test("numbering inspection names duplicated and lost batches", () => {
   const key = "agent:main:web:1d8d5bfd-de0e-4877-82cb-6bc2a77c6957";
   const episode = (n) => ({ name: `6bc2a77c6957-${n}` });

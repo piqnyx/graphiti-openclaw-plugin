@@ -228,21 +228,12 @@ test("a head whose first delivery failed after its identity was reserved is deli
     },
   });
 
-  // Date is mocked here, so waitFor's deadline would never pass: wait by a bounded count instead.
-  const waitTicks = async (predicate, what) => {
-    for (let i = 0; i < 300; i += 1) {
-      if (predicate()) return;
-      await sleep(10);
-    }
-    assert.fail(`${what} did not happen`);
-  };
-
   await turn(hooks);
-  await waitTicks(() => lookups === 1, "the first delivery attempt");
+  await waitSteps(() => lookups === 1, "the first delivery attempt");
   assert.ok(queue.peekHead("main"), "the head stays after the failed attempt");
 
   t.mock.timers.tick(30_000);
-  await waitTicks(() => !queue.peekHead("main"), "delivery on the next retry");
+  await waitSteps(() => !queue.peekHead("main"), "delivery on the next retry");
   assert.equal(calls.filter((call) => call.name === "add_memory").length, 1);
 });
 

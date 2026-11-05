@@ -246,15 +246,18 @@ export class GraphitiMcpClient {
    * be submitted again. The durable caller keeps the head on disk the whole time.
    *
    * `replayed` is the exception, and it exists because the graph answers a
-   * narrower question than the one being asked. A restart mid-delivery leaves a
-   * head whose episode the backend may still be extracting -- minutes of work --
-   * and during that time the Saga tail is still the predecessor, so "is it
-   * committed?" answers no while the truthful answer is "not yet, it is running".
-   * Submitting then hands the backend a second task for the same UUID: its
-   * episode queue holds closures and does not dedupe, so the extraction runs
-   * twice and both runs attach the episode to the Saga after the same
-   * predecessor, which is how a chain grows a second head. A replayed head
-   * therefore asks the queue first and submits only if nobody owns the UUID.
+   * narrower question than the one being asked. A restart or a failed attempt
+   * mid-delivery leaves a head whose episode the backend may still be extracting
+   * -- minutes of work -- and during that time the Saga tail is still the
+   * predecessor, so "is it committed?" answers no while the truthful answer is
+   * "not yet, it is running". Submitting then hands the backend a second task for
+   * the same UUID. Upstream's episode queue holds closures and does not dedupe, so
+   * the extraction would run twice and both runs attach the episode to the Saga
+   * after the same predecessor, which is how a chain grows a second head. The
+   * piqnyx Graphiti fork ignores a duplicate of a UUID it is running or holding
+   * (mcp_server/src/piqnyx_reliable_queue.py), but this client does not rely on
+   * that: a replayed head asks the queue first and submits only if nobody owns
+   * the UUID.
    */
   async addMemory(params: {
     uuid: string;
@@ -335,7 +338,7 @@ export class GraphitiMcpClient {
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
           if (await this.episodeCommitted(params)) {
-            return lastSubmissionResult;
+            return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
           }
           lastSubmissionResult = await this.callToolOnce("add_memory", args);
           if (typeof lastSubmissionResult.error === "string") {

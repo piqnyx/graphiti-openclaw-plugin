@@ -116,7 +116,8 @@ export class DurableBufferEngine {
   private readonly knownSessions = new Map<string, KnownSession>();
   private readonly processing = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
-  private readonly failureActive = new Set<string>();
+  // The reason the agent's head last failed on, while it keeps failing.
+  private readonly failureActive = new Map<string, string>();
   private stopped = false;
   private persistFailureActive = false;
 
@@ -474,10 +475,13 @@ export class DurableBufferEngine {
           });
         } catch (error) {
           this.retryAfter.set(agentId, Date.now() + CHECK_INTERVAL_SEC * 1000);
-          if (!this.failureActive.has(agentId)) {
-            this.opts.notifyError?.(agentId, entry.buffer.sessionKey, reason, asError(error));
+          const failure = asError(error);
+          // Reported again whenever the reason changes: with only the first one, retries failing on
+          // another reason stayed silent for two days (02.11).
+          if (this.failureActive.get(agentId) !== failure.message) {
+            this.opts.notifyError?.(agentId, entry.buffer.sessionKey, reason, failure);
           }
-          this.failureActive.add(agentId);
+          this.failureActive.set(agentId, failure.message);
           return;
         }
 

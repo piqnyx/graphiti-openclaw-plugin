@@ -645,3 +645,41 @@ test("concurrent first calls share a single MCP handshake", async (t) => {
   await Promise.all([client.getQueueStatus("main"), client.getQueueStatus("igor")]);
   assert.equal(methods.filter((method) => method === "initialize").length, 1);
 });
+
+test("an episode that lands between the wait loop's two checks is returned as persisted", async (t) => {
+  // 02.11 and 04.11: the commit landed after the loop's own check and before the check that guards a
+  // resubmission, and that path returned the add_memory reply without persisted -- a false failure.
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const uuid = "22222222-2222-4222-8222-222222222222";
+  let lookups = 0;
+  const calls = [];
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    const handshake = installHandshake(payload);
+    if (handshake) return handshake;
+    const { name } = payload.params;
+    calls.push(name);
+    // 1: before submitting; 2: top of the wait loop -- not there yet; 3: the check before a resubmission -- landed.
+    if (name === "get_episodes_by_ref") return toolResponse(payload.id, { episodes: ++lookups >= 3 ? [{ uuid }] : [] });
+    if (name === "get_queue_status") return toolResponse(payload.id, healthyQueue("main", { worker_running: false }));
+    if (name === "get_saga") return toolResponse(payload.id, validSaga({ name: "session-1", first: uuid, last: uuid }));
+    if (name === "add_memory") return toolResponse(payload.id, { message: "queued" });
+    throw new Error(`unexpected tool ${name}`);
+  };
+
+  const result = await fastClient().addMemory({
+    uuid,
+    name: "6bc2a77c6957-1",
+    jsonBody: "{}",
+    groupId: "main",
+    saga: "session-1",
+    referenceTime: "2026-08-14T00:00:00.000Z",
+    previousEpisodeUuids: [],
+  });
+
+  assert.equal(lookups, 3);
+  assert.equal(result.uuid, uuid);
+  assert.equal(result.persisted, true);
+  assert.equal(calls.filter((name) => name === "add_memory").length, 1);
+});

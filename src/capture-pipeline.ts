@@ -358,7 +358,22 @@ export function createCapturePipeline(params: {
       const sessionKey = entry.buffer.sessionKey;
       const episode: EpisodeJson = entry.buffer.episode;
       const jsonBody = JSON.stringify(episode);
+      // The head already carried a reserved identity when this attempt began -- after a restart or a
+      // failed attempt -- so the backend may still be extracting it: addMemory asks its queue before
+      // submitting again. Read here, because identityRestored is cleared on the way to addMemory.
+      const resumed = entry.episode !== undefined;
 
+      // A retry in this process, not a restart: the head is read back from disk on every attempt, but
+      // this process still holds exactly its reservation. The restart path refuses a pending batch,
+      // so taking it left the head stuck until the gateway restarted (02.11-05.11). Skipping it,
+      // prepare() returns the same reservation and addMemory's first check finds a landed commit.
+      if (
+        entry.identityRestored &&
+        entry.episode &&
+        sequences.snapshot(agentId, sessionKey).pending?.episodeUuid === entry.episode.uuid
+      ) {
+        entry.identityRestored = false;
+      }
       if (entry.identityRestored && entry.episode) {
         const alreadyCommitted = await reconcileRestoredIdentity(
           agentId,
@@ -449,7 +464,7 @@ export function createCapturePipeline(params: {
         referenceTime,
         previousEpisodeUuids: sequence.previousEpisodeUuids,
         sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
-        replayed: entry.identityRestored === true,
+        replayed: resumed,
       });
       const committedUuid = acceptedEpisodeUuid(result);
       if (committedUuid !== sequence.episodeUuid) {

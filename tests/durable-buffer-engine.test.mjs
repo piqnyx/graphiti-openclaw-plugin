@@ -454,3 +454,31 @@ test("the same words from the other speaker are a different turn", async (t) => 
 
   assert.deepEqual(sent[0], ["user", "assistant"]);
 });
+
+test("a stuck head reports every new reason it fails on, not only the first", async (t) => {
+  // 02.11-05.11: only the first failure of a stall was logged, so two days of retries failing on a
+  // different reason left no line at all.
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+  const root = withRoot(t);
+  const reported = [];
+  const failures = ["first reason", "second reason", "second reason"];
+  let calls = 0;
+  const engine = new DurableBufferEngine(root, actors, 1, 30, async () => {
+    calls += 1;
+    if (calls <= failures.length) throw new Error(failures[calls - 1]);
+  }, {
+    notifyError: (_agentId, _sessionKey, _reason, error) => reported.push(error.message),
+    notifyRecovered: () => reported.push("recovered"),
+  });
+  t.after(async () => { await engine.shutdown(500); });
+
+  engine.ingest("main", "s1", [{ role: "user", text: "x" }], watermark("main", "s1"));
+  await waitFor(() => calls === 1);
+  for (let attempt = 2; attempt <= 4; attempt += 1) {
+    t.mock.timers.tick(30_000);
+    await waitFor(() => calls === attempt);
+  }
+  await waitFor(() => reported.includes("recovered"));
+
+  assert.deepEqual(reported, ["first reason", "second reason", "recovered"]);
+});

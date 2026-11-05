@@ -359,6 +359,17 @@ export function createCapturePipeline(params: {
       const episode: EpisodeJson = entry.buffer.episode;
       const jsonBody = JSON.stringify(episode);
 
+      // A retry in this process, not a restart: the head is read back from disk on every attempt, but
+      // this process still holds exactly its reservation. The restart path refuses a pending batch,
+      // so taking it left the head stuck until the gateway restarted (02.11-05.11). Skipping it,
+      // prepare() returns the same reservation and addMemory's first check finds a landed commit.
+      if (
+        entry.identityRestored &&
+        entry.episode &&
+        sequences.snapshot(agentId, sessionKey).pending?.episodeUuid === entry.episode.uuid
+      ) {
+        entry.identityRestored = false;
+      }
       if (entry.identityRestored && entry.episode) {
         const alreadyCommitted = await reconcileRestoredIdentity(
           agentId,

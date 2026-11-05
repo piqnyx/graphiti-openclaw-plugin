@@ -198,3 +198,50 @@ test("deterministic Graphiti identity is fsynced into the head before remote sub
   episodeExists = true;
   await waitFor(() => queue.approximateDepth("main") === 0, "committed head removal");
 });
+
+test("a head whose first delivery failed after its identity was reserved is delivered on the next retry", async (t) => {
+  // 02.11-05.11: a failure after the identity was reserved left it pending in this process, and
+  // every retry took the restart path, which refuses a pending batch -- stuck until a restart.
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+  let submittedUuid;
+  let lookups = 0;
+  const { calls, hooks, queue } = harness(t, {
+    get_saga: () =>
+      submittedUuid
+        ? healthySaga(submittedUuid)
+        : { error: "No saga named 'agent:main:telegram:1' found in group 'main'" },
+    get_episodes_by_ref: () =>
+      ++lookups === 1
+        ? { error: "Error retrieving episodes: Query timed out" }
+        : { episodes: submittedUuid ? [{ uuid: submittedUuid }] : [] },
+    get_queue_status: () => ({
+      group_id: "main",
+      blocked: false,
+      attempts: 0,
+      pending: 0,
+      worker_running: false,
+      queued_episode_uuids: [],
+    }),
+    add_memory: (args) => {
+      submittedUuid = args.uuid;
+      return { message: "queued", uuid: args.uuid };
+    },
+  });
+
+  // Date is mocked here, so waitFor's deadline would never pass: wait by a bounded count instead.
+  const waitTicks = async (predicate, what) => {
+    for (let i = 0; i < 300; i += 1) {
+      if (predicate()) return;
+      await sleep(10);
+    }
+    assert.fail(`${what} did not happen`);
+  };
+
+  await turn(hooks);
+  await waitTicks(() => lookups === 1, "the first delivery attempt");
+  assert.ok(queue.peekHead("main"), "the head stays after the failed attempt");
+
+  t.mock.timers.tick(30_000);
+  await waitTicks(() => !queue.peekHead("main"), "delivery on the next retry");
+  assert.equal(calls.filter((call) => call.name === "add_memory").length, 1);
+});

@@ -358,6 +358,10 @@ export function createCapturePipeline(params: {
       const sessionKey = entry.buffer.sessionKey;
       const episode: EpisodeJson = entry.buffer.episode;
       const jsonBody = JSON.stringify(episode);
+      // The head already carried a reserved identity when this attempt began -- after a restart or a
+      // failed attempt -- so the backend may still be extracting it: addMemory asks its queue before
+      // submitting again. Read here, because identityRestored is cleared on the way to addMemory.
+      const resumed = entry.episode !== undefined;
 
       // A retry in this process, not a restart: the head is read back from disk on every attempt, but
       // this process still holds exactly its reservation. The restart path refuses a pending batch,
@@ -460,7 +464,7 @@ export function createCapturePipeline(params: {
         referenceTime,
         previousEpisodeUuids: sequence.previousEpisodeUuids,
         sagaPreviousEpisodeUuid: sequence.sagaPreviousEpisodeUuid,
-        replayed: entry.identityRestored === true,
+        replayed: resumed,
       });
       const committedUuid = acceptedEpisodeUuid(result);
       if (committedUuid !== sequence.episodeUuid) {

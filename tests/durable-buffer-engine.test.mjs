@@ -471,14 +471,23 @@ test("a stuck head reports every new reason it fails on, not only the first", as
     notifyRecovered: () => reported.push("recovered"),
   });
   t.after(async () => { await engine.shutdown(500); });
+  // Date is mocked here, so waitFor's deadline would never pass and a regression would hang:
+  // wait by a bounded count instead.
+  const waitTicks = async (predicate) => {
+    for (let i = 0; i < 300; i += 1) {
+      if (predicate()) return;
+      await sleep(5);
+    }
+    assert.fail("condition was not met");
+  };
 
   engine.ingest("main", "s1", [{ role: "user", text: "x" }], watermark("main", "s1"));
-  await waitFor(() => calls === 1);
+  await waitTicks(() => calls === 1);
   for (let attempt = 2; attempt <= 4; attempt += 1) {
     t.mock.timers.tick(30_000);
-    await waitFor(() => calls === attempt);
+    await waitTicks(() => calls === attempt);
   }
-  await waitFor(() => reported.includes("recovered"));
+  await waitTicks(() => reported.includes("recovered"));
 
   assert.deepEqual(reported, ["first reason", "second reason", "recovered"]);
 });

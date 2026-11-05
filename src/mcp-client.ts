@@ -335,7 +335,7 @@ export class GraphitiMcpClient {
       if (!backendOwnsUuid && submissionOldEnough) {
         try {
           if (await this.episodeCommitted(params)) {
-            return lastSubmissionResult;
+            return { ...lastSubmissionResult, uuid: params.uuid, persisted: true };
           }
           lastSubmissionResult = await this.callToolOnce("add_memory", args);
           if (typeof lastSubmissionResult.error === "string") {
